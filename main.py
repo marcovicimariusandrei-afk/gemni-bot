@@ -433,7 +433,7 @@ def _read_v610_env() -> Tuple[
         raw = os.environ.get(name, "").strip()
         return raw if raw else default
 
-    strategy_mode = _s("STRATEGY_MODE", "lag_signal",
+    strategy_mode = _s("STRATEGY_MODE", "both_sides_btc",
                        ("lag_signal", "both_sides_btc"))
 
     # Lead-time window: enter both legs when 5m market TTR is in
@@ -478,16 +478,7 @@ def _read_v610_env() -> Tuple[
 
     # v6.2.2: BS_STRATEGY selects which sell-loser logic is active.
     # Values:
-    #   "v621" (default) — full v6.2.1 stack: PROD path + BTC late-fallback +
-    #                       late-conviction override + BTC guard. Production bot.
-    #   "verification_late" — pure BTC-tiered logic, no book check, no BTC
-    #                          guard. Fires only:
-    #                            - TTR ≤ 60s + |BTC Δ| ≥ $90  (Phase B)
-    #                            - TTR ≤ 30s + |BTC Δ| ≥ $85  (Phase C)
-    #                            - TTR ≤ 10s + |BTC Δ| ≥ $80  (Phase D)
-    #                          Designed for side-by-side A/B testing on a second
-    #                          Railway service (DRY only, same markets, same entry).
-    #   "bss_entry" (v6.3.0) — Both-Sides See-Saw entry. REPLACES the standard
+    #   "bss_entry" (default, v6.3.0) — Both-Sides See-Saw entry. REPLACES the standard
     #                          sum_ask<1.10 entry path AND replaces verification_late.
     #                          Bot watches every 5m market and waits for ONE side
     #                          to dip below BS_BSS_T_FIRST sustained for
@@ -501,11 +492,20 @@ def _read_v610_env() -> Tuple[
     #                          Mirror-of-verification_late structure: sustain →
     #                          fire pattern, just inverted (buy low instead of
     #                          confirm high). DRY-only.
-    bs_strategy_raw = os.environ.get("BS_STRATEGY", "v621").strip().lower()
+    #   "v621"       — full v6.2.1 stack: PROD path + BTC late-fallback +
+    #                  late-conviction override + BTC guard. Legacy mode.
+    #   "verification_late" — pure BTC-tiered logic, no book check, no BTC
+    #                          guard. Fires only:
+    #                            - TTR ≤ 60s + |BTC Δ| ≥ $90  (Phase B)
+    #                            - TTR ≤ 30s + |BTC Δ| ≥ $85  (Phase C)
+    #                            - TTR ≤ 10s + |BTC Δ| ≥ $80  (Phase D)
+    #                          Designed for side-by-side A/B testing on a second
+    #                          Railway service (DRY only, same markets, same entry).
+    bs_strategy_raw = os.environ.get("BS_STRATEGY", "bss_entry").strip().lower()
     if bs_strategy_raw not in ("v621", "verification_late", "bss_entry"):
         print(f"[boot][v6.2.2] warning: BS_STRATEGY={bs_strategy_raw!r} "
-              f"not recognized; using default 'v621'", flush=True)
-        bs_strategy_raw = "v621"
+              f"not recognized; using default 'bss_entry'", flush=True)
+        bs_strategy_raw = "bss_entry"
     bs_strategy = bs_strategy_raw
 
     # v6.2.4: verification_late freeze logic (whipsaw detection).
@@ -519,9 +519,9 @@ def _read_v610_env() -> Tuple[
 
     # v6.3.0: BSS (Both-Sides See-Saw) parameters. Inert unless
     # BS_STRATEGY == 'bss_entry'.
-    bs_bss_t_first         = _f("BS_BSS_T_FIRST",          0.45, 0.10, 0.50)
+    bs_bss_t_first         = _f("BS_BSS_T_FIRST",          0.48, 0.10, 0.50)
     bs_bss_sustain_first_s = _f("BS_BSS_SUSTAIN_FIRST_S",  4.0,  0.0,  30.0)
-    bs_bss_t_second_strict = _f("BS_BSS_T_SECOND_STRICT",  0.50, 0.30, 0.99)
+    bs_bss_t_second_strict = _f("BS_BSS_T_SECOND_STRICT",  0.52, 0.30, 0.99)
     bs_bss_t_second_relax  = _f("BS_BSS_T_SECOND_RELAXED", 0.62, 0.30, 0.99)
     bs_bss_sustain_2nd_s   = _f("BS_BSS_SUSTAIN_SECOND_S", 3.0,  0.0,  30.0)
     bs_bss_relax_at_s      = _f("BS_BSS_RELAX_AT_S",       240.0, 1.0, 280.0)
@@ -537,7 +537,7 @@ def _read_v610_env() -> Tuple[
     bs_bss_btc_vel_lookback_s = _f("BS_BSS_BTC_VEL_LOOKBACK_S", 30.0, 5.0, 120.0)
 
     # v6.3.7: PATIENT SECOND LEG. When the opposite side hits the strict
-    # threshold (0.50), don't fire immediately if the price is still
+    # threshold (0.52), don't fire immediately if the price is still
     # actively falling — wait one more tick for a better fill. The bot
     # checks the opposite-side ask velocity over the last
     # OPP_VEL_LOOKBACK_S seconds. If price has dropped by at least
@@ -546,7 +546,7 @@ def _read_v610_env() -> Tuple[
     #
     # Floor backstop: if opposite side ever hits T_SECOND_FLOOR or below
     # (default 0.40), fire IMMEDIATELY regardless of velocity. The dip is
-    # so deep that risking a bounce above 0.50 is worse than firing now.
+    # so deep that risking a bounce above 0.52 is worse than firing now.
     #
     # Set OPP_VEL_PATIENT_DROP=0 to disable patience (= v6.3.6 behavior).
     bs_bss_t_second_floor = _f("BS_BSS_T_SECOND_FLOOR", 0.40, 0.10, 0.50)
@@ -564,24 +564,24 @@ def _read_v610_env() -> Tuple[
 
     # v6.3.2: PRE-MARKET BSS phase. Polymarket creates 5m markets ~30 min
     # before the window opens. Books form, prices wobble, sometimes one
-    # side drops below $0.49 in this period. We can buy then. To use this
+    # side drops below $0.52 in this period. We can buy then. To use this
     # phase you also need to extend BS_LEAD_TIME_MAX_S to 1800 (or
     # whatever pre-market window you want covered).
     #
-    # Pre-market thresholds are LOOSER than live (0.49 vs 0.45 first leg)
+    # Pre-market thresholds are LOOSER than live (0.52 vs 0.48 first leg)
     # because pre-market dips tend to be shallower — books are thinner,
     # market makers haven't tightened yet.
     #
     # No abort timer during pre-market (time is abundant). When the live
     # window opens (T=0) and we're still WAITING_2ND, the bot switches to
-    # standard live thresholds (0.50/0.62) and starts the abort timer
+    # standard live thresholds (0.52/0.62) and starts the abort timer
     # from T=0 (not from pre-market first-leg fill).
     #
     # If neither side ever dipped below T_FIRST_PRE during the entire
     # pre-market period, the bot enters the live window in WATCH state
     # and runs standard BSS logic.
-    bs_bss_t_first_pre   = _f("BS_BSS_T_FIRST_PRE",   0.49, 0.10, 0.99)
-    bs_bss_t_second_pre  = _f("BS_BSS_T_SECOND_PRE",  0.49, 0.10, 0.99)
+    bs_bss_t_first_pre   = _f("BS_BSS_T_FIRST_PRE",   0.52, 0.10, 0.99)
+    bs_bss_t_second_pre  = _f("BS_BSS_T_SECOND_PRE",  0.52, 0.10, 0.99)
     bs_bss_sustain_first_pre_s  = _f("BS_BSS_SUSTAIN_FIRST_PRE_S", 4.0, 0.0, 60.0)
     bs_bss_sustain_second_pre_s = _f("BS_BSS_SUSTAIN_SECOND_PRE_S", 3.0, 0.0, 60.0)
 
@@ -3432,7 +3432,7 @@ if(bssActive){
       <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted);">
         ${p.bss_state==='WAITING_2ND'?`<span>${p.in_pre_market?`pre-market · live opens in <b style="color:var(--yellow);">${fmtCountdown(p.pre_market_remaining_s||0)}</b> · `:`elapsed <b style="color:var(--text);">${(p.elapsed_s||0).toFixed(0)}s</b> · `}phase <b>${escapeHtml(p.phase||'')}</b> · sustain ${(p.second_sustain_s||0).toFixed(1)}/${(p.sustain_second_s||3).toFixed(0)}s</span><span>${p.in_pre_market?`<span style="color:var(--muted);">no abort during pre-market</span>`:`abort in <b style="color:${(p.abort_in_s||0)<30?'var(--red)':'var(--yellow)'};">${(p.abort_in_s||0).toFixed(0)}s</b>`}</span>`:''}
         ${p.bss_state==='BOTH'?`<span>cost <b style="color:var(--text);">$${((p.first_price||0)+(p.second_price||0)).toFixed(4)}</b></span><span>if win: <b style="color:var(--green);">+$${(1.0/Math.max(p.first_price||1,p.second_price||1) - 2.0).toFixed(4)}</b></span>`:''}
-        ${p.bss_state==='WATCH'?`<span>need either side &lt;${(p.t_first||0.45).toFixed(2)} for ${(p.sustain_first_s||4).toFixed(0)}s · YES sus ${(p.yes_sustain_s||0).toFixed(1)}s · NO sus ${(p.no_sustain_s||0).toFixed(1)}s</span>`:''}
+        ${p.bss_state==='WATCH'?`<span>need either side &lt;${(p.t_first||0.48).toFixed(2)} for ${(p.sustain_first_s||4).toFixed(0)}s · YES sus ${(p.yes_sustain_s||0).toFixed(1)}s · NO sus ${(p.no_sustain_s||0).toFixed(1)}s</span>`:''}
       </div>
       ${p.bss_state==='WAITING_2ND' && (p.orphan_sell_enabled || p.orphan_tp_enabled)?(()=>{
         // v6.5.5.3: in-flight orphan-sell indicator
@@ -3485,7 +3485,7 @@ if(bssActive){
     const stateColor=isWaiting?'var(--yellow)':'var(--muted)';
     const detail=isWaiting
       ? `1st ${escapeHtml(p.first_side||'')}@${(p.first_price||0).toFixed(3)} · 2nd ${escapeHtml(p.first_side==='YES'?'NO':'YES')} ${(p.other_ask||0).toFixed(3)}/<${(p.current_threshold||0).toFixed(2)} · ${p.in_pre_market?'pre':'abort '+(p.abort_in_s||0).toFixed(0)+'s'}`
-      : `YES ${(p.yes_ask||0).toFixed(3)} · NO ${(p.no_ask||0).toFixed(3)} · need <${(p.t_first||0.45).toFixed(2)}`;
+      : `YES ${(p.yes_ask||0).toFixed(3)} · NO ${(p.no_ask||0).toFixed(3)} · need <${(p.t_first||0.48).toFixed(2)}`;
     return `<div style="padding:6px 10px;background:rgba(255,255,255,0.02);border-radius:4px;margin-top:4px;font-size:11px;display:flex;gap:10px;align-items:center;">
       <span style="font-family:monospace;color:var(--muted);">${escapeHtml((p.market_id||'').slice(0,10))}…</span>
       <span style="color:${stateColor};font-weight:600;min-width:80px;">${escapeHtml(p.bss_state)}</span>
@@ -4018,6 +4018,31 @@ def _build_status_payload(state: BotState) -> dict:
         "skips_by_reason": dict(state.skips_by_reason),
         "trade_history": state.trade_history[-15:],
     }
+
+
+CSV_EXPORT_FILES = [
+    ("planned_entries.csv", "planned_entries.csv"),
+    ("executed_trades.csv", "executed_trades.csv"),
+    ("open_positions.csv", "open_positions.csv"),
+    ("exits.csv", "exits.csv"),
+]
+
+def _ensure_validation_csvs(state):
+    try:
+        os.makedirs(state.log_dir, exist_ok=True)
+        headers = {
+            "planned_entries.csv": "ts,market_slug,question,yes_ask,no_ask,sum_ask,eligible,entry_window_s,polymarket_url\n",
+            "executed_trades.csv": "ts,market_slug,question,action,side,price,size,reason,polymarket_url\n",
+            "open_positions.csv": "ts,market_slug,question,yes_entry,no_entry,size_usdc,status,polymarket_url\n",
+            "exits.csv": "ts,market_slug,question,side_sold,exit_price,reason,realized_pnl,polymarket_url\n",
+        }
+        for fname, header in headers.items():
+            fpath = os.path.join(state.log_dir, fname)
+            if not os.path.exists(fpath):
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.write(header)
+    except Exception as e:
+        print(f"[csv] init failed: {type(e).__name__}: {e}", flush=True)
 
 
 def http_server_thread(state: BotState) -> None:
@@ -6146,7 +6171,7 @@ def _bs_evaluate_late_conviction(
 # Mirror of _bs_evaluate_verification_late. Same skeleton, opposite
 # direction:
 #   verification_late:  arm on winner_ask ≥ 0.70, sustain, fire SELL_LOSER
-#   bss_entry:          arm on cheap_ask ≤ 0.45, sustain, fire BUY_FIRST_LEG
+#   bss_entry:          arm on cheap_ask ≤ 0.48, sustain, fire BUY_FIRST_LEG
 #
 # State lives on MultiDurationMarket.bss_* (mirroring how VL state lives
 # on BothSidesPosition.vl_*). Both halves of the strategy use the same
@@ -6499,7 +6524,7 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
                     return
 
         # ── Live-window second-leg detection (v6.3.7: patient + floor) ──
-        # Maintain sustain timers for both strict (0.50) and relaxed (0.62) tiers.
+        # Maintain sustain timers for both strict (0.52) and relaxed (0.62) tiers.
         if other_ask < _BS_BSS_T_SECOND_STRICT:
             if mdm.bss_other_below_strict_start_ts is None:
                 mdm.bss_other_below_strict_start_ts = now
@@ -7144,5 +7169,4181 @@ def _bss_handle_window_end_orphan(state: BotState, mdm: MultiDurationMarket,
             size_usdc=mdm.bss_leg1_size_usdc or 0.0,
             qty_shares=mdm.bss_leg1_qty or 0.0,
             entry_ts=mdm.bss_first_fill_ts or now,
-            peak_bid=yes_bid, peak_bid_ts=mdm.bss
-Explain
+            peak_bid=yes_bid, peak_bid_ts=mdm.bss_first_fill_ts or now,
+        )
+        no_leg = BothSidesLeg(
+            side="NO", token_id=market.no_token_id,
+            entry_ask=0.0, entry_bid=no_bid,
+            size_usdc=0.0, qty_shares=0.0,
+            entry_ts=now,
+            peak_bid=no_bid, peak_bid_ts=now,
+        )
+    else:
+        no_leg = BothSidesLeg(
+            side="NO", token_id=market.no_token_id,
+            entry_ask=mdm.bss_leg1_actual_ask or 0.0,
+            entry_bid=no_bid,
+            size_usdc=mdm.bss_leg1_size_usdc or 0.0,
+            qty_shares=mdm.bss_leg1_qty or 0.0,
+            entry_ts=mdm.bss_first_fill_ts or now,
+            peak_bid=no_bid, peak_bid_ts=mdm.bss_first_fill_ts or now,
+        )
+        yes_leg = BothSidesLeg(
+            side="YES", token_id=market.yes_token_id,
+            entry_ask=0.0, entry_bid=yes_bid,
+            size_usdc=0.0, qty_shares=0.0,
+            entry_ts=now,
+            peak_bid=yes_bid, peak_bid_ts=now,
+        )
+    pos = BothSidesPosition(
+        market_id=market.condition_id,
+        market_url=market.market_url,
+        market_question=market.question,
+        slug=market.slug,
+        duration_s=mdm.duration_s,
+        end_ts=market.end_ts,
+        entry_ts=mdm.bss_first_fill_ts or now,
+        sum_ask_at_entry=mdm.bss_leg1_actual_ask or 0.0,
+        yes_leg=yes_leg,
+        no_leg=no_leg,
+    )
+    state.both_sides_positions[market.condition_id] = pos
+    state.bs_entered_market_ids.add(market.condition_id)
+    state.bs_total_entered += 1
+    mdm.bss_state = "ORPHAN_END"
+    mdm.bss_leg1_orphan_end_logged = True
+    _v653_buf_clear(market.condition_id)  # v6.5.3
+    
+    _bs_log_bss_orphan_end_event(state, mdm, now,
+                                   yes_ask=yes_ask, no_ask=no_ask,
+                                   yes_bid=yes_bid, no_bid=no_bid)
+    print(f"[bss_entry] ORPHAN_END market={market.condition_id[:10]}… "
+          f"first={mdm.bss_first_side}@{mdm.bss_leg1_actual_ask:.4f} "
+          f"qty={mdm.bss_leg1_qty:.3f} "
+          f"second_never_came → held to resolution",
+          flush=True)
+
+
+def _bs_log_bss_first_leg_event(state: BotState, mdm: MultiDurationMarket,
+                                  now: float, yes_ask: float, no_ask: float,
+                                  yes_bid: float, no_bid: float,
+                                  sus_s: float) -> None:
+    """v6.3.0: log a BSS_FIRST_LEG_DRY event to bs_trades. Kept in v6.5.0
+    for backward compat with downstream analysis. Logged BEFORE leg 1
+    placement is attempted — so this row records the candidate detection
+    even if the placement fails.
+
+    v6.5.3: appends `extra_json={...}` to the `notes` field with Tier 1
+    pre-entry features (leg2 microstructure, depth deltas, leg1 bid
+    trajectory, latency, regime). Other fields unchanged for backward
+    compat with downstream parsers."""
+    if state.bs_trades_logger is None:
+        return
+    try:
+        market = mdm.market
+        ttr_s = market.end_ts - now
+        # v6.5.3: compute Tier 1 features
+        leg1_side = mdm.bss_first_side or ""
+        leg2_side = "NO" if leg1_side == "YES" else "YES"
+        yb = state.poly_books.get(market.yes_token_id)
+        nb = state.poly_books.get(market.no_token_id)
+        yes_d5 = _v653_ask_depth_5(yb) if yb else 0.0
+        no_d5 = _v653_ask_depth_5(nb) if nb else 0.0
+        yes_age = (now - yb.last_update_ts) if yb else 999.0
+        no_age = (now - nb.last_update_ts) if nb else 999.0
+        bin_last_ts_ms = None
+        bin_snap: List[Tuple[float, float]] = []
+        try:
+            if state.binance_prices:
+                bin_snap = list(state.binance_prices)
+                if bin_snap:
+                    bin_last_ts_ms = int(bin_snap[-1][0] * 1000)
+        except Exception:
+            pass
+        feats = _v653_compute_features(
+            market_id=market.condition_id,
+            fire_ts_ms=int(now * 1000),
+            leg1_side=leg1_side, leg2_side=leg2_side,
+            now_unix=now,
+            yes_ask_depth5_now=yes_d5, no_ask_depth5_now=no_d5,
+            yes_book_age_s=yes_age, no_book_age_s=no_age,
+            binance_last_tick_ts_ms=bin_last_ts_ms,
+            binance_prices_snapshot=bin_snap,
+            leg2_token_id=(market.yes_token_id if leg2_side == "YES"
+                           else market.no_token_id),
+            poly_trades=state.poly_trades,
+            decision_lat_ms=int((time.time() - now) * 1000),
+        )
+        extra_json = json.dumps(feats, separators=(',', ':'))
+        note = (f"src=bss_entry,sustain={sus_s:.1f}s,ttr={ttr_s:.0f}s,"
+                f"yes_ask={yes_ask:.4f},no_ask={no_ask:.4f},"
+                f"yes_bid={yes_bid:.4f},no_bid={no_bid:.4f},"
+                f"extra_json={extra_json}")
+        size = state.config.position_size_usdc
+        first_price = mdm.bss_first_price or 0.0
+        qty = size / first_price if first_price else 0.0
+        row = [
+            int(time.time() * 1000),
+            "BSS_FIRST_LEG_DRY",
+            market.condition_id,
+            market.slug,
+            market.market_url,
+            f"{market.end_ts:.0f}",
+            mdm.bss_first_side or "",
+            (market.yes_token_id if mdm.bss_first_side == "YES"
+             else market.no_token_id),
+            f"{first_price:.4f}",
+            f"{(yes_bid if mdm.bss_first_side == 'YES' else no_bid):.4f}",
+            f"{size:.4f}",
+            f"{qty:.4f}",
+            "0.0000", "",
+            "0.0000",
+            "0.0000",
+            state.config.mode,
+            note,
+        ]
+        state.bs_trades_logger.log(row)
+    except Exception as e:
+        print(f"[bss_log] error first_leg slug={mdm.market.slug}: "
+              f"{type(e).__name__}: {e}", flush=True)
+
+
+def _bs_log_bss_candidate_event(state: BotState, mdm: MultiDurationMarket,
+                                  now: float, side: str, ask_price: float,
+                                  yes_ask: float, no_ask: float,
+                                  yes_bid: float, no_bid: float) -> None:
+    """v6.5.3: log a BSS_CANDIDATE_DRY event when a side's ask first dips
+    below T_FIRST (streak starts). This is the population from which
+    BSS_FIRST_LEG fires are drawn — logging candidates lets analysis
+    compare features at "could have fired" vs "did fire" time, fixing
+    selection bias.
+
+    Logged at most once per streak (caller ensures by only calling on
+    the None→ts transition). Same schema as BSS_FIRST_LEG for parsers
+    that expect uniform rows."""
+    if state.bs_trades_logger is None:
+        return
+    try:
+        market = mdm.market
+        leg2_side = "NO" if side == "YES" else "YES"
+        ttr_s = market.end_ts - now
+        yb = state.poly_books.get(market.yes_token_id)
+        nb = state.poly_books.get(market.no_token_id)
+        yes_d5 = _v653_ask_depth_5(yb) if yb else 0.0
+        no_d5 = _v653_ask_depth_5(nb) if nb else 0.0
+        yes_age = (now - yb.last_update_ts) if yb else 999.0
+        no_age = (now - nb.last_update_ts) if nb else 999.0
+        bin_last_ts_ms = None
+        bin_snap: List[Tuple[float, float]] = []
+        try:
+            if state.binance_prices:
+                bin_snap = list(state.binance_prices)
+                if bin_snap:
+                    bin_last_ts_ms = int(bin_snap[-1][0] * 1000)
+        except Exception:
+            pass
+        feats = _v653_compute_features(
+            market_id=market.condition_id,
+            fire_ts_ms=int(now * 1000),
+            leg1_side=side, leg2_side=leg2_side,
+            now_unix=now,
+            yes_ask_depth5_now=yes_d5, no_ask_depth5_now=no_d5,
+            yes_book_age_s=yes_age, no_book_age_s=no_age,
+            binance_last_tick_ts_ms=bin_last_ts_ms,
+            binance_prices_snapshot=bin_snap,
+            leg2_token_id=(market.yes_token_id if leg2_side == "YES"
+                           else market.no_token_id),
+            poly_trades=state.poly_trades,
+            decision_lat_ms=int((time.time() - now) * 1000),
+        )
+        extra_json = json.dumps(feats, separators=(',', ':'))
+        note = (f"src=bss_entry,kind=candidate,side={side},"
+                f"ask={ask_price:.4f},ttr={ttr_s:.0f}s,"
+                f"yes_ask={yes_ask:.4f},no_ask={no_ask:.4f},"
+                f"yes_bid={yes_bid:.4f},no_bid={no_bid:.4f},"
+                f"extra_json={extra_json}")
+        row = [
+            int(time.time() * 1000),
+            "BSS_CANDIDATE_DRY",
+            market.condition_id,
+            market.slug,
+            market.market_url,
+            f"{market.end_ts:.0f}",
+            side,
+            (market.yes_token_id if side == "YES" else market.no_token_id),
+            f"{ask_price:.4f}",
+            f"{(yes_bid if side == 'YES' else no_bid):.4f}",
+            "0.0000",
+            "0.0000",
+            "0.0000", "",
+            "0.0000",
+            "0.0000",
+            state.config.mode,
+            note,
+        ]
+        state.bs_trades_logger.log(row)
+    except Exception as e:
+        print(f"[bss_log] error candidate slug={mdm.market.slug}: "
+              f"{type(e).__name__}: {e}", flush=True)
+
+
+def _bs_log_bss_hold_shadow_event(state: "BotState", mdm: "MultiDurationMarket",
+                                    now: float,
+                                    yes_ask: float, no_ask: float,
+                                    yes_bid: float, no_bid: float) -> None:
+    """v6.5.3.1: emit a BSS_HOLD_SHADOW_DRY event during the WAITING_2ND
+    hold, capturing raw state for post-hoc emergency-sell rule design.
+
+    PURE LOGGING — no actual sell happens. Throttled to
+    _BS_BSS_SHADOW_TICK_INTERVAL_S cadence via mdm.bss_last_shadow_ts.
+    Caller (eval loop) checks this before calling.
+
+    Design philosophy: capture maximum-information raw state per tick.
+    NO baked-in rule booleans — all rule evaluation happens post-hoc in
+    pandas where it can be tuned freely. Each tick is a complete snapshot
+    of the decision space: leg1 trajectory, leg2 trajectory, recovery
+    dynamics, BTC directional context, latency, depth, and phase markers.
+
+    First tick of a hold (bss_hold_id is None) initializes per-hold
+    bookkeeping: hold_id (UUID), bin_price_atleg1, leg2_ask_atleg1, peaks/
+    troughs, visit counters. Subsequent ticks update the running stats.
+    """
+    if state.bs_trades_logger is None:
+        return
+    if mdm.bss_state != "WAITING_2ND":
+        return
+    # Need leg1 fill state to compute sell pnl
+    leg1_side = mdm.bss_first_side
+    leg1_fill_ask = mdm.bss_leg1_actual_ask
+    leg1_qty = mdm.bss_leg1_qty
+    leg1_size = mdm.bss_leg1_size_usdc
+    leg1_fee = mdm.bss_leg1_fee or 0.0
+    if (leg1_side is None or leg1_fill_ask is None
+            or leg1_qty is None or leg1_size is None):
+        return  # incomplete state, skip
+
+    try:
+        market = mdm.market
+        leg2_side = "NO" if leg1_side == "YES" else "YES"
+        ttr_s = market.end_ts - now
+        hold_elapsed_s = ((now - mdm.bss_first_fill_ts)
+                          if mdm.bss_first_fill_ts else 0.0)
+
+        # Current quotes
+        leg1_bid_now = yes_bid if leg1_side == "YES" else no_bid
+        leg2_ask_now = no_ask if leg1_side == "YES" else yes_ask
+
+        # Hypothetical sell pnl right now (v6.5.5: Polymarket curved fee)
+        sell_proceeds = leg1_qty * leg1_bid_now
+        sell_fee = _polymarket_taker_fee(leg1_qty, leg1_bid_now)
+        sell_pnl_now = sell_proceeds - sell_fee - leg1_size - leg1_fee
+        recov_ratio = (leg1_bid_now / leg1_fill_ask
+                       if leg1_fill_ask > 0 else 0.0)
+        recov_abs_c = (leg1_bid_now - leg1_fill_ask) * 100.0  # cents
+
+        # Current Binance price (latest tick)
+        bin_price_now: Optional[float] = None
+        bin_snap: List[Tuple[float, float]] = []
+        try:
+            if state.binance_prices:
+                bin_snap = list(state.binance_prices)
+                if bin_snap:
+                    bin_price_now = bin_snap[-1][1]
+        except Exception:
+            pass
+
+        # ── FIRST TICK INIT (lazy) ─────────────────────────────────
+        is_first_tick = (mdm.bss_hold_id is None)
+        if is_first_tick:
+            mdm.bss_hold_id = uuid.uuid4().hex[:12]
+            mdm.bss_hold_tick_idx = 0
+            mdm.bss_hold_bin_price_atleg1 = bin_price_now
+            mdm.bss_hold_leg2_ask_atleg1 = leg2_ask_now
+            mdm.bss_hold_pnl_peak = sell_pnl_now
+            mdm.bss_hold_pnl_peak_ts = now
+            mdm.bss_hold_pnl_was_positive = (sell_pnl_now >= 0)
+            mdm.bss_hold_leg1_bid_max = leg1_bid_now
+            mdm.bss_hold_leg1_bid_min = leg1_bid_now
+            mdm.bss_hold_leg2_ask_max = leg2_ask_now
+            mdm.bss_hold_leg2_ask_min = leg2_ask_now
+            mdm.bss_hold_l2_visits_below_055 = 0
+            mdm.bss_hold_l2_visits_below_062 = 0
+            mdm.bss_hold_l2_prev_above_055 = leg2_ask_now >= 0.55
+            mdm.bss_hold_l2_prev_above_062 = leg2_ask_now >= 0.62
+        else:
+            mdm.bss_hold_tick_idx += 1
+
+        # ── UPDATE RUNNING STATS ───────────────────────────────────
+        # Pnl peak tracking
+        if (mdm.bss_hold_pnl_peak is None
+                or sell_pnl_now > mdm.bss_hold_pnl_peak):
+            mdm.bss_hold_pnl_peak = sell_pnl_now
+            mdm.bss_hold_pnl_peak_ts = now
+        if sell_pnl_now >= 0 and not mdm.bss_hold_pnl_was_positive:
+            mdm.bss_hold_pnl_was_positive = True
+        # Leg1 bid extremes
+        if (mdm.bss_hold_leg1_bid_max is None
+                or leg1_bid_now > mdm.bss_hold_leg1_bid_max):
+            mdm.bss_hold_leg1_bid_max = leg1_bid_now
+        if (mdm.bss_hold_leg1_bid_min is None
+                or leg1_bid_now < mdm.bss_hold_leg1_bid_min):
+            mdm.bss_hold_leg1_bid_min = leg1_bid_now
+        # Leg2 ask extremes
+        if (mdm.bss_hold_leg2_ask_max is None
+                or leg2_ask_now > mdm.bss_hold_leg2_ask_max):
+            mdm.bss_hold_leg2_ask_max = leg2_ask_now
+        if (mdm.bss_hold_leg2_ask_min is None
+                or leg2_ask_now < mdm.bss_hold_leg2_ask_min):
+            mdm.bss_hold_leg2_ask_min = leg2_ask_now
+        # Visit-edge counters (count each downward crossing of threshold)
+        if leg2_ask_now < 0.55 and mdm.bss_hold_l2_prev_above_055:
+            mdm.bss_hold_l2_visits_below_055 += 1
+        mdm.bss_hold_l2_prev_above_055 = (leg2_ask_now >= 0.55)
+        if leg2_ask_now < 0.62 and mdm.bss_hold_l2_prev_above_062:
+            mdm.bss_hold_l2_visits_below_062 += 1
+        mdm.bss_hold_l2_prev_above_062 = (leg2_ask_now >= 0.62)
+
+        # ── LEG1 BID + LEG2 ASK TRAJECTORY FROM v6.5.3 RING BUFFER ──
+        # Ring buf tuple: (ts_ms, yes_ask, no_ask, yes_bid, no_bid,
+        #                  yes_ask_d5, no_ask_d5)
+        leg1_bid_idx = 3 if leg1_side == "YES" else 4
+        leg2_ask_idx = 1 if leg2_side == "YES" else 2
+        l1_d5_idx = 5 if leg1_side == "YES" else 6   # for asks of leg1 side (informational)
+        l2_d5_idx = 5 if leg2_side == "YES" else 6
+
+        l1_bid_drift_30s: Optional[float] = None
+        l1_bid_drift_60s: Optional[float] = None
+        l1_bid_drift_120s: Optional[float] = None
+        l1_bid_nch_30s: Optional[int] = None
+        l1_bid_falling_5s: Optional[int] = None
+        l1_bid_climbing_5s: Optional[int] = None
+        l2_ask_drift_30s: Optional[float] = None
+        l2_ask_drift_60s: Optional[float] = None
+        l2_ask_drift_120s: Optional[float] = None
+        l2_ask_nch_30s: Optional[int] = None
+        l2_ask_nch_60s: Optional[int] = None
+        l1_bid_d5_now: Optional[float] = None
+        l2_ask_d5_now: Optional[float] = None
+
+        try:
+            buf = _v653_buf.get(market.condition_id)
+            if buf is not None and len(buf) >= 3:
+                snap = list(buf)
+                now_ms = int(now * 1000)
+                # Most recent depth values (current)
+                last = snap[-1]
+                l1_bid_d5_now = float(last[l1_d5_idx])  # depth at leg1's ASK side (informational)
+                l2_ask_d5_now = float(last[l2_d5_idx])
+                for w_label, w_ms in (("30s", 30_000),
+                                        ("60s", 60_000),
+                                        ("120s", 120_000)):
+                    sub = [r for r in snap if (now_ms - r[0]) <= w_ms]
+                    if len(sub) >= 3:
+                        l1_bids = [float(r[leg1_bid_idx]) for r in sub]
+                        l2_asks = [float(r[leg2_ask_idx]) for r in sub]
+                        nch_l1 = sum(1 for i in range(1, len(l1_bids))
+                                     if l1_bids[i] != l1_bids[i-1])
+                        nch_l2 = sum(1 for i in range(1, len(l2_asks))
+                                     if l2_asks[i] != l2_asks[i-1])
+                        if w_label == "30s":
+                            l1_bid_drift_30s = leg1_bid_now - l1_bids[0]
+                            l2_ask_drift_30s = leg2_ask_now - l2_asks[0]
+                            l1_bid_nch_30s = nch_l1
+                            l2_ask_nch_30s = nch_l2
+                        elif w_label == "60s":
+                            l1_bid_drift_60s = leg1_bid_now - l1_bids[0]
+                            l2_ask_drift_60s = leg2_ask_now - l2_asks[0]
+                            l2_ask_nch_60s = nch_l2
+                        else:  # 120s
+                            l1_bid_drift_120s = leg1_bid_now - l1_bids[0]
+                            l2_ask_drift_120s = leg2_ask_now - l2_asks[0]
+                # Falling/climbing detection on trailing 5s of leg1 bid
+                sub5 = [r for r in snap if (now_ms - r[0]) <= 5_000]
+                if len(sub5) >= 3:
+                    l1_5 = [float(r[leg1_bid_idx]) for r in sub5]
+                    l1_bid_falling_5s = int(l1_5[-1] < l1_5[0])
+                    l1_bid_climbing_5s = int(l1_5[-1] > l1_5[0])
+        except Exception:
+            pass
+
+        # ── BINANCE DIRECTIONAL CONTEXT ────────────────────────────
+        bin_delta_since_leg1: Optional[float] = None
+        bin_delta_since_leg1_bps: Optional[float] = None
+        bin_adverse_since_leg1_bps: Optional[float] = None
+        bin_ret_5s_bps: Optional[float] = None
+        bin_ret_30s_bps: Optional[float] = None
+        bin_ret_60s_bps: Optional[float] = None
+        bin_ret_120s_bps: Optional[float] = None
+        bin_vol_60s_bps: Optional[float] = None
+        bin_age_ms: Optional[int] = None
+        try:
+            if bin_snap and len(bin_snap) >= 2:
+                bin_age_ms = int((now - bin_snap[-1][0]) * 1000)
+                if (mdm.bss_hold_bin_price_atleg1
+                        and mdm.bss_hold_bin_price_atleg1 > 0):
+                    bin_delta_since_leg1 = (
+                        bin_price_now - mdm.bss_hold_bin_price_atleg1
+                    ) if bin_price_now else 0.0
+                    bin_delta_since_leg1_bps = (
+                        (bin_price_now / mdm.bss_hold_bin_price_atleg1 - 1.0)
+                        * 10000.0
+                    ) if bin_price_now else 0.0
+                    # Adverse: signed for leg1 direction
+                    # leg1=YES means we bet UP — adverse = BTC down (negative ret → adverse positive)
+                    # leg1=NO  means we bet DOWN — adverse = BTC up (positive ret → adverse positive)
+                    if leg1_side == "YES":
+                        bin_adverse_since_leg1_bps = -bin_delta_since_leg1_bps
+                    else:
+                        bin_adverse_since_leg1_bps = bin_delta_since_leg1_bps
+
+                # Windowed returns
+                for w_label, w_s in (("5s", 5.0), ("30s", 30.0),
+                                       ("60s", 60.0), ("120s", 120.0)):
+                    cutoff = now - w_s
+                    recent = [(t, p) for t, p in bin_snap
+                              if t >= cutoff and p > 0]
+                    if len(recent) >= 2:
+                        ret_bps = ((recent[-1][1] / recent[0][1]) - 1.0) * 10000.0
+                        if w_label == "5s":
+                            bin_ret_5s_bps = ret_bps
+                        elif w_label == "30s":
+                            bin_ret_30s_bps = ret_bps
+                        elif w_label == "60s":
+                            bin_ret_60s_bps = ret_bps
+                        else:
+                            bin_ret_120s_bps = ret_bps
+                # 60s realized vol
+                cutoff = now - 60.0
+                recent = [(t, p) for t, p in bin_snap
+                          if t >= cutoff and p > 0]
+                if len(recent) >= 5:
+                    import math as _math
+                    prices = [p for _, p in recent]
+                    log_rets = []
+                    for i in range(len(prices) - 1):
+                        if prices[i] > 0 and prices[i+1] > 0:
+                            log_rets.append(_math.log(prices[i+1] / prices[i]))
+                    if log_rets:
+                        avg = sum(log_rets) / len(log_rets)
+                        var = sum((r - avg) ** 2 for r in log_rets) / len(log_rets)
+                        bin_vol_60s_bps = _math.sqrt(var) * 10000.0
+        except Exception:
+            pass
+
+        # Polymarket-Binance lag indicator (raw data; modelling post-hoc)
+        leg2_ask_move_since_leg1: Optional[float] = None
+        if mdm.bss_hold_leg2_ask_atleg1 is not None:
+            leg2_ask_move_since_leg1 = (
+                leg2_ask_now - mdm.bss_hold_leg2_ask_atleg1
+            )
+
+        # ── LATENCY ────────────────────────────────────────────────
+        yb = state.poly_books.get(market.yes_token_id)
+        nb = state.poly_books.get(market.no_token_id)
+        l1_book_age_ms: Optional[int] = None
+        l2_book_age_ms: Optional[int] = None
+        if leg1_side == "YES":
+            l1_book_age_ms = int((now - yb.last_update_ts) * 1000) if yb else None
+            l2_book_age_ms = int((now - nb.last_update_ts) * 1000) if nb else None
+        else:
+            l1_book_age_ms = int((now - nb.last_update_ts) * 1000) if nb else None
+            l2_book_age_ms = int((now - yb.last_update_ts) * 1000) if yb else None
+        decision_lat_ms = int((time.time() - now) * 1000)
+
+        # ── PHASE MARKERS ──────────────────────────────────────────
+        is_strict_window = int(hold_elapsed_s <= _BS_BSS_RELAX_AT_S)
+        is_last_60s = int(ttr_s <= 60)
+        is_last_30s = int(ttr_s <= 30)
+        is_last_10s = int(ttr_s <= 10)
+
+        # ── ASSEMBLE FEATURE DICT ──────────────────────────────────
+        feats: Dict[str, Any] = {
+            "v": "6.5.3.1",
+            "hold_id": mdm.bss_hold_id,
+            "tick_idx": mdm.bss_hold_tick_idx,
+            "hold_elapsed_s": round(hold_elapsed_s, 1),
+            "ttr_s": round(ttr_s, 1),
+            "leg1_side": leg1_side,
+            "leg2_side": leg2_side,
+            "leg1_fill_p": round(leg1_fill_ask, 4),
+            "leg1_qty": round(leg1_qty, 4),
+            "leg1_size": round(leg1_size, 4),
+            "leg1_bid_now": round(leg1_bid_now, 4),
+            "sell_pnl_now": round(sell_pnl_now, 4),
+            "recov_ratio": round(recov_ratio, 4),
+            "recov_abs_c": round(recov_abs_c, 2),
+            "leg2_ask_now": round(leg2_ask_now, 4),
+            # Leg1 across-hold extremes
+            "l1_bid_max_so_far": round(mdm.bss_hold_leg1_bid_max or 0.0, 4),
+            "l1_bid_min_so_far": round(mdm.bss_hold_leg1_bid_min or 0.0, 4),
+            # Leg2 across-hold extremes
+            "l2_ask_max_so_far": round(mdm.bss_hold_leg2_ask_max or 0.0, 4),
+            "l2_ask_min_so_far": round(mdm.bss_hold_leg2_ask_min or 0.0, 4),
+            # Visit counters (proximity to firing thresholds)
+            "l2_visits_below_055": mdm.bss_hold_l2_visits_below_055,
+            "l2_visits_below_062": mdm.bss_hold_l2_visits_below_062,
+            # Pnl recovery dynamics
+            "pnl_peak_so_far": round(mdm.bss_hold_pnl_peak or 0.0, 4),
+            "pnl_drop_from_peak": round(
+                sell_pnl_now - (mdm.bss_hold_pnl_peak or sell_pnl_now), 4),
+            "secs_since_pnl_peak": round(
+                now - (mdm.bss_hold_pnl_peak_ts or now), 1),
+            "pnl_was_pos": int(mdm.bss_hold_pnl_was_positive),
+            # Phase markers
+            "is_strict_window": is_strict_window,
+            "is_last_60s": is_last_60s,
+            "is_last_30s": is_last_30s,
+            "is_last_10s": is_last_10s,
+            # Latency
+            "decision_lat_ms": decision_lat_ms,
+        }
+        # Optional fields (None-safe)
+        if l1_bid_drift_30s is not None:
+            feats["l1_bid_drift_30s"] = round(l1_bid_drift_30s, 4)
+        if l1_bid_drift_60s is not None:
+            feats["l1_bid_drift_60s"] = round(l1_bid_drift_60s, 4)
+        if l1_bid_drift_120s is not None:
+            feats["l1_bid_drift_120s"] = round(l1_bid_drift_120s, 4)
+        if l1_bid_nch_30s is not None:
+            feats["l1_bid_nch_30s"] = l1_bid_nch_30s
+        if l1_bid_falling_5s is not None:
+            feats["l1_bid_falling_5s"] = l1_bid_falling_5s
+        if l1_bid_climbing_5s is not None:
+            feats["l1_bid_climbing_5s"] = l1_bid_climbing_5s
+        if l2_ask_drift_30s is not None:
+            feats["l2_ask_drift_30s"] = round(l2_ask_drift_30s, 4)
+        if l2_ask_drift_60s is not None:
+            feats["l2_ask_drift_60s"] = round(l2_ask_drift_60s, 4)
+        if l2_ask_drift_120s is not None:
+            feats["l2_ask_drift_120s"] = round(l2_ask_drift_120s, 4)
+        if l2_ask_nch_30s is not None:
+            feats["l2_ask_nch_30s"] = l2_ask_nch_30s
+        if l2_ask_nch_60s is not None:
+            feats["l2_ask_nch_60s"] = l2_ask_nch_60s
+        if l1_bid_d5_now is not None:
+            feats["l1_bid_d5_now"] = round(l1_bid_d5_now, 1)
+        if l2_ask_d5_now is not None:
+            feats["l2_ask_d5_now"] = round(l2_ask_d5_now, 1)
+        if bin_price_now is not None:
+            feats["bin_price_now"] = round(bin_price_now, 1)
+        if mdm.bss_hold_bin_price_atleg1 is not None:
+            feats["bin_price_atleg1"] = round(mdm.bss_hold_bin_price_atleg1, 1)
+        if bin_delta_since_leg1 is not None:
+            feats["bin_delta_since_leg1"] = round(bin_delta_since_leg1, 1)
+        if bin_delta_since_leg1_bps is not None:
+            feats["bin_delta_since_leg1_bps"] = round(bin_delta_since_leg1_bps, 1)
+        if bin_adverse_since_leg1_bps is not None:
+            feats["bin_adverse_since_leg1_bps"] = round(bin_adverse_since_leg1_bps, 1)
+        if bin_ret_5s_bps is not None:
+            feats["bin_ret_5s_bps"] = round(bin_ret_5s_bps, 1)
+        if bin_ret_30s_bps is not None:
+            feats["bin_ret_30s_bps"] = round(bin_ret_30s_bps, 1)
+        if bin_ret_60s_bps is not None:
+            feats["bin_ret_60s_bps"] = round(bin_ret_60s_bps, 1)
+        if bin_ret_120s_bps is not None:
+            feats["bin_ret_120s_bps"] = round(bin_ret_120s_bps, 1)
+        if bin_vol_60s_bps is not None:
+            feats["bin_vol_60s_bps"] = round(bin_vol_60s_bps, 1)
+        if leg2_ask_move_since_leg1 is not None:
+            feats["leg2_ask_move_since_leg1"] = round(leg2_ask_move_since_leg1, 4)
+        if bin_age_ms is not None:
+            feats["bin_age_ms"] = bin_age_ms
+        if l1_book_age_ms is not None:
+            feats["l1_book_age_ms"] = l1_book_age_ms
+        if l2_book_age_ms is not None:
+            feats["l2_book_age_ms"] = l2_book_age_ms
+        # Time-of-day context
+        try:
+            dt_utc = datetime.utcfromtimestamp(now)
+            feats["hod_utc"] = dt_utc.hour
+            feats["dow_utc"] = dt_utc.weekday()  # 0=Mon, 6=Sun
+        except Exception:
+            pass
+
+        extra_json = json.dumps(feats, separators=(',', ':'))
+        note = (f"src=bss_entry,kind=hold_shadow,"
+                f"hold_id={mdm.bss_hold_id},"
+                f"tick={mdm.bss_hold_tick_idx},"
+                f"elapsed={hold_elapsed_s:.1f}s,ttr={ttr_s:.0f}s,"
+                f"yes_ask={yes_ask:.4f},no_ask={no_ask:.4f},"
+                f"yes_bid={yes_bid:.4f},no_bid={no_bid:.4f},"
+                f"extra_json={extra_json}")
+        row = [
+            int(time.time() * 1000),
+            "BSS_HOLD_SHADOW_DRY",
+            market.condition_id,
+            market.slug,
+            market.market_url,
+            f"{market.end_ts:.0f}",
+            leg1_side,
+            (market.yes_token_id if leg1_side == "YES"
+             else market.no_token_id),
+            f"{leg1_fill_ask:.4f}",
+            f"{leg1_bid_now:.4f}",
+            f"{leg1_size:.4f}",
+            f"{leg1_qty:.4f}",
+            "0.0000", "",
+            "0.0000",
+            f"{sell_pnl_now:.4f}",
+            state.config.mode,
+            note,
+        ]
+        state.bs_trades_logger.log(row)
+    except Exception as e:
+        print(f"[bss_log] error hold_shadow slug={mdm.market.slug}: "
+              f"{type(e).__name__}: {e}", flush=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v6.5.4 SKULD: orphan-sell rule (positive-exit) + v6.5.5 TP
+# ═══════════════════════════════════════════════════════════════════
+
+def _bs_is_book_locked(yes_ask: Optional[float], no_ask: Optional[float],
+                        yes_bid: Optional[float], no_bid: Optional[float]) -> bool:
+    """v6.5.5.2: detect stale/ghost orderbook snapshot.
+
+    Real Polymarket orderbooks always have at least 1¢ spread (the
+    platform's tick size). When `yes_ask == yes_bid` (or `no_ask ==
+    no_bid`), the bot's in-memory book has frozen on a phantom snapshot
+    — typically caused by a websocket gap where price-level deltas were
+    missed and the book never converged back to the real state.
+
+    The signature of these phantoms is dead simple: `yes_ask = yes_bid =
+    0.505` and `no_ask = no_bid = 0.495` (the "locked at 50/50" state),
+    while the real depth book shows the market actually collapsed to
+    0.99/0.01 or similar extreme.
+
+    The May 19 audit found 23 of 24 phantom orphan-sell fires occurred
+    on ticks with zero spread. Decisions made on these ticks would fire
+    on prices that don't exist in the real market — booking fake DRY
+    profit and (in LIVE) submitting sell orders that immediately fail.
+
+    Returns True if the book appears stale and decisions should skip.
+    """
+    if (yes_ask is None or yes_bid is None
+            or no_ask is None or no_bid is None):
+        return True  # incomplete data treated as stale (defensive)
+    if yes_ask <= 0 or no_ask <= 0:
+        return True  # zero prices = collapsed/uninitialized book
+    # A real Polymarket orderbook always has ask > bid (at least 1¢).
+    return (yes_ask - yes_bid) <= 0 or (no_ask - no_bid) <= 0
+
+
+def _bs_update_band_sustain(mdm: "MultiDurationMarket",
+                             condition_met: bool, now: float,
+                             first_attr: str, last_attr: str,
+                             grace_s: float) -> Tuple[bool, float]:
+    """v6.5.5.2: update band-based sustain timestamps for a rule.
+
+    Replaces tick-counting persist mechanism with timestamp tracking
+    that tolerates brief wobble (gaps shorter than `grace_s`).
+
+    Logic:
+      - If condition is met NOW:
+          * Set first_attr if None (start of run)
+          * Update last_attr to now
+          * Return (True, run_duration_s)
+      - If condition is NOT met:
+          * If we have an active run AND gap since last > grace_s:
+            reset both (sustained failure)
+          * Otherwise: leave timestamps alone (brief wobble tolerated)
+          * Return (False, 0.0)
+
+    The caller checks the returned run_duration against its SUSTAIN_S
+    threshold and fires only when conditions are met NOW.
+    """
+    if condition_met:
+        if getattr(mdm, first_attr) is None:
+            setattr(mdm, first_attr, now)
+        setattr(mdm, last_attr, now)
+        first_ts = getattr(mdm, first_attr)
+        return True, now - first_ts
+    else:
+        last_ts = getattr(mdm, last_attr)
+        if last_ts is not None and (now - last_ts) > grace_s:
+            setattr(mdm, first_attr, None)
+            setattr(mdm, last_attr, None)
+        return False, 0.0
+
+
+def _bs_evaluate_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
+                              now: float,
+                              yes_ask: float, no_ask: float,
+                              yes_bid: float, no_bid: float) -> None:
+    """v6.5.4/v6.5.5: evaluate orphan exit rules on this shadow tick.
+
+    Two independent triggers can fire (whichever first):
+
+    (A) POSITIVE-EXIT (v6.5.4 defensive — BTC adverse, breakeven):
+        sell_pnl_now            >= _BS_BSS_ORPHAN_SELL_MIN_PNL
+        hold_elapsed_s          >= _BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S
+        bin_adverse_since_leg1  >= _BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS
+        for N consecutive shadow ticks → sell leg-1, lock in profit.
+
+    (B) TAKE-PROFIT (v6.5.5 opportunistic — bid up ratio×):
+        leg1_bid_now / leg1_entry >= _BS_BSS_ORPHAN_TP_RATIO
+        for M consecutive shadow ticks → sell leg-1, lock in gain.
+
+    Both rules NO-OP when their respective ENABLED flags are false.
+
+    v6.5.5.1 CASHOUT FIX: sell pnl uses `leg1_top_bid` directly (the
+    cashout proxy) rather than walking the bid book. Matches the May 1
+    "cashout style" agreement: "cashout always works — no liquidity
+    concerns". Polymarket curved fee formula (rate × p × (1-p)) is
+    applied as before. The book-walk simulator (`_bss_simulate_dry_sell`)
+    remains in the codebase for future LIVE-realism work but no longer
+    gates firing decisions.
+    """
+    if mdm.bss_state != "WAITING_2ND":
+        return
+    if not (_BS_BSS_ORPHAN_SELL_ENABLED or _BS_BSS_ORPHAN_TP_ENABLED):
+        return
+
+    # ── v6.5.5.2 LOCKED-SPREAD REJECT ────────────────────────────────
+    # If the in-memory orderbook is in the "locked at 50/50" stale state
+    # (yes_ask == yes_bid, no_ask == no_bid), our price view is a phantom
+    # and any sell decision based on it would fire on a price that does
+    # not exist in the real market. The May 19 audit found 23 of 24
+    # phantom orphan-sell fires occurred on locked-spread ticks. Skip
+    # the entire evaluation, including band-sustain updates. The book
+    # will recover on the next valid websocket update.
+    if _bs_is_book_locked(yes_ask, no_ask, yes_bid, no_bid):
+        return
+
+    leg1_side = mdm.bss_first_side
+    leg1_qty = mdm.bss_leg1_qty
+    leg1_size = mdm.bss_leg1_size_usdc
+    leg1_fee = mdm.bss_leg1_fee or 0.0
+    leg1_entry_ask = mdm.bss_leg1_actual_ask
+    if (leg1_side is None or leg1_qty is None
+            or leg1_size is None or leg1_entry_ask is None):
+        return  # incomplete state
+
+    # ── COMPUTE REALISTIC SELL VIA BID-WALK ───────────────────────────
+    leg1_top_bid = yes_bid if leg1_side == "YES" else no_bid
+    if leg1_top_bid is None or leg1_top_bid <= 0:
+        # No bid available — cannot evaluate or fire. Clear band-sustain
+        # state defensively (a missing bid is sustained failure).
+        mdm.bss_orphan_sell_first_qual_ts = None
+        mdm.bss_orphan_sell_last_qual_ts = None
+        mdm.bss_orphan_tp_first_qual_ts = None
+        mdm.bss_orphan_tp_last_qual_ts = None
+        return
+
+    market = mdm.market
+    token_id = (market.yes_token_id if leg1_side == "YES"
+                else market.no_token_id)
+
+    # v6.5.5.1 CASHOUT FIX: Use leg1_top_bid directly as the cashout
+    # proxy, matching the shadow logger and the cashout convention we
+    # agreed in the May 1 design discussion ("cashout always works — no
+    # liquidity concerns; price ≈ best bid").
+    #
+    # v6.5.5 used `_bss_simulate_dry_sell` to walk the bid book and gate
+    # on `bid_size`/levels. That was wrong: it returned no_liquidity on
+    # ghost-bid moments (visible price, zero depth) and blocked 75+
+    # seconds of +$0.82 fires on the 0x59bd47e1 trade. The book-walk
+    # simulator is RETAINED in the codebase for future LIVE realism work
+    # (and a diagnostic) but is no longer used to gate firing decisions.
+    #
+    # Under the cashout convention:
+    #   - Fill quantity = leg1_qty (full position, no partials)
+    #   - Fill price    = leg1_top_bid (the cashout proxy)
+    #   - Fill fee      = Polymarket curved formula on (qty, top_bid)
+    #   - Outcome       = "cashout" (informational tag)
+    sell_avg_p = leg1_top_bid
+    qty_sold = leg1_qty
+    sell_fee = _polymarket_taker_fee(qty_sold, sell_avg_p)
+    sell_outcome = "cashout"
+
+    # Realized sell pnl (Polymarket curved fee, cashout-style fill):
+    #   pnl = qty * cashout_price - sell_fee - leg1_cost - leg1_entry_fee
+    sell_proceeds = qty_sold * sell_avg_p
+    sell_pnl_now = sell_proceeds - sell_fee - leg1_size - leg1_fee
+
+    hold_elapsed_s = ((now - mdm.bss_first_fill_ts)
+                       if mdm.bss_first_fill_ts else 0.0)
+
+    # ── (A) POSITIVE-EXIT RULE ───────────────────────────────────────
+    # Requires Binance adverse signal. Skip the whole branch if disabled.
+    if _BS_BSS_ORPHAN_SELL_ENABLED:
+        bin_adverse_bps: Optional[float] = None
+        try:
+            if (mdm.bss_hold_bin_price_atleg1
+                    and mdm.bss_hold_bin_price_atleg1 > 0
+                    and state.binance_prices):
+                bin_snap = list(state.binance_prices)
+                if bin_snap:
+                    bin_price_now = bin_snap[-1][1]
+                    if bin_price_now and bin_price_now > 0:
+                        bin_delta_bps = (
+                            (bin_price_now / mdm.bss_hold_bin_price_atleg1) - 1.0
+                        ) * 10000.0
+                        if leg1_side == "YES":
+                            bin_adverse_bps = -bin_delta_bps
+                        else:
+                            bin_adverse_bps = bin_delta_bps
+        except Exception:
+            pass
+        if bin_adverse_bps is None:
+            # No Binance context → mark conditions not-met (band logic
+            # will tolerate brief gaps but reset on sustained absence).
+            _bs_update_band_sustain(
+                mdm, condition_met=False, now=now,
+                first_attr="bss_orphan_sell_first_qual_ts",
+                last_attr="bss_orphan_sell_last_qual_ts",
+                grace_s=_BS_BSS_ORPHAN_SELL_GRACE_S,
+            )
+        else:
+            pe_conditions = (
+                sell_pnl_now >= _BS_BSS_ORPHAN_SELL_MIN_PNL
+                and hold_elapsed_s >= _BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S
+                and bin_adverse_bps >= _BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS
+                # v6.5.9: when significant TTR remains, require higher P&L bar.
+                # Data: 79% of PE fires with TTR>120s would have paired or
+                # recovered to better P&L if held. Require $0.15 min when
+                # time remains to avoid leaving paired-trade value on the table.
+                and (market.end_ts - now > _BS_BSS_PE_HIGH_BAR_TTR_S
+                     and sell_pnl_now >= _BS_BSS_PE_HIGH_BAR_PNL
+                     or market.end_ts - now <= _BS_BSS_PE_HIGH_BAR_TTR_S)
+            )
+            qualified_now, run_duration_s = _bs_update_band_sustain(
+                mdm, condition_met=pe_conditions, now=now,
+                first_attr="bss_orphan_sell_first_qual_ts",
+                last_attr="bss_orphan_sell_last_qual_ts",
+                grace_s=_BS_BSS_ORPHAN_SELL_GRACE_S,
+            )
+            # Fire only when conditions are met RIGHT NOW (fresh bid,
+            # fresh pnl) AND the qualifying run has lasted SUSTAIN_S+.
+            # The intermediate wobble (within GRACE_S) is tolerated by
+            # the band-sustain helper.
+            if (qualified_now
+                    and run_duration_s >= _BS_BSS_ORPHAN_SELL_SUSTAIN_S):
+                _bs_fire_orphan_sell(state, mdm, now,
+                                      sell_avg_p, qty_sold, sell_fee,
+                                      sell_pnl_now, hold_elapsed_s,
+                                      bin_adverse_bps, sell_outcome,
+                                      reason="positive_exit",
+                                      yes_ask=yes_ask, no_ask=no_ask,
+                                      yes_bid=yes_bid, no_bid=no_bid)
+                return
+
+    # ── (B) TAKE-PROFIT RULE ────────────────────────────────────────
+    if _BS_BSS_ORPHAN_TP_ENABLED:
+        ratio = leg1_top_bid / leg1_entry_ask if leg1_entry_ask > 0 else 0.0
+        tp_condition = ratio >= _BS_BSS_ORPHAN_TP_RATIO
+        qualified_now_tp, run_duration_s_tp = _bs_update_band_sustain(
+            mdm, condition_met=tp_condition, now=now,
+            first_attr="bss_orphan_tp_first_qual_ts",
+            last_attr="bss_orphan_tp_last_qual_ts",
+            grace_s=_BS_BSS_ORPHAN_TP_GRACE_S,
+        )
+        if (qualified_now_tp
+                and run_duration_s_tp >= _BS_BSS_ORPHAN_TP_SUSTAIN_S):
+            _bs_fire_orphan_sell(state, mdm, now,
+                                  sell_avg_p, qty_sold, sell_fee,
+                                  sell_pnl_now, hold_elapsed_s,
+                                  None, sell_outcome,
+                                  reason="take_profit",
+                                  yes_ask=yes_ask, no_ask=no_ask,
+                                  yes_bid=yes_bid, no_bid=no_bid,
+                                  tp_ratio=ratio)
+            return
+
+    # ── (C) REVERSE-SNIPER CASHOUT (v6.5.7 / tiered v6.5.10) ────────
+    # Tiered adaptive exit: only sell when depth+TTR data shows full-loss
+    # probability is high enough to justify early exit over natural recovery.
+    # 820-market analysis: below winner=0.90 recovery is 20-40% — never sell.
+    # At winner>=0.90+TTR<120s: 82-93% full loss — sell to recover loser bid.
+    # At winner>=0.95 any TTR: 96-100% full loss — sell immediately.
+    # BTC guard: BTC falling >$5/60s cuts full-loss from 82%→43% → hold.
+    if _BS_BSS_ORPHAN_RS_ENABLED:
+        ttr_s_rs = market.end_ts - now
+        winner_ask_now = no_ask if leg1_side == "YES" else yes_ask
+
+        # BTC 60s delta — suppress RS if BTC moving in recovery direction
+        _rs_btc_delta = 0.0
+        try:
+            if state.binance_prices and len(state.binance_prices) >= 2:
+                _bp = list(state.binance_prices)
+                _price_now = _bp[-1][1]
+                _ts_now_ms = _bp[-1][0]
+                _price_60s = next(
+                    (p for ts, p in reversed(_bp)
+                     if _ts_now_ms - ts >= 60_000), _bp[0][1]
+                )
+                _rs_btc_raw = _price_now - _price_60s
+                # sign: positive = BTC rising, negative = BTC falling
+                # For YES-up orphan: if leg1=NO and BTC is falling → good for NO
+                # For NO-up orphan: if leg1=YES and BTC is rising → good for YES
+                if leg1_side == "NO":   # we hold NO, winner=YES
+                    _rs_btc_delta = -_rs_btc_raw  # falling BTC helps NO
+                else:                   # we hold YES, winner=NO
+                    _rs_btc_delta = _rs_btc_raw   # rising BTC helps YES
+        except Exception:
+            pass
+
+        # BTC guard: if BTC is moving favourably for our position, hold
+        _btc_recovery_signal = (
+            _BS_BSS_ORPHAN_RS_BTC_GUARD_USD > 0
+            and _rs_btc_delta > _BS_BSS_ORPHAN_RS_BTC_GUARD_USD
+        )
+
+        # Tiered condition: Tier1 (any TTR), Tier2, Tier3 (TTR-gated)
+        rs_condition = (
+            hold_elapsed_s >= _BS_BSS_ORPHAN_RS_MIN_ELAPSED_S
+            and leg1_top_bid > 0
+            and not _btc_recovery_signal
+            and (
+                winner_ask_now >= _BS_BSS_ORPHAN_RS_TIER1_WIN
+                or (winner_ask_now >= _BS_BSS_ORPHAN_RS_TIER2_WIN
+                    and ttr_s_rs <= _BS_BSS_ORPHAN_RS_TIER2_TTR_S)
+                or (winner_ask_now >= _BS_BSS_ORPHAN_RS_TIER3_WIN
+                    and ttr_s_rs <= _BS_BSS_ORPHAN_RS_TIER3_TTR_S)
+            )
+        )
+        qualified_now_rs, run_duration_s_rs = _bs_update_band_sustain(
+            mdm, condition_met=rs_condition, now=now,
+            first_attr="bss_orphan_rs_first_qual_ts",
+            last_attr="bss_orphan_rs_last_qual_ts",
+            grace_s=_BS_BSS_ORPHAN_RS_GRACE_S,
+        )
+        if (qualified_now_rs
+                and run_duration_s_rs >= _BS_BSS_ORPHAN_RS_SUSTAIN_S):
+            _bs_fire_orphan_sell(state, mdm, now,
+                                  sell_avg_p, qty_sold, sell_fee,
+                                  sell_pnl_now, hold_elapsed_s,
+                                  None, sell_outcome,
+                                  reason="reverse_sniper",
+                                  yes_ask=yes_ask, no_ask=no_ask,
+                                  yes_bid=yes_bid, no_bid=no_bid,
+                                  tp_ratio=winner_ask_now)
+            return
+
+
+def _bs_fire_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
+                          now: float,
+                          sell_avg_p: float, qty_sold: float,
+                          sell_fee: float, sell_pnl_now: float,
+                          hold_elapsed_s: float,
+                          bin_adverse_bps: Optional[float],
+                          sell_outcome: str,
+                          reason: str,
+                          yes_ask: float, no_ask: float,
+                          yes_bid: float, no_bid: float,
+                          tp_ratio: Optional[float] = None) -> None:
+    """v6.5.5/v6.5.6: execute the orphan-sell action.
+
+    v6.5.6: In LIVE mode, this now submits a REAL FAK sell order to the
+    Polymarket CLOB via `_bss_place_live_sell`. Three branches:
+
+      - filled_live  → actual full fill. Use ACTUAL fill price (not the
+                       snapshot caller passed in) for P&L. Update state
+                       to ORPHAN_SOLD, book P&L, log event.
+      - partial_live → some shares matched, less than full. Book P&L for
+                       sold portion proportionally, reduce mdm.bss_leg1_*
+                       to reflect remaining shares, transition state to
+                       ORPHAN_SOLD_PARTIAL. Remaining shares hold to
+                       resolution (no further orphan-sell attempts).
+      - rejected/error/no_client → don't change state, don't update P&L
+                       counter. Log BSS_ORPHAN_SELL_LIVE_FAIL. Position
+                       stays in WAITING_2ND. Band-sustain timestamps
+                       remain valid; rule may fire again next tick.
+
+    v6.5.4/v6.5.5: in DRY mode, no real order. Logs BSS_ORPHAN_SELL_DRY
+    (positive-exit) or BSS_ORPHAN_TP_DRY (take-profit) event, updates
+    dashboard P&L counter, records to trade history for dashboard
+    last-15-trades display, transitions state to terminal.
+
+    Caller passes (sell_avg_p, qty_sold, sell_fee, sell_pnl_now)
+    computed from the cashout convention as the DESIRED sale. In LIVE
+    these are inputs to the order; the actual fill may differ. In DRY
+    these become the recorded values directly.
+    """
+    leg1_side = mdm.bss_first_side
+    market = mdm.market
+    leg1_entry_ask = mdm.bss_leg1_actual_ask or 0.0
+    leg1_size = mdm.bss_leg1_size_usdc or 0.0
+    leg1_qty = mdm.bss_leg1_qty or 0.0
+    leg1_fee = mdm.bss_leg1_fee or 0.0
+    token_id = (market.yes_token_id if leg1_side == "YES"
+                else market.no_token_id)
+    is_live = (state.config.mode == "live")
+
+    # ── v6.5.6: LIVE BRANCH — submit actual FAK SELL order ───────────
+    # In LIVE we attempt the real order BEFORE updating any state. If
+    # the order fails or partially fills, the recorded P&L and state
+    # must reflect what actually happened, not the requested cashout.
+    actual_outcome = sell_outcome  # default: caller's "cashout" tag (DRY)
+    if is_live:
+        live_fill_p, live_fill_qty, live_fee, live_out = (
+            _bss_place_live_sell(
+                state, token_id,
+                decision_price=sell_avg_p, qty_shares=qty_sold,
+            )
+        )
+        if live_out in ("rejected", "error", "no_client"):
+            # Order didn't go through. Don't change state, don't book
+            # P&L, just log the failure so we have a record. The next
+            # shadow tick will re-evaluate the rule; if conditions are
+            # still met (and band-sustain still valid) it will retry.
+            try:
+                event_fail = ("BSS_ORPHAN_TP_LIVE_FAIL"
+                              if reason == "take_profit"
+                              else "BSS_ORPHAN_SELL_LIVE_FAIL")
+                note_fail = (f"src=bss_entry,leg=1,side={leg1_side},"
+                              f"reason={reason},attempted_price={sell_avg_p:.4f},"
+                              f"attempted_qty={qty_sold:.4f},"
+                              f"outcome={live_out},"
+                              f"hold_elapsed={hold_elapsed_s:.1f}s,"
+                              f"ttr={market.end_ts - now:.0f}s")
+                if state.bs_trades_logger is not None:
+                    row = [
+                        int(now * 1000), event_fail,
+                        market.condition_id, market.slug, market.market_url,
+                        f"{market.end_ts:.0f}", leg1_side, token_id,
+                        f"{leg1_entry_ask:.4f}", f"{sell_avg_p:.4f}",
+                        f"{leg1_size:.4f}", f"{qty_sold:.4f}",
+                        "0.0000", "", "0.0000", "0.0000",
+                        state.config.mode, note_fail,
+                    ]
+                    state.bs_trades_logger.log(row)
+            except Exception as e:
+                print(f"[bss_orphan_sell] LIVE fail log error: "
+                      f"{type(e).__name__}: {e}", flush=True)
+            return  # Don't update state, don't book P&L.
+
+        # filled_live or partial_live — recompute everything from ACTUAL
+        # fill data (price and qty), not the caller's snapshot.
+        sell_avg_p = live_fill_p
+        qty_sold = live_fill_qty
+        sell_fee = live_fee
+        actual_outcome = live_out
+
+        # P&L for the SOLD portion only (works for both full and partial).
+        # For partial, the entry-side cost and fee must be proportional
+        # to the fraction sold: cost_sold = leg1_size * (sold/leg1_qty),
+        # entry_fee_sold = leg1_fee * (sold/leg1_qty).
+        if leg1_qty > 0:
+            sold_fraction = min(qty_sold / leg1_qty, 1.0)
+        else:
+            sold_fraction = 1.0
+        cost_sold = leg1_size * sold_fraction
+        entry_fee_sold = leg1_fee * sold_fraction
+        sell_proceeds = qty_sold * sell_avg_p
+        sell_pnl_now = sell_proceeds - sell_fee - cost_sold - entry_fee_sold
+
+    # ── Stamp the sell on the mdm for downstream / dashboard visibility
+    mdm.bss_orphan_sold_at = sell_avg_p
+    mdm.bss_orphan_sold_ts = now
+    mdm.bss_orphan_sold_pnl = sell_pnl_now
+    mdm.bss_orphan_sold_reason = reason
+
+    if actual_outcome == "partial_live":
+        # Some shares remain unsold; they hold to natural market
+        # resolution. Reduce mdm.bss_leg1_* so the resolution flow
+        # settles only the remaining qty, not the original.
+        remaining_qty = leg1_qty - qty_sold
+        remaining_size = leg1_size * (remaining_qty / leg1_qty if leg1_qty > 0 else 0.0)
+        remaining_fee = leg1_fee * (remaining_qty / leg1_qty if leg1_qty > 0 else 0.0)
+        mdm.bss_leg1_qty = remaining_qty
+        mdm.bss_leg1_size_usdc = remaining_size
+        mdm.bss_leg1_fee = remaining_fee
+        # New terminal-ish state. The entry evaluator's terminal-state
+        # list and resolution gate both treat ORPHAN_SOLD_PARTIAL as a
+        # held position awaiting natural settlement (see v6.5.6 entry
+        # evaluator updates).
+        mdm.bss_state = "ORPHAN_SOLD_PARTIAL"
+    else:
+        # Full fill (LIVE) or DRY simulated sell — terminal.
+        mdm.bss_state = "ORPHAN_SOLD"
+
+    # Update P&L counter (dashboard reflects this immediately)
+    state.bs_pnl_today_usdc += sell_pnl_now
+    state.bs_total_sold_loser += 1   # reuse existing counter for visibility
+
+    # Log the event
+    try:
+        if reason == "take_profit":
+            event = "BSS_ORPHAN_TP_LIVE" if is_live else "BSS_ORPHAN_TP_DRY"
+        else:
+            event = "BSS_ORPHAN_SELL_LIVE" if is_live else "BSS_ORPHAN_SELL_DRY"
+        ttr_s = market.end_ts - now
+        note = (f"src=bss_entry,leg=1,side={leg1_side},reason={reason},"
+                f"entry_ask={leg1_entry_ask:.4f},"
+                f"sold_at={sell_avg_p:.4f},"
+                f"sell_outcome={actual_outcome},"
+                f"qty_sold={qty_sold:.4f},"
+                f"sell_fee={sell_fee:.4f},"
+                f"sell_pnl={sell_pnl_now:+.4f},"
+                f"hold_elapsed={hold_elapsed_s:.1f}s,"
+                f"bin_adverse_bps={bin_adverse_bps if bin_adverse_bps is None else f'{bin_adverse_bps:+.1f}'},"
+                f"tp_ratio={tp_ratio if tp_ratio is None else f'{tp_ratio:.3f}'},"
+                f"ttr={ttr_s:.0f}s")
+        if state.bs_trades_logger is not None:
+            row = [
+                int(now * 1000),
+                event,
+                market.condition_id,
+                market.slug,
+                market.market_url,
+                f"{market.end_ts:.0f}",
+                leg1_side,
+                token_id,
+                f"{leg1_entry_ask:.4f}",
+                f"{sell_avg_p:.4f}",
+                f"{leg1_size:.4f}",
+                f"{qty_sold:.4f}",
+                f"{sell_avg_p:.4f}",
+                f"{now:.0f}",
+                f"{sell_pnl_now:+.4f}",
+                "0.0000",
+                state.config.mode,
+                note,
+            ]
+            state.bs_trades_logger.log(row)
+    except Exception as e:
+        print(f"[bss_orphan_sell] log error slug={market.slug}: "
+              f"{type(e).__name__}: {e}", flush=True)
+
+    # v6.5.5: record in bs_trade_history so dashboard "last 15" shows it
+    try:
+        _bs_record_orphan_sold_history(state, mdm, now,
+                                        sell_avg_p, qty_sold,
+                                        sell_pnl_now, hold_elapsed_s,
+                                        bin_adverse_bps, reason, tp_ratio)
+    except Exception as e:
+        print(f"[bss_orphan_sell] history record error: "
+              f"{type(e).__name__}: {e}", flush=True)
+
+    # Clear ring buffer — position closed
+    try:
+        _v653_buf_clear(market.condition_id)
+    except Exception:
+        pass
+
+    extra = (f"adv={bin_adverse_bps:+.1f}bps" if bin_adverse_bps is not None
+             else f"ratio={tp_ratio:.3f}")
+    print(f"[bss_orphan_sell] market={market.condition_id[:10]}… "
+          f"reason={reason} side={leg1_side} "
+          f"entry={leg1_entry_ask:.4f}→sold@{sell_avg_p:.4f} "
+          f"({sell_outcome}) pnl=${sell_pnl_now:+.4f} "
+          f"elapsed={hold_elapsed_s:.0f}s {extra} "
+          f"ttr={(market.end_ts - now):.0f}s", flush=True)
+
+
+def _bs_record_orphan_sold_history(state: "BotState", mdm: "MultiDurationMarket",
+                                     now: float,
+                                     sell_avg_p: float, qty_sold: float,
+                                     sell_pnl: float, hold_elapsed_s: float,
+                                     bin_adverse_bps: Optional[float],
+                                     reason: str,
+                                     tp_ratio: Optional[float]) -> None:
+    """v6.5.5: append the orphan-sold position to bs_trade_history for
+    the dashboard last-15-trades display. Schema is similar to paired
+    trades but with `outcome='ORPHAN_SOLD'` and includes sell-side fields
+    (sell_price, sell_ts_offset, sell_pnl, sell_reason, etc).
+    """
+    market = mdm.market
+    leg1_side = mdm.bss_first_side or ""
+    leg1_entry_ask = mdm.bss_leg1_actual_ask or 0.0
+    leg1_size = mdm.bss_leg1_size_usdc or 0.0
+    leg1_qty = mdm.bss_leg1_qty or 0.0
+    entry_ts = mdm.bss_first_fill_ts or now
+
+    entry = {
+        "market_id": market.condition_id,
+        "market_url": market.market_url,
+        "slug": market.slug,
+        "outcome": "ORPHAN_SOLD",
+        "market_winner": "",   # we don't know yet — market still pending
+        "had_sell_loser": False,
+        # The leg we held (use yes_* fields if leg1=YES else no_*; the
+        # OTHER side is empty since orphan never filled leg-2)
+        "leg1_side": leg1_side,
+        "leg1_entry_ask": round(leg1_entry_ask, 4),
+        "leg1_qty": round(leg1_qty, 4),
+        "leg1_size_usdc": round(leg1_size, 4),
+        # Sell-specific fields (new in v6.5.5)
+        "sell_price": round(sell_avg_p, 4),
+        "sell_qty": round(qty_sold, 4),
+        "sell_pnl": round(sell_pnl, 4),
+        "sell_reason": reason,
+        "hold_elapsed_s": round(hold_elapsed_s, 1),
+        "bin_adverse_bps": (None if bin_adverse_bps is None
+                             else round(bin_adverse_bps, 1)),
+        "tp_ratio": (None if tp_ratio is None else round(tp_ratio, 3)),
+        # Compat fields for dashboard renderer (paired-trade schema)
+        "total_pnl": round(sell_pnl, 4),
+        "sum_ask_at_entry": round(leg1_entry_ask, 4),
+        "entry_ts": entry_ts,
+        "close_ts": now,
+        # Stub the yes_/no_ leg fields — dashboard branches on outcome
+        "yes_entry_ask": (round(leg1_entry_ask, 4) if leg1_side == "YES"
+                           else 0.0),
+        "yes_close_price": (round(sell_avg_p, 4) if leg1_side == "YES"
+                              else 0.0),
+        "yes_pnl": (round(sell_pnl, 4) if leg1_side == "YES" else 0.0),
+        "no_entry_ask": (round(leg1_entry_ask, 4) if leg1_side == "NO"
+                          else 0.0),
+        "no_close_price": (round(sell_avg_p, 4) if leg1_side == "NO"
+                             else 0.0),
+        "no_pnl": (round(sell_pnl, 4) if leg1_side == "NO" else 0.0),
+    }
+    state.bs_trade_history.append(entry)
+    # Bound memory (mirror paired-history behavior)
+    if len(state.bs_trade_history) > 100:
+        state.bs_trade_history = state.bs_trade_history[-100:]
+
+
+def _bs_log_bss_leg_fill_event(state: BotState, mdm: MultiDurationMarket,
+                                  now: float, leg_num: int, fire_side: str,
+                                  decision_ask: float, fill_ask: float,
+                                  fill_qty: float, fee: float, size_usdc: float,
+                                  outcome: str, sus_s: float, is_live: bool,
+                                  yes_ask: float, no_ask: float,
+                                  yes_bid: float, no_bid: float,
+                                  phase: Optional[str] = None) -> None:
+    """v6.5.0: log a per-leg fill event. event = BSS_LEG_FILL_DRY or _LIVE.
+    Captures actual fill data (price, qty, fee) separately from decision price.
+    Slippage = fill_ask - decision_ask (positive when book moved up).
+
+    v6.5.5.2: optional `phase` parameter ("floor" | "strict" | "relaxed")
+    surfaces second-leg firing path in the CSV note for analytics. Floor
+    fires (sustain=0, deep-dip) and strict/relaxed (timed sustain) are
+    logged identically otherwise; this distinction was previously visible
+    only in stdout log lines, not in trade history.
+    """
+    if state.bs_trades_logger is None:
+        return
+    try:
+        market = mdm.market
+        event = "BSS_LEG_FILL_LIVE" if is_live else "BSS_LEG_FILL_DRY"
+        slippage = fill_ask - decision_ask
+        ttr_s = market.end_ts - now
+        phase_part = f",phase={phase}" if phase else ""
+        note = (f"src=bss_entry,leg={leg_num}{phase_part},"
+                f"decision_ask={decision_ask:.4f},"
+                f"fill_ask={fill_ask:.4f},slippage={slippage:+.4f},"
+                f"qty={fill_qty:.4f},fee={fee:.4f},"
+                f"outcome={outcome},sustain={sus_s:.1f}s,ttr={ttr_s:.0f}s")
+        token_id = (market.yes_token_id if fire_side == "YES"
+                    else market.no_token_id)
+        bid_at_fire = yes_bid if fire_side == "YES" else no_bid
+        row = [
+            int(now * 1000),
+            event,
+            market.condition_id,
+            market.slug,
+            market.market_url,
+            f"{market.end_ts:.0f}",
+            fire_side,
+            token_id,
+            f"{fill_ask:.4f}",
+            f"{bid_at_fire:.4f}",
+            f"{size_usdc:.4f}",
+            f"{fill_qty:.4f}",
+            "0.0000", "",
+            f"{-fee:+.4f}",       # entry P&L = negative fee (cost paid)
+            "0.0000",
+            state.config.mode,
+            note,
+        ]
+        state.bs_trades_logger.log(row)
+        # v6.5.4: dashboard P&L fix. Until v6.5.3.x, the dashboard counter
+        # state.bs_pnl_today_usdc was updated only on RESOLVE events (which
+        # reflect gross win/loss without fees). The per-leg taker fee was
+        # logged to CSV here (as pnl=-fee) but never accumulated. Result:
+        # dashboard showed +$22.86 while real net was +$8.29 (a $14.57 gap
+        # in the 49.5h audit, exactly matching 743 fills × $0.02 fee).
+        # Add the fee here so the dashboard reflects true net.
+        state.bs_pnl_today_usdc -= fee
+    except Exception as e:
+        print(f"[bss_log] error leg_fill slug={mdm.market.slug}: "
+              f"{type(e).__name__}: {e}", flush=True)
+
+
+def _bs_log_bss_leg_fok_fail_event(state: BotState, mdm: MultiDurationMarket,
+                                     now: float, leg_num: int, fire_side: str,
+                                     decision_ask: float, outcome: str,
+                                     yes_ask: float, no_ask: float,
+                                     yes_bid: float, no_bid: float) -> None:
+    """v6.5.0: log a per-leg FOK/fill-failure event. event = BSS_LEG_FOK_FAIL_DRY
+    or _LIVE. Captures the failure reason (rejected, error, no_book, etc.).
+    Logged ONCE per failure attempt. The state machine prevents retry-loop
+    spam by resetting sustain timers — no new event will fire until the dip
+    sustains afresh."""
+    if state.bs_trades_logger is None:
+        return
+    try:
+        market = mdm.market
+        is_live = (state.config.mode == "live")
+        event = "BSS_LEG_FOK_FAIL_LIVE" if is_live else "BSS_LEG_FOK_FAIL_DRY"
+        ttr_s = market.end_ts - now
+        note = (f"src=bss_entry,leg={leg_num},"
+                f"decision_ask={decision_ask:.4f},"
+                f"outcome={outcome},ttr={ttr_s:.0f}s,"
+                f"yes_ask={yes_ask:.4f},no_ask={no_ask:.4f}")
+        token_id = (market.yes_token_id if fire_side == "YES"
+                    else market.no_token_id)
+        size = state.config.position_size_usdc
+        row = [
+            int(now * 1000),
+            event,
+            market.condition_id,
+            market.slug,
+            market.market_url,
+            f"{market.end_ts:.0f}",
+            fire_side,
+            token_id,
+            f"{decision_ask:.4f}",
+            "0.0000",
+            f"{size:.4f}",
+            "0.0000",
+            "0.0000", "",
+            "0.0000",
+            "0.0000",
+            state.config.mode,
+            note,
+        ]
+        state.bs_trades_logger.log(row)
+    except Exception as e:
+        print(f"[bss_log] error leg_fok_fail slug={mdm.market.slug}: "
+              f"{type(e).__name__}: {e}", flush=True)
+
+
+def _bs_log_bss_second_leg_event(state: BotState, mdm: MultiDurationMarket,
+                                   pos: BothSidesPosition, now: float,
+                                   yes_ask: float, no_ask: float,
+                                   yes_bid: float, no_bid: float,
+                                   sus_s: float, threshold: float) -> None:
+    """v6.3.0: kept for backward compat. v6.5.0 now writes BSS_LEG_FILL_DRY/LIVE
+    as the primary leg-2 event; this BSS_SECOND_LEG_DRY row is also written
+    for downstream parsers that key on the old name."""
+    if state.bs_trades_logger is None:
+        return
+    second_side = "NO" if mdm.bss_first_side == "YES" else "YES"
+    second_leg = pos.no_leg if second_side == "NO" else pos.yes_leg
+    elapsed_s = now - (mdm.bss_first_fill_ts or now)
+    note = (f"src=bss_entry,phase={mdm.bss_second_phase},"
+            f"sustain={sus_s:.1f}s,threshold={threshold:.4f},"
+            f"elapsed={elapsed_s:.1f}s,"
+            f"first_paid={mdm.bss_leg1_actual_ask or 0.0:.4f},"
+            f"second_paid={mdm.bss_leg2_actual_ask or 0.0:.4f},"
+            f"sum_ask={(mdm.bss_leg1_actual_ask or 0.0) + (mdm.bss_leg2_actual_ask or 0.0):.4f}")
+    _bs_log_trade_event(state, "BSS_SECOND_LEG_DRY", pos, second_leg,
+                         note=note)
+
+
+def _bs_log_bss_orphan_end_event(state: BotState, mdm: MultiDurationMarket,
+                                    now: float, yes_ask: float, no_ask: float,
+                                    yes_bid: float, no_bid: float) -> None:
+    """v6.5.0: log a BSS_ORPHAN_END event when window closes with leg 1
+    held but no leg 2. No sell happens. Just records the transition for
+    analysis — the actual P&L will be logged at RESOLVE time when the CTF
+    pays out the held position."""
+    if state.bs_trades_logger is None:
+        return
+    try:
+        market = mdm.market
+        first_ask = mdm.bss_leg1_actual_ask or 0.0
+        first_qty = mdm.bss_leg1_qty or 0.0
+        first_size = mdm.bss_leg1_size_usdc or 0.0
+        first_fee = mdm.bss_leg1_fee or 0.0
+        held_ago_s = now - (mdm.bss_first_fill_ts or now)
+        ttr_s = market.end_ts - now
+        note = (f"src=bss_entry,first_side={mdm.bss_first_side},"
+                f"first_ask={first_ask:.4f},first_qty={first_qty:.4f},"
+                f"first_size={first_size:.4f},first_fee={first_fee:.4f},"
+                f"held_ago_s={held_ago_s:.0f},ttr={ttr_s:.0f}s,"
+                f"yes_ask={yes_ask:.4f},no_ask={no_ask:.4f},"
+                f"yes_bid={yes_bid:.4f},no_bid={no_bid:.4f}")
+        token_id = (market.yes_token_id if mdm.bss_first_side == "YES"
+                    else market.no_token_id)
+        bid = yes_bid if mdm.bss_first_side == "YES" else no_bid
+        row = [
+            int(now * 1000),
+            "BSS_ORPHAN_END",
+            market.condition_id,
+            market.slug,
+            market.market_url,
+            f"{market.end_ts:.0f}",
+            mdm.bss_first_side or "",
+            token_id,
+            f"{first_ask:.4f}",
+            f"{bid:.4f}",
+            f"{first_size:.4f}",
+            f"{first_qty:.4f}",
+            "0.0000", "",
+            "0.0000",       # P&L recorded at RESOLVE_WIN/RESOLVE_LOSS later
+            "0.0000",
+            state.config.mode,
+            note,
+        ]
+        state.bs_trades_logger.log(row)
+    except Exception as e:
+        print(f"[bss_log] error orphan_end slug={mdm.market.slug}: "
+              f"{type(e).__name__}: {e}", flush=True)
+
+
+
+# ───────────────────────────────────────────────────────────────────────
+def _bs_evaluate_verification_late(
+        state: BotState, pos: BothSidesPosition,
+        now: float) -> Tuple[bool, str, str, float, float]:
+    """Returns (should_fire, reason, loser_side, loser_bid, winner_ask).
+    Only invoked when _BS_STRATEGY == 'verification_late'.
+
+    v6.2.4 ARM/FREEZE state machine (whipsaw detection):
+      - On every tick where TTR ≤ 60s, update pos.vl_* state.
+      - ARM the moment winner_ask ≥ _BS_VL_ARM_THRESHOLD (default 0.70).
+        Captures vl_armed_side, starts vl_peak_winner_ask tracking.
+      - Once armed, FREEZE permanently if:
+          (a) the winning side flips (different side now has higher ask), OR
+          (b) winner_ask drops more than _BS_VL_DROP_TOLERANCE (0.03) below
+              the peak observed since arming.
+      - Once frozen → never fire on this market for the rest of its life.
+      - If TTR ≤ 60s passes without arming (winner_ask never ≥ 0.70) → also
+        treated as "not safe to fire" — the verification rules are gated
+        behind "armed AND not frozen".
+
+    All state transitions are recorded:
+      - sell_loser_status carries the live status (armed/frozen/etc.)
+      - On freeze: vl_freeze_reason + vl_freeze_ts captured (visible in CSV
+        downstream via diag and in dashboard via sell_loser_status).
+    """
+
+    ttr = pos.end_ts - now
+    if ttr < 0.0 or ttr > 60.0:
+        return False, "ttr_outside_60s", "", 0.0, 0.0
+
+    yes_book = state.poly_books.get(pos.yes_leg.token_id)
+    no_book = state.poly_books.get(pos.no_leg.token_id)
+    if yes_book is None or no_book is None:
+        return False, "no_book", "", 0.0, 0.0
+
+    book_age_max = max(now - yes_book.last_update_ts,
+                       now - no_book.last_update_ts)
+    if book_age_max > 30.0:
+        return False, f"book_stale:{book_age_max:.0f}s", "", 0.0, 0.0
+
+    yes_ask = float(yes_book.ask)
+    no_ask = float(no_book.ask)
+    yes_bid = float(yes_book.bid)
+    no_bid = float(no_book.bid)
+
+    # Identify winner = side with HIGHER ask (closer to $1)
+    if yes_ask >= no_ask and yes_ask > 0:
+        winner_side = "YES"
+        winner_ask = yes_ask
+        loser_side = "NO"
+        loser_bid = no_bid
+    elif no_ask > 0:
+        winner_side = "NO"
+        winner_ask = no_ask
+        loser_side = "YES"
+        loser_bid = yes_bid
+    else:
+        return False, "both_asks_zero", "", 0.0, 0.0
+
+    # ────────────────────────────────────────────────────────────────────
+    # v6.2.4: ARM / FREEZE state machine
+    # ────────────────────────────────────────────────────────────────────
+    if pos.vl_frozen:
+        return False, (f"vl_frozen:{pos.vl_freeze_reason}"), \
+               loser_side, loser_bid, winner_ask
+
+    # ARM logic
+    if not pos.vl_armed:
+        if winner_ask >= _BS_VL_ARM_THRESHOLD:
+            pos.vl_armed = True
+            pos.vl_armed_side = winner_side
+            pos.vl_peak_winner_ask = winner_ask
+            pos.vl_armed_ts = now              # v6.2.5: arm timestamp for vl_armed_for_s diag
+            pos.vl_peak_update_count = 1       # v6.2.5: count this initial peak set as update #1
+            print(f"[vl_arm] market={pos.market_id[:10]}… armed_side={winner_side} "
+                  f"winner_ask={winner_ask:.3f} ttr={ttr:.0f}s", flush=True)
+        else:
+            # Not yet armed and winner_ask too low — wait for next tick
+            return False, (f"vl_unarmed:winner_ask={winner_ask:.3f}<"
+                           f"{_BS_VL_ARM_THRESHOLD:.2f},ttr={ttr:.0f}s"), \
+                   loser_side, loser_bid, winner_ask
+
+    # Already armed — FREEZE checks
+    # Check (a): side flip — was winning, now isn't
+    if pos.vl_armed_side != winner_side:
+        pos.vl_frozen = True
+        pos.vl_freeze_reason = (f"side_flipped:was={pos.vl_armed_side},"
+                                f"now={winner_side},winner_ask={winner_ask:.3f}")
+        pos.vl_freeze_ts = now
+        print(f"[vl_freeze] market={pos.market_id[:10]}… "
+              f"reason=side_flip {pos.vl_armed_side}→{winner_side} "
+              f"peak={pos.vl_peak_winner_ask:.3f} now={winner_ask:.3f} "
+              f"ttr={ttr:.0f}s", flush=True)
+        return False, (f"vl_frozen:{pos.vl_freeze_reason}"), \
+               loser_side, loser_bid, winner_ask
+
+    # Update peak (only if armed side is still winning, which we just checked)
+    if winner_ask > pos.vl_peak_winner_ask:
+        pos.vl_peak_winner_ask = winner_ask
+        pos.vl_peak_update_count += 1   # v6.2.5: 1Hz-leak diagnostic counter
+
+    # Check (b): drop > tolerance below peak.
+    # Add a tiny epsilon (1e-6) to guard against float-arithmetic edge cases
+    # like (0.85 - 0.82) yielding 0.0300000...4 instead of exactly 0.03.
+    drop = pos.vl_peak_winner_ask - winner_ask
+    if drop > _BS_VL_DROP_TOLERANCE + 1e-6:
+        pos.vl_frozen = True
+        pos.vl_freeze_reason = (f"drop:peak={pos.vl_peak_winner_ask:.3f},"
+                                f"now={winner_ask:.3f},drop={drop:.3f}>"
+                                f"{_BS_VL_DROP_TOLERANCE:.3f}")
+        pos.vl_freeze_ts = now
+        print(f"[vl_freeze] market={pos.market_id[:10]}… "
+              f"reason=drop peak={pos.vl_peak_winner_ask:.3f} "
+              f"now={winner_ask:.3f} drop={drop:.3f}>"
+              f"{_BS_VL_DROP_TOLERANCE:.3f} ttr={ttr:.0f}s", flush=True)
+        return False, (f"vl_frozen:{pos.vl_freeze_reason}"), \
+               loser_side, loser_bid, winner_ask
+
+    # Armed AND not frozen — proceed to phase B/C/D evaluation
+    # ────────────────────────────────────────────────────────────────────
+
+    # Tiered: tightest TTR window first (lowest threshold)
+    threshold_used = None
+    phase = None
+    if ttr <= 10.0 and winner_ask >= 0.80:
+        threshold_used = 0.80; phase = "D"
+    elif ttr <= 30.0 and winner_ask >= 0.85:
+        threshold_used = 0.85; phase = "C"
+    elif ttr <= 60.0 and winner_ask >= 0.90:
+        threshold_used = 0.90; phase = "B"
+
+    if threshold_used is None:
+        return False, (f"vl_armed_no_phase:winner_ask={winner_ask:.3f},"
+                       f"ttr={ttr:.0f}s,peak={pos.vl_peak_winner_ask:.3f}"), \
+               loser_side, loser_bid, winner_ask
+
+    if loser_bid <= 0.0:
+        return False, f"loser_bid_zero:{loser_bid:.3f}", \
+               loser_side, loser_bid, winner_ask
+
+    reason = (f"verification_late:phase={phase},"
+              f"winner_ask={winner_ask:.3f},thr={threshold_used:.2f},"
+              f"ttr={ttr:.0f}s,peak={pos.vl_peak_winner_ask:.3f}")
+    return True, reason, loser_side, loser_bid, winner_ask
+
+
+def _bs_close_leg(leg: BothSidesLeg, close_price: float, close_ts: float,
+                   reason: str) -> None:
+    """Close one leg in place. Computes pnl_usdc using the buy-side fee
+    structure shared with the v5.7.0 _close_with_pnl path: pnl = qty *
+    close_price - size_usdc. (Fees not modeled in DRY — same as v5.8.1.)
+    """
+    leg.closed = True
+    leg.close_reason = reason
+    leg.close_price = close_price
+    leg.close_ts = close_ts
+    leg.pnl_usdc = leg.qty_shares * close_price - leg.size_usdc
+
+
+# ─────────────────────────────────────────────────────────────────────
+# v6.1.2: resolution cascade helpers — determine winner from any source.
+# Returns Optional[bool]: True = YES won, False = NO won, None = unknown.
+# Used by _bs_settle_position when WS book is cleared at end_ts+2s.
+# ─────────────────────────────────────────────────────────────────────
+
+def _resolve_btc_winner_via_chainlink_for_market(
+        end_ts: float, duration_s: int) -> Optional[bool]:
+    """v6.1.2: read Chainlink relay BTC price at start_ts and end_ts; return
+    True if YES won (price went up over the candle), False if NO won, None
+    if the relay doesn't have data within tolerance.
+
+    Reuses the existing chainlink_stream_log infrastructure (already streaming
+    via boot()). Tolerance 60s — the relay publishes every 5-10s typically,
+    so this should hit on the first try unless the stream had a gap.
+    """
+    if not _CHAINLINK_AVAILABLE or chainlink_stream_log is None:
+        return None
+    try:
+        symbol = chainlink_stream_log.get_symbol_for_coin("BTC")
+        if symbol is None:
+            return None
+        start_ts = end_ts - duration_s
+        start_pt = chainlink_stream_log.get_price_at(symbol, start_ts, tolerance_s=60.0)
+        end_pt = chainlink_stream_log.get_price_at(symbol, end_ts, tolerance_s=60.0)
+        if start_pt is None or end_pt is None:
+            return None
+        start_price = start_pt["value"]
+        end_price = end_pt["value"]
+        if start_price <= 0 or end_price <= 0:
+            return None
+        # Edge case: BTC moved literally 0.00 cents across the candle.
+        # Polymarket's resolution rules treat this as a tie (both sides 0.5
+        # in outcomes) but in practice this is essentially never observed
+        # at sub-second precision. We return None to defer to Gamma which
+        # has the on-chain answer for tie-resolution.
+        if end_price == start_price:
+            return None
+        return end_price > start_price
+    except Exception as e:
+        print(f"[bs_settle_chainlink] error: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _resolve_btc_winner_via_gamma(
+        market_id: str, yes_token_id: str,
+        no_token_id: str) -> Optional[bool]:
+    """v6.1.2: query Polymarket Gamma API for the on-chain market resolution.
+    Returns True/False once Polymarket has marked the market closed AND has
+    valid outcomePrices. None until then (Polymarket usually settles within
+    60-120s of end_ts).
+
+    Throttling is the caller's responsibility (the network call is ~1s).
+    """
+    md = _fetch_market_resolution(market_id)
+    if md is None:
+        return None
+    closed = bool(md.get("closed", False))
+    if not closed:
+        return None
+    out_raw = md.get("outcomePrices")
+    try:
+        prices = json.loads(out_raw) if isinstance(out_raw, str) else out_raw
+    except Exception:
+        return None
+    if not isinstance(prices, list) or len(prices) != 2:
+        return None
+    try:
+        yes_payout = float(prices[0])
+        no_payout = float(prices[1])
+    except Exception:
+        return None
+    # Map outcome prices to YES/NO via outcome labels (v5.8.1 _settle_position
+    # uses the same logic). outcomes[0]='Up'/'Yes' → prices[0] is YES payout.
+    outcomes_raw = md.get("outcomes")
+    try:
+        outcomes = (json.loads(outcomes_raw) if isinstance(outcomes_raw, str)
+                    else outcomes_raw)
+    except Exception:
+        outcomes = None
+    if isinstance(outcomes, list) and len(outcomes) == 2:
+        o0 = (outcomes[0] or "").strip().lower()
+        if o0 in ("up", "yes"):
+            return yes_payout >= 0.5
+        else:
+            return no_payout < 0.5
+    # Fallback: assume index 0 is YES.
+    return yes_payout >= 0.5
+
+
+def _resolve_btc_winner_via_binance_for_market(
+        state: BotState, end_ts: float, duration_s: int,
+        tolerance_s: float = 30.0) -> Optional[bool]:
+    """v6.1.6: read state.binance_prices deque for BTC at start_ts and end_ts.
+    Returns True if YES won (price went up), False if NO won, None if not
+    enough data within tolerance.
+
+    Binance trades stream at ~1Hz+ continuously, so unlike the Chainlink
+    relay (which only publishes on 0.5% deviation or hourly heartbeat),
+    this nearly always has fresh samples within a few seconds of any
+    target timestamp. This is the workhorse resolution source post-v6.1.6.
+
+    The deque holds (ts_seconds, price) tuples, where ts is epoch seconds
+    (float). Snapshot the deque to avoid race with the Binance WS thread.
+    """
+    if not state.binance_prices:
+        return None
+    snapshot = list(state.binance_prices)
+    start_ts = end_ts - duration_s
+
+    def closest(target_ts: float) -> Optional[float]:
+        best_price = None
+        best_dt = float('inf')
+        for ts, price in snapshot:
+            dt = abs(ts - target_ts)
+            if dt < best_dt and dt <= tolerance_s:
+                best_dt = dt
+                best_price = price
+        return best_price
+
+    start_price = closest(start_ts)
+    end_price = closest(end_ts)
+    if start_price is None or end_price is None:
+        return None
+    if start_price <= 0 or end_price <= 0:
+        return None
+    # Tie: same price at both endpoints — defer to a slower oracle for
+    # tie-resolution semantics rather than guessing.
+    if end_price == start_price:
+        return None
+    return end_price > start_price
+
+
+def _is_book_chaotic(yes_ask: float, yes_bid: float,
+                       no_ask: float, no_bid: float,
+                       tolerance: float = 0.05) -> bool:
+    """v6.1.6: detect a chaotic / broken Polymarket book snapshot.
+
+    A healthy binary market book has yes_ask + no_ask ≈ 1.00 (with a small
+    spread). When the book is in transition (final seconds, market clearing,
+    massive order cancellations), sum_ask can deviate wildly — observed
+    values include 0.30, 0.01, 1.25, 1.49 in production logs.
+
+    These chaotic snapshots are unreliable as resolution signals. Returns
+    True if the book deviates from the sum_ask = 1.0 invariant by more
+    than `tolerance` (default ±5¢).
+
+    Edge case: if both asks are 0 (book completely cleared by Polymarket
+    post-resolution), sum_ask=0 — that's chaotic too. Even more chaotic
+    when one side is 0 and the other has a value (e.g., sum_ask=0.30).
+    """
+    sum_ask = yes_ask + no_ask
+    return abs(sum_ask - 1.0) > tolerance
+
+
+def _bs_resolve_via_cascade(state: BotState, pos: BothSidesPosition,
+                              now: float) -> Tuple[Optional[bool], str]:
+    """v6.1.2: try each resolution source in priority order.
+    Returns (yes_won, source) or (None, "none") if all sources failed.
+
+    Priority:
+      1. cached WS book (populated 1-3s before end_ts in both_sides_tick)
+      2. live WS book (often cleared at end_ts+2s — usually empty)
+      3. Chainlink relay (most reliable secondary source)
+      4. Polymarket Gamma API (throttled to 30s/market)
+
+    Sources 3 and 4 are the difference between v6.1.2 and earlier — they
+    eliminate the "both_zero VOID" branch entirely for BTC up/down markets.
+
+    v6.1.3: order changed — Chainlink moved to position #1. Polymarket
+    resolves these markets using Chainlink price feed; cache/live book
+    can disagree on photo-finish markets (BTC moved <0.005%) where the
+    book signal is essentially 50/50 noise. Chainlink is authoritative.
+    Chainlink lookup is in-memory deque scan (<1ms), no perf cost.
+
+    v6.1.6: Production diagnosis (May 2 afternoon, 7 trades) found that
+    Chainlink fell through 100% of the time for stable BTC over 5m
+    windows (relay publishes on 0.5% deviation OR hourly heartbeat —
+    rarely triggered in 5m), and the bot fell back to cache. When the
+    cache happened to capture chaotic final-second book whipsaw (sum_ask
+    diverging from 1.0 — observed 0.30, 1.49, 1.39 in production), it
+    mislabeled the winner. One such mislabel cost -$1.88 (NO should have
+    won per Binance, but cached book showed YES at end_ts-3s during
+    chaos). Two new defenses:
+      A. Binance source — continuous (~1Hz+) sub-second-density BTC
+         prices from state.binance_prices, inserted between Chainlink
+         and cache. Almost always returns a valid result.
+      B. Chaotic cache detection — skip cache/live when the snapshot
+         shows sum_ask deviating from 1.0 by > ±0.05 (book is broken).
+    """
+    # --- Source 1: Chainlink relay (AUTHORITATIVE when available) ---
+    # v6.1.3: moved to position #1. Polymarket itself uses Chainlink to
+    # resolve these markets, so Chainlink is the single source of truth
+    # WHEN it has data. v6.1.6 production data shows it almost never does
+    # for 5m BTC windows (no deviation trigger), but if we ever do get
+    # a fresh sample at both endpoints, prefer it.
+    cl = _resolve_btc_winner_via_chainlink_for_market(pos.end_ts, pos.duration_s)
+    if cl is not None:
+        return cl, "chainlink"
+
+    # --- Source 2: Binance trade stream (NEW v6.1.6 — continuous data) ---
+    # state.binance_prices is a deque populated by the Binance WS thread
+    # at trade rate (~1Hz+). Unlike Chainlink, this nearly always has fresh
+    # samples within a few seconds of any target timestamp. This is the
+    # workhorse resolution source post-v6.1.6.
+    bn = _resolve_btc_winner_via_binance_for_market(state, pos.end_ts, pos.duration_s)
+    if bn is not None:
+        return bn, "binance"
+
+    # --- Source 3: cached WS book (v6.1.2 cache, with v6.1.6 chaos check) ---
+    # Only trust the cache if the book is in a healthy state (sum_ask near 1.0).
+    # If sum_ask deviates significantly (e.g., 0.30 or 1.49), the book is
+    # transitioning / broken — fall through.
+    if pos.last_book_ts > 0.0:
+        if not _is_book_chaotic(pos.last_yes_ask, pos.last_yes_bid,
+                                  pos.last_no_ask, pos.last_no_bid):
+            yes_signal = max(pos.last_yes_ask, pos.last_yes_bid)
+            no_signal = max(pos.last_no_ask, pos.last_no_bid)
+            if yes_signal > 0.0 or no_signal > 0.0:
+                return (yes_signal >= no_signal), f"cached@{now - pos.last_book_ts:.1f}s"
+
+    # --- Source 4: live WS book — REMOVED in v6.4.0 ---
+    # Reading the WS book at end_ts to infer the winner from which side's
+    # ask is higher was WRONG in 2 of 3 cases on May 7 (BTC moved $228+
+    # opposite to the bot's claimed winner). The book at end_ts is in
+    # mid-clearing transition and unreliable even with chaos detection.
+    # Source ordering is now: chainlink → binance → cache (with chaos
+    # check) → gamma. No "live" inference.
+
+    # --- Source 5: Polymarket Gamma API (throttled, last resort) ---
+    if (now - pos.last_gamma_fetch_ts) >= 30.0:
+        pos.last_gamma_fetch_ts = now
+        gm = _resolve_btc_winner_via_gamma(
+            pos.market_id, pos.yes_leg.token_id, pos.no_leg.token_id)
+        if gm is not None:
+            return gm, "gamma"
+
+    return None, "none"
+
+
+def _bs_collect_btc_samples(state: BotState, pos: BothSidesPosition,
+                              n_samples: int = 30) -> Tuple[Optional[float], List[float]]:
+    """v6.1.9: collect BTC trajectory for the trade lifetime, for the
+    dashboard sparkline. Snapshots state.binance_prices (deque maxlen=12000,
+    ~100min on btcusdt@trade) and downsamples to n_samples evenly-spaced
+    points across [pos.entry_ts, close_ts]. Returns (strike, samples) where
+    strike is BTC at pos.entry_ts. On insufficient data returns (None, []).
+    """
+    close_ts = max(pos.yes_leg.close_ts, pos.no_leg.close_ts)
+    if close_ts <= pos.entry_ts or not state.binance_prices:
+        return None, []
+    snapshot = list(state.binance_prices)
+    strike = None
+    for ts, p in snapshot:
+        if ts >= pos.entry_ts:
+            strike = p
+            break
+    if strike is None:
+        return None, []
+    span = close_ts - pos.entry_ts
+    samples: List[float] = []
+    snap_idx = 0
+    for i in range(n_samples):
+        target = pos.entry_ts + span * (i / max(1, n_samples - 1))
+        while (snap_idx + 1 < len(snapshot)
+               and abs(snapshot[snap_idx + 1][0] - target) < abs(snapshot[snap_idx][0] - target)):
+            snap_idx += 1
+        samples.append(round(snapshot[snap_idx][1], 2))
+    return round(strike, 2), samples
+
+
+def _bs_record_trade_history(state: BotState, pos: BothSidesPosition,
+                              source: str) -> None:
+    """v6.1.2: append the resolved both-sides position to bs_trade_history
+    for the dashboard. Trims list to last 100 entries to bound memory.
+
+    Outcome derivation:
+      - 'WIN' if total_pnl > 0
+      - 'LOSS' if total_pnl < 0
+      - 'EVEN' if total_pnl == 0
+    Sell-loser flag is derived from leg close_reason ('sell_loser' on
+    either leg → True). No 'VOID' category — v6.1.2 removes it.
+
+    v6.1.8: derive market_winner from close prices. In Polymarket binary
+    BTC markets there is ALWAYS a winner — one side closes at $1.00
+    (or whatever the resolution oracle produced) and the other at $0.00.
+    "EVEN" outcome at the bot level just means the entry asymmetry
+    happened to net to ~$0 (e.g. NO bought at 0.50, won at $1.00, and
+    YES bought at 0.51, lost — net = $0.00 to the cent). The market still
+    had a real winner, and the dashboard now surfaces that explicitly.
+    """
+    total_pnl = pos.yes_leg.pnl_usdc + pos.no_leg.pnl_usdc
+    had_sell_loser = (pos.yes_leg.close_reason == "sell_loser"
+                      or pos.no_leg.close_reason == "sell_loser")
+    if total_pnl > 0.0001:
+        outcome = "WIN"
+    elif total_pnl < -0.0001:
+        outcome = "LOSS"
+    else:
+        outcome = "EVEN"
+    # v6.1.8: derive the side that won the underlying market from close
+    # prices. Whichever leg closed at the higher price is the bot's
+    # recorded winner. "" when the close prices tie (e.g. both at 0,
+    # extremely rare — would only occur if both legs were sold-as-loser
+    # via independent mechanisms or all resolution sources failed).
+    if pos.yes_leg.close_price > pos.no_leg.close_price:
+        market_winner = "YES"
+    elif pos.no_leg.close_price > pos.yes_leg.close_price:
+        market_winner = "NO"
+    else:
+        market_winner = ""
+    entry = {
+        "market_id": pos.market_id,
+        "market_url": pos.market_url,
+        "slug": pos.slug,
+        "outcome": outcome,
+        "market_winner": market_winner,
+        "had_sell_loser": had_sell_loser,
+        "yes_entry_ask": round(pos.yes_leg.entry_ask, 4),
+        "yes_close_price": round(pos.yes_leg.close_price, 4),
+        "yes_pnl": round(pos.yes_leg.pnl_usdc, 4),
+        "yes_close_reason": pos.yes_leg.close_reason,
+        # v6.1.4: peak bid + when (relative to entry, in seconds)
+        "yes_peak_bid": round(pos.yes_leg.peak_bid, 4),
+        "yes_peak_bid_at_s": (round(pos.yes_leg.peak_bid_ts - pos.yes_leg.entry_ts, 1)
+                                if pos.yes_leg.peak_bid_ts > 0 else 0.0),
+        "no_entry_ask": round(pos.no_leg.entry_ask, 4),
+        "no_close_price": round(pos.no_leg.close_price, 4),
+        "no_pnl": round(pos.no_leg.pnl_usdc, 4),
+        "no_close_reason": pos.no_leg.close_reason,
+        # v6.1.4: peak bid + when (relative to entry, in seconds)
+        "no_peak_bid": round(pos.no_leg.peak_bid, 4),
+        "no_peak_bid_at_s": (round(pos.no_leg.peak_bid_ts - pos.no_leg.entry_ts, 1)
+                               if pos.no_leg.peak_bid_ts > 0 else 0.0),
+        "total_pnl": round(total_pnl, 4),
+        "sum_ask_at_entry": round(pos.sum_ask_at_entry, 4),
+        "entry_ts": pos.entry_ts,
+        "close_ts": max(pos.yes_leg.close_ts, pos.no_leg.close_ts),
+        "resolution_source": source,
+        "pending_duration_s": (
+            round(max(pos.yes_leg.close_ts, pos.no_leg.close_ts) - pos.pending_since, 1)
+            if pos.pending_since > 0 else 0.0),
+        # v6.2.4: verification_late freeze diagnostics. Always present in record
+        # (not gated on strategy mode) so historical CSVs are uniform.
+        # Useful for downstream analysis: which markets armed, which froze and why.
+        "vl_armed": pos.vl_armed,
+        "vl_armed_side": pos.vl_armed_side,
+        "vl_peak_winner_ask": round(pos.vl_peak_winner_ask, 4),
+        "vl_frozen": pos.vl_frozen,
+        "vl_freeze_reason": pos.vl_freeze_reason,
+        "vl_freeze_ts": (round(pos.vl_freeze_ts - pos.entry_ts, 1)
+                         if pos.vl_freeze_ts > 0 else 0.0),
+    }
+    # v6.1.9: BTC trajectory for dashboard sparkline (None/[] on insufficient data)
+    btc_strike, btc_samples = _bs_collect_btc_samples(state, pos)
+    entry["btc_strike"] = btc_strike
+    entry["btc_samples"] = btc_samples
+    state.bs_trade_history.append(entry)
+    if len(state.bs_trade_history) > 100:
+        state.bs_trade_history = state.bs_trade_history[-100:]
+
+
+def _bs_settle_position(state: BotState, pos: BothSidesPosition,
+                          now: float) -> None:
+    """v6.1.2: settle a both-sides position using the resolution cascade.
+
+    Tries 4 sources in priority order (cache → live → chainlink → gamma).
+    If ALL return None, the position is marked PENDING and stays in
+    state.both_sides_positions for retry on the next tick.
+
+    There is NO VOID branch. BTC up/down binary markets always resolve
+    on Polymarket (Chainlink price comparison) — if our bot can't read
+    the result, that's a bot-side data gap, not a market void. We keep
+    retrying forever; positions pending >= 600s flag as STUCK on the
+    dashboard for user investigation.
+
+    v6.1.1 P&L accounting preserved: only NEWLY closed legs are added
+    to bs_pnl_today_usdc (legs sold by sell-loser already added at
+    sell time).
+    """
+    yes_was_closed = pos.yes_leg.closed
+    no_was_closed = pos.no_leg.closed
+
+    yes_won, source = _bs_resolve_via_cascade(state, pos, now)
+
+    if yes_won is None:
+        # All sources failed. Mark/keep pending; retry next tick. Do NOT
+        # delete the position. Do NOT void. Do NOT log $0 P&L.
+        if pos.pending_since == 0.0:
+            pos.pending_since = now
+            print(
+                f"[bs_settle] market={pos.market_id[:10]}… PENDING "
+                f"(cache={'yes' if pos.last_book_ts > 0 else 'no'}, "
+                f"live=cleared, chainlink=miss, gamma=miss); "
+                f"will retry until a source returns",
+                flush=True,
+            )
+        pos.pending_attempts += 1
+        # Throttled progress logging: 30s, 2min, 10min, then every 30min.
+        elapsed = now - pos.pending_since
+        log_now = False
+        if pos.last_pending_log_ts == 0.0:
+            # First retry attempt, no logging yet
+            pass
+        if elapsed >= 30 and pos.last_pending_log_ts < pos.pending_since + 30:
+            log_now = True
+        elif elapsed >= 120 and pos.last_pending_log_ts < pos.pending_since + 120:
+            log_now = True
+        elif elapsed >= 600 and pos.last_pending_log_ts < pos.pending_since + 600:
+            log_now = True
+        elif elapsed >= 1800 and (now - pos.last_pending_log_ts) >= 1800:
+            log_now = True
+        if log_now:
+            tag = "STUCK" if elapsed >= 600 else "PENDING"
+            print(
+                f"[bs_settle] market={pos.market_id[:10]}… {tag} "
+                f"elapsed={elapsed:.0f}s attempts={pos.pending_attempts}",
+                flush=True,
+            )
+            pos.last_pending_log_ts = now
+        return
+
+    # We have a winner. Settle both legs (skip already-closed ones).
+    if not pos.yes_leg.closed:
+        if yes_won:
+            _bs_close_leg(pos.yes_leg, 1.0, now, "resolved_win")
+            _bs_log_trade_event(state, "RESOLVE_WIN", pos, pos.yes_leg,
+                                 note=f"source={source}")
+        else:
+            _bs_close_leg(pos.yes_leg, 0.0, now, "resolved_loss")
+            _bs_log_trade_event(state, "RESOLVE_LOSS", pos, pos.yes_leg,
+                                 note=f"source={source}")
+    if not pos.no_leg.closed:
+        if not yes_won:
+            _bs_close_leg(pos.no_leg, 1.0, now, "resolved_win")
+            _bs_log_trade_event(state, "RESOLVE_WIN", pos, pos.no_leg,
+                                 note=f"source={source}")
+        else:
+            _bs_close_leg(pos.no_leg, 0.0, now, "resolved_loss")
+            _bs_log_trade_event(state, "RESOLVE_LOSS", pos, pos.no_leg,
+                                 note=f"source={source}")
+
+    # v6.1.1: only add NEWLY-closed legs to running counter.
+    new_pnl = 0.0
+    if not yes_was_closed:
+        new_pnl += pos.yes_leg.pnl_usdc
+    if not no_was_closed:
+        new_pnl += pos.no_leg.pnl_usdc
+    state.bs_pnl_today_usdc += new_pnl
+    state.bs_total_resolved += 1
+
+    pos_pnl_total = pos.yes_leg.pnl_usdc + pos.no_leg.pnl_usdc
+
+    pending_tag = ""
+    if pos.pending_since > 0:
+        pending_tag = f" [resolved-from-pending after {now - pos.pending_since:.0f}s]"
+
+    print(
+        f"[bs_settle] market={pos.market_id[:10]}… "
+        f"YES_pnl={pos.yes_leg.pnl_usdc:+.4f} NO_pnl={pos.no_leg.pnl_usdc:+.4f} "
+        f"TOTAL={pos_pnl_total:+.4f} "
+        f"(new_pnl_added={new_pnl:+.4f}; already_counted="
+        f"{'YES' if yes_was_closed else ''}"
+        f"{'+NO' if (yes_was_closed and no_was_closed) else ('NO' if no_was_closed else '')}"
+        f"{'none' if not (yes_was_closed or no_was_closed) else ''}) "
+        f"source={source}{pending_tag}",
+        flush=True,
+    )
+
+    # v6.1.2: append to dashboard rolling history before deleting.
+    _bs_record_trade_history(state, pos, source)
+
+    # v6.4.0 SKULD: write resolution_audit_log row.
+    # Independent BTC cross-check: compares the bot's claimed winner against
+    # the BTC direction implied by binance_prices over the market window.
+    # Disagreements are real signal, not necessarily bugs (knife-edge prices
+    # can resolve either way per Polymarket's Chainlink oracle), but the
+    # audit gives us evidence to diagnose source-bug regressions.
+    try:
+        if state.resolution_audit_logger is not None and state.resolution_audit_logger.enabled:
+            start_ts = pos.end_ts - pos.duration_s
+            btc_at_start = None
+            btc_at_end = None
+            if state.binance_prices:
+                snapshot = list(state.binance_prices)
+                def _closest_at(target_ts: float, tol_s: float = 30.0):
+                    best = None; best_dt = float('inf')
+                    for ts, p in snapshot:
+                        dt = abs(ts - target_ts)
+                        if dt < best_dt and dt <= tol_s:
+                            best_dt = dt; best = p
+                    return best
+                btc_at_start = _closest_at(start_ts)
+                btc_at_end = _closest_at(pos.end_ts)
+            btc_delta_usd = None
+            btc_delta_pct = None
+            btc_implied = ""
+            if btc_at_start is not None and btc_at_end is not None and btc_at_start > 0:
+                btc_delta_usd = btc_at_end - btc_at_start
+                btc_delta_pct = btc_delta_usd / btc_at_start * 100.0
+                if btc_delta_usd > 0:
+                    btc_implied = "YES"
+                elif btc_delta_usd < 0:
+                    btc_implied = "NO"
+                else:
+                    btc_implied = "TIE"
+            claimed = "YES" if yes_won else "NO"
+            agreement = ""
+            if btc_implied in ("YES", "NO"):
+                agreement = "AGREE" if btc_implied == claimed else "DISAGREE"
+            elif btc_implied == "TIE":
+                agreement = "TIE"
+            else:
+                agreement = "NO_DATA"
+            state.resolution_audit_logger.log([
+                int(now * 1000),
+                pos.market_id,
+                pos.slug,
+                f"{pos.end_ts:.0f}",
+                f"{pos.duration_s}",
+                claimed,
+                source,
+                f"{btc_at_start:.4f}" if btc_at_start is not None else "",
+                f"{btc_at_end:.4f}" if btc_at_end is not None else "",
+                f"{btc_delta_usd:+.4f}" if btc_delta_usd is not None else "",
+                f"{btc_delta_pct:+.6f}" if btc_delta_pct is not None else "",
+                btc_implied,
+                agreement,
+                f"{pos_pnl_total:+.4f}",
+            ])
+    except Exception as e:
+        print(f"[resolution_audit] error market={pos.market_id[:10]}: "
+              f"{type(e).__name__}: {e}", flush=True)
+
+    del state.both_sides_positions[pos.market_id]
+
+
+def both_sides_tick(state: BotState) -> None:
+    """Called from main_loop. No-op when STRATEGY_MODE=lag_signal.
+    Otherwise: (a) attempt to enter both-sides on every 5m market in
+    the lead-time window we haven't entered before, and (b) evaluate
+    sell-loser preconditions on every open both-sides position.
+
+    v6.3.0: When _BS_STRATEGY == 'bss_entry', the entry path is REPLACED
+    by the BSS state-machine evaluator (which lazily creates positions
+    only when both legs sustain), and the sell-loser pass is suppressed
+    (BSS holds both legs to resolution; existing resolution flow handles
+    the payout).
+    """
+    if not _BS_ACTIVE:
+        return
+    now = time.time()
+
+    # v6.3.2: BSS_ENTRY MODE — evaluation now runs in dedicated fast
+    # thread (bss_fast_tick_thread, 20Hz). main_loop's 1Hz pass for
+    # BSS would just duplicate work. Suppress entry + VL passes here.
+    if _BS_STRATEGY == "bss_entry":
+        return  # BSS handled by fast thread; nothing else to do
+
+    # ── ENTRY PASS ──
+    # Iterate over a snapshot so the discovery thread can mutate the dict
+    for mdm in list(state.bs_5m_in_window.values()):
+        try:
+            should_enter, reason, yes_ask, no_ask, sum_ask = \
+                _bs_should_enter(state, mdm, now)
+            if not should_enter:
+                # Most reasons aren't worth logging every tick (would spam).
+                # Only log on first encounter of a new market_id.
+                continue
+            _bs_place_entry(state, mdm, yes_ask, no_ask, sum_ask)
+        except Exception as e:
+            print(f"[bs_entry] error on market={mdm.market.condition_id[:10]}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+
+    # ── SELL-LOSER PASS ──
+    for mid in list(state.both_sides_positions.keys()):
+        pos = state.both_sides_positions.get(mid)
+        if pos is None:
+            continue
+        # v6.1.2: update last-known live book cache. Polymarket clears WS
+        # books within 1-2s of end_ts, so this snapshot is what settle will
+        # use to determine the winner. We only update before end_ts.
+        if now < pos.end_ts:
+            yb = state.poly_books.get(pos.yes_leg.token_id)
+            nb = state.poly_books.get(pos.no_leg.token_id)
+            if yb is not None and nb is not None:
+                # Skip stale ticks (don't overwrite a fresh cache with a
+                # stale book that just happens to still be in the dict).
+                book_age = max(now - yb.last_update_ts, now - nb.last_update_ts)
+                if book_age <= 30.0:
+                    pos.last_yes_ask = float(yb.ask)
+                    pos.last_yes_bid = float(yb.bid)
+                    pos.last_no_ask = float(nb.ask)
+                    pos.last_no_bid = float(nb.bid)
+                    pos.last_book_ts = now
+                    # v6.1.4: track peak bid per leg for diagnostic. Only
+                    # update peak for legs that are still open — once a leg
+                    # is closed (sell_loser fired), its peak is locked in.
+                    # Bid is what we'd sell at, so this captures the highest
+                    # exit price each side reached during its lifetime.
+                    yes_bid_now = float(yb.bid)
+                    no_bid_now = float(nb.bid)
+                    if not pos.yes_leg.closed and yes_bid_now > pos.yes_leg.peak_bid:
+                        pos.yes_leg.peak_bid = yes_bid_now
+                        pos.yes_leg.peak_bid_ts = now
+                    if not pos.no_leg.closed and no_bid_now > pos.no_leg.peak_bid:
+                        pos.no_leg.peak_bid = no_bid_now
+                        pos.no_leg.peak_bid_ts = now
+        try:
+            # v6.2.2: BS_STRATEGY selects which sell-loser logic is active.
+            # In "verification_late" mode, ALL v6.2.1 paths are bypassed and
+            # only the pure BTC-tiered Phase B/C/D logic fires.
+            if _BS_STRATEGY == "verification_late":
+                vl_fire, vl_reason, vl_loser_side, vl_loser_bid, vl_winner_ask = \
+                    _bs_evaluate_verification_late(state, pos, now)
+                pos.sell_loser_status = vl_reason
+                if not vl_fire:
+                    continue
+                if pos.yes_leg.closed or pos.no_leg.closed:
+                    continue  # idempotency guard
+                should_sell = True
+                reason = vl_reason
+                loser_side = vl_loser_side
+                loser_bid = vl_loser_bid
+                winner_ask = vl_winner_ask
+                fire_source = "verification_late"
+                pos.identified_loser_side = loser_side
+                # Skip to fire path (preserves diag/logging structure below)
+                diag = _bs_compute_sell_loser_diagnostics(state, pos, now)
+                diag = f"src={fire_source},{diag}"
+                if loser_side == "YES" and not pos.yes_leg.closed:
+                    _bs_close_leg(pos.yes_leg, loser_bid, now, "sell_loser")
+                    state.bs_total_sold_loser += 1
+                    state.bs_pnl_today_usdc += pos.yes_leg.pnl_usdc
+                    _bs_log_trade_event(state, "SELL_LOSER_DRY", pos, pos.yes_leg,
+                        note=f"winner_ask={winner_ask:.3f},loser_bid={loser_bid:.3f},{diag}")
+                    print(f"[bs_sell] market={pos.market_id[:10]}… loser=YES "
+                          f"sold@{loser_bid:.3f} pnl={pos.yes_leg.pnl_usdc:+.4f} "
+                          f"src={fire_source} TTR={pos.end_ts - now:.0f}s", flush=True)
+                elif loser_side == "NO" and not pos.no_leg.closed:
+                    _bs_close_leg(pos.no_leg, loser_bid, now, "sell_loser")
+                    state.bs_total_sold_loser += 1
+                    state.bs_pnl_today_usdc += pos.no_leg.pnl_usdc
+                    _bs_log_trade_event(state, "SELL_LOSER_DRY", pos, pos.no_leg,
+                        note=f"winner_ask={winner_ask:.3f},loser_bid={loser_bid:.3f},{diag}")
+                    print(f"[bs_sell] market={pos.market_id[:10]}… loser=NO "
+                          f"sold@{loser_bid:.3f} pnl={pos.no_leg.pnl_usdc:+.4f} "
+                          f"src={fire_source} TTR={pos.end_ts - now:.0f}s", flush=True)
+                continue  # done with this market
+
+            # Default v621 strategy below — full v6.2.1 stack
+            should_sell, reason, loser_side, loser_bid, winner_ask = \
+                _bs_evaluate_sell_loser(state, pos, now)
+            pos.sell_loser_status = reason
+            fire_source = "prod"
+            # v6.2.0: BTC late-fallback. If PROD didn't fire AND neither leg
+            # is closed yet, check the BTC-fundamentals fallback. Catches
+            # held-both markets with sharp final-minute BTC moves that the
+            # book never reflected at the 0.93 threshold.
+            # v6.5.11: skipped when BS_TIER_ENABLED — operator chose pure-numbers
+            # design (Option E). The BTC late-fallback is directional and was
+            # explicitly out of scope. Set BS_TIER_ENABLED=false to restore.
+            if (not _BS_TIER_ENABLED
+                    and not should_sell
+                    and not pos.yes_leg.closed
+                    and not pos.no_leg.closed):
+                btc_fire, btc_reason, btc_loser_side, btc_loser_bid, btc_winner_ask = \
+                    _bs_evaluate_btc_late_fallback(state, pos, now)
+                if btc_fire:
+                    should_sell = True
+                    reason = btc_reason
+                    loser_side = btc_loser_side
+                    loser_bid = btc_loser_bid
+                    winner_ask = btc_winner_ask
+                    fire_source = "btc_late"
+                    pos.sell_loser_status = reason
+                    pos.identified_loser_side = loser_side
+            # v6.2.1: Late-conviction override. If neither PROD nor BTC late-
+            # fallback fired AND neither leg is closed, check the late-
+            # conviction path: TTR≤5s + winner_ask≥0.98 + |BTC Δ|≥$10. This
+            # bypasses the standard $30 BTC guard at very late TTR with
+            # overwhelming book conviction. Captures held-both markets where
+            # main guard is too conservative.
+            # v6.5.11: skipped when BS_TIER_ENABLED — see btc_late guard above.
+            if (not _BS_TIER_ENABLED
+                    and not should_sell
+                    and not pos.yes_leg.closed
+                    and not pos.no_leg.closed):
+                lc_fire, lc_reason, lc_loser_side, lc_loser_bid, lc_winner_ask = \
+                    _bs_evaluate_late_conviction(state, pos, now)
+                if lc_fire:
+                    should_sell = True
+                    reason = lc_reason
+                    loser_side = lc_loser_side
+                    loser_bid = lc_loser_bid
+                    winner_ask = lc_winner_ask
+                    fire_source = "late_conv"
+                    pos.sell_loser_status = reason
+                    pos.identified_loser_side = loser_side
+            if not should_sell:
+                continue
+            # Fire — close the loser leg at its current bid
+            # v6.1.7: compute richer diagnostics ONCE per fire, used in both
+            # YES-loser and NO-loser branches below.
+            diag = _bs_compute_sell_loser_diagnostics(state, pos, now)
+            diag = f"src={fire_source},{diag}"
+            if loser_side == "YES" and not pos.yes_leg.closed:
+                _bs_close_leg(pos.yes_leg, loser_bid, now, "sell_loser")
+                state.bs_total_sold_loser += 1
+                state.bs_pnl_today_usdc += pos.yes_leg.pnl_usdc
+                _bs_log_trade_event(
+                    state, "SELL_LOSER_DRY", pos, pos.yes_leg,
+                    note=f"winner_ask={winner_ask:.3f},loser_bid={loser_bid:.3f},{diag}",
+                )
+                print(
+                    f"[bs_sell] market={pos.market_id[:10]}… loser=YES "
+                    f"sold@{loser_bid:.3f} pnl={pos.yes_leg.pnl_usdc:+.4f} "
+                    f"winner_ask={winner_ask:.3f} TTR={pos.end_ts - now:.0f}s",
+                    flush=True,
+                )
+            elif loser_side == "NO" and not pos.no_leg.closed:
+                _bs_close_leg(pos.no_leg, loser_bid, now, "sell_loser")
+                state.bs_total_sold_loser += 1
+                state.bs_pnl_today_usdc += pos.no_leg.pnl_usdc
+                _bs_log_trade_event(
+                    state, "SELL_LOSER_DRY", pos, pos.no_leg,
+                    note=f"winner_ask={winner_ask:.3f},loser_bid={loser_bid:.3f},{diag}",
+                )
+                print(
+                    f"[bs_sell] market={pos.market_id[:10]}… loser=NO "
+                    f"sold@{loser_bid:.3f} pnl={pos.no_leg.pnl_usdc:+.4f} "
+                    f"winner_ask={winner_ask:.3f} TTR={pos.end_ts - now:.0f}s",
+                    flush=True,
+                )
+        except Exception as e:
+            print(f"[bs_sell] error on market={mid[:10]}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+
+
+def _bs_resolution_tick(state: BotState) -> None:
+    """Called from main_loop. Settles any both-sides positions whose
+    end_ts has passed. Runs only when v6.1.0 is active. Independent from
+    the v5.8.1 resolution_thread (which handles single-leg positions)."""
+    if not _BS_ACTIVE:
+        return
+    now = time.time()
+    for mid in list(state.both_sides_positions.keys()):
+        pos = state.both_sides_positions.get(mid)
+        if pos is None:
+            continue
+        # Settle a couple of seconds AFTER end_ts to give the final book
+        # tick a chance to arrive (Chainlink lag + WS jitter).
+        if now < pos.end_ts + 2.0:
+            continue
+        try:
+            _bs_settle_position(state, pos, now)
+        except Exception as e:
+            print(f"[bs_settle] error on market={mid[:10]}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+
+
+def _health_log_tick(state: BotState) -> None:
+    """v6.4.0 SKULD: writes a health snapshot row every
+    BS_HEALTH_LOG_INTERVAL_S (default 10s). Captures WS+API health and
+    bot-state counters so a postmortem can answer 'why did the bot stop
+    trading at HH:MM' from the CSV alone.
+
+    No-op when health_logger is None or disabled.
+    """
+    if state.health_logger is None or not state.health_logger.enabled:
+        return
+    now = time.time()
+    if now - state.last_health_log_ts < _BS_HEALTH_LOG_INTERVAL_S:
+        return
+    state.last_health_log_ts = now
+    try:
+        binance_age = (now - state.binance_last_msg_ts) if state.binance_last_msg_ts else None
+        poly_age = (now - state.poly_last_msg_ts) if state.poly_last_msg_ts else None
+        # CLOB health rolling counters (best effort — fields may not exist)
+        clob_calls = getattr(state, 'clob_calls_60s', 0)
+        clob_2xx = getattr(state, 'clob_2xx_60s', 0)
+        clob_4xx = getattr(state, 'clob_4xx_60s', 0)
+        clob_5xx = getattr(state, 'clob_5xx_60s', 0)
+        # BSS state counts
+        bss_state_counts = {}
+        bss_watching_n = 0
+        try:
+            for mdm in state.bs_5m_in_window.values():
+                st = getattr(mdm, 'bss_state', None) or "NONE"
+                bss_state_counts[st] = bss_state_counts.get(st, 0) + 1
+                if st in ("WATCH", "WAITING_2ND"):
+                    bss_watching_n += 1
+        except Exception:
+            pass
+        state.health_logger.log([
+            int(now * 1000),
+            f"{state.uptime_s:.1f}",
+            BOT_VERSION,
+            state.config.mode,
+            "true" if _LIVE_BSS_ENABLED else "false",
+            f"{binance_age:.2f}" if binance_age is not None else "",
+            len(state.binance_prices) if state.binance_prices is not None else 0,
+            f"{poly_age:.2f}" if poly_age is not None else "",
+            len(state.poly_books) if state.poly_books is not None else 0,
+            clob_calls, clob_2xx, clob_4xx, clob_5xx,
+            len(state.both_sides_positions) if state.both_sides_positions is not None else 0,
+            state.bs_total_entered,
+            state.bs_total_resolved,
+            f"{state.bs_pnl_today_usdc:+.4f}",
+            bss_watching_n,
+            ";".join(f"{k}={v}" for k, v in sorted(bss_state_counts.items())),
+        ])
+    except Exception as e:
+        print(f"[health_log] error: {type(e).__name__}: {e}", flush=True)
+
+
+def pre_market_books_log_tick(state: BotState) -> None:
+    """Called from main_loop. Writes a row to pre_market_books_<date>.csv
+    for every market in bs_5m_in_window / bs_15m_in_window /
+    bs_60m_in_window whose last log was >= LOG_SAMPLE_INTERVAL_S ago.
+
+    Schema:
+      ts_ms, duration_label, market_id, slug, end_ts, ttr_s,
+      yes_ask, yes_bid, yes_ask_size, yes_bid_size,
+      no_ask, no_bid, no_ask_size, no_bid_size,
+      sum_ask, sum_bid, btc_price_now, mode, has_position
+
+    Logging is enabled in BOTH lag_signal AND both_sides_btc modes when
+    LOG_TO_DISK=true — the only difference is which durations have
+    candidate markets to log against. In lag_signal mode the v6.1.0
+    discovery thread is idle so the dicts stay empty and this tick is
+    effectively a no-op.
+    """
+    if state.pre_market_books_logger is None:
+        return
+    if not state.pre_market_books_logger.enabled:
+        return
+    now = time.time()
+
+    # Latest BTC price for cross-reference (snapshot from binance buffer)
+    prices = list(state.binance_prices)
+    btc_price_now = prices[-1][1] if prices else 0.0
+
+    for duration_dict in (state.bs_5m_in_window,
+                          state.bs_15m_in_window,
+                          state.bs_60m_in_window):
+        for mdm in duration_dict.values():
+            try:
+                if (now - mdm.last_logged_ts) < _LOG_SAMPLE_INTERVAL_S:
+                    continue
+                market = mdm.market
+                yes_book = state.poly_books.get(market.yes_token_id)
+                no_book = state.poly_books.get(market.no_token_id)
+                yes_ask = float(yes_book.ask) if yes_book else 0.0
+                yes_bid = float(yes_book.bid) if yes_book else 0.0
+                yes_ask_sz = float(yes_book.ask_size) if yes_book else 0.0
+                yes_bid_sz = float(yes_book.bid_size) if yes_book else 0.0
+                no_ask = float(no_book.ask) if no_book else 0.0
+                no_bid = float(no_book.bid) if no_book else 0.0
+                no_ask_sz = float(no_book.ask_size) if no_book else 0.0
+                no_bid_sz = float(no_book.bid_size) if no_book else 0.0
+                # Skip rows where both books are missing — no useful data
+                if yes_book is None and no_book is None:
+                    mdm.last_logged_ts = now
+                    continue
+                ttr = market.end_ts - now
+                has_position = market.condition_id in state.both_sides_positions
+                row = [
+                    int(now * 1000),
+                    mdm.duration_label,
+                    market.condition_id,
+                    market.slug,
+                    market.market_url,
+                    f"{market.end_ts:.0f}",
+                    f"{ttr:.1f}",
+                    f"{yes_ask:.4f}", f"{yes_bid:.4f}",
+                    f"{yes_ask_sz:.2f}", f"{yes_bid_sz:.2f}",
+                    f"{no_ask:.4f}", f"{no_bid:.4f}",
+                    f"{no_ask_sz:.2f}", f"{no_bid_sz:.2f}",
+                    f"{(yes_ask + no_ask):.4f}",
+                    f"{(yes_bid + no_bid):.4f}",
+                    f"{btc_price_now:.2f}",
+                    state.config.mode,
+                    "1" if has_position else "0",
+                ]
+                state.pre_market_books_logger.log(row)
+                mdm.last_logged_ts = now
+            except Exception as e:
+                print(f"[pre_market_books_log] error on "
+                      f"{mdm.duration_label}/{mdm.market.condition_id[:10]}: "
+                      f"{type(e).__name__}: {e}", flush=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# RESOLUTION POLLING + EXIT
+# ═══════════════════════════════════════════════════════════════════
+
+GAMMA_MARKET_BY_ID_URL = "https://gamma-api.polymarket.com/markets"
+
+
+def _fetch_market_resolution(condition_id: str) -> Optional[Dict[str, Any]]:
+    import requests
+    headers = {
+        "User-Agent": "polybot-simple-v1/0.6 (+https://polymarket.com)",
+        "Accept": "application/json",
+    }
+    attempts = [
+        {"condition_ids": condition_id, "closed": "true"},
+        {"condition_ids": condition_id, "closed": "true", "archived": "true"},
+        {"condition_ids": condition_id},
+    ]
+    for params in attempts:
+        try:
+            r = requests.get(GAMMA_MARKET_BY_ID_URL, params=params, headers=headers, timeout=8)
+        except Exception as e:
+            _record_clob_status(0)  # v6.1.3: 0 = network exception
+            print(f"[resolution] fetch error for {condition_id[:10]} params={params}: {e}", flush=True)
+            continue
+        _record_clob_status(r.status_code)  # v6.1.3
+        if r.status_code != 200:
+            print(f"[resolution] HTTP {r.status_code} for {condition_id[:10]} params={params}", flush=True)
+            continue
+        try:
+            data = r.json()
+        except Exception:
+            continue
+        items = data if isinstance(data, list) else (data.get("data") or data.get("markets") or [])
+        if items:
+            return items[0]
+    print(f"[resolution] market {condition_id[:10]} not found in any query shape", flush=True)
+    return None
+
+
+def _resolve_via_chainlink(state: BotState, position: Position) -> Optional[bool]:
+    if not _CHAINLINK_AVAILABLE or chainlink_stream_log is None:
+        return None
+
+    symbol = chainlink_stream_log.get_symbol_for_coin(position.coin)
+    if symbol is None:
+        print(f"[resolution] chainlink: no relay symbol for coin={position.coin!r}", flush=True)
+        return None
+
+    end_ts = position.resolution_ts
+    start_ts = end_ts - 300
+
+    start_pt = chainlink_stream_log.get_price_at(symbol, start_ts, tolerance_s=60.0)
+    end_pt = chainlink_stream_log.get_price_at(symbol, end_ts, tolerance_s=60.0)
+
+    if start_pt is None or end_pt is None:
+        miss = []
+        if start_pt is None: miss.append("start")
+        if end_pt is None: miss.append("end")
+        print(f"[resolution] chainlink: {symbol} no price at {','.join(miss)} "
+              f"(start_ts={int(start_ts)} end_ts={int(end_ts)}) — falling back",
+              flush=True)
+        return None
+
+    start_price = start_pt["value"]
+    end_price = end_pt["value"]
+    if start_price <= 0 or end_price <= 0:
+        return None
+
+    yes_won = end_price > start_price
+    print(f"[resolution] chainlink: {symbol} "
+          f"start=${start_price:.2f}(age={start_pt['age_s']:.0f}s) "
+          f"end=${end_price:.2f}(age={end_pt['age_s']:.0f}s) "
+          f"→ YES_WON={yes_won}",
+          flush=True)
+    return yes_won
+
+
+def _resolve_via_binance(state: BotState, position: Position) -> Optional[bool]:
+    end_ts = position.resolution_ts
+    start_ts = end_ts - 300
+
+    # v5.5.24-fix: snapshot deque before iterating
+    prices = list(state.binance_prices)
+    if not prices:
+        return None
+
+    def closest_price(target_ts):
+        best = None
+        best_diff = float("inf")
+        for ts, price in prices:
+            d = abs(ts - target_ts)
+            if d < best_diff:
+                best_diff = d
+                best = (ts, price)
+        return best, best_diff
+
+    start_pt, start_diff = closest_price(start_ts)
+    end_pt, end_diff = closest_price(end_ts)
+
+    if start_pt is None or end_pt is None:
+        return None
+    if start_diff > 30 or end_diff > 30:
+        print(f"[resolution] binance fallback: anchor too far off "
+              f"(start_diff={start_diff:.1f}s end_diff={end_diff:.1f}s), inconclusive", flush=True)
+        return None
+
+    start_price = start_pt[1]
+    end_price = end_pt[1]
+    yes_won = end_price > start_price
+    print(f"[resolution] binance fallback: start=${start_price:.2f}@{start_pt[0]:.0f} "
+          f"end=${end_price:.2f}@{end_pt[0]:.0f} → YES_WON={yes_won}", flush=True)
+    return yes_won
+
+
+def resolution_thread(state: BotState) -> None:
+    cfg = state.config
+    print(f"[resolution] thread started, poll_interval={cfg.resolution_poll_s}s", flush=True)
+    last_status_log = 0.0
+    poll_count = 0
+
+    while not state.kill_flag:
+        try:
+            pos = state.open_position
+            now = time.time()
+
+            if pos is None:
+                if now - last_status_log > 300:
+                    print(f"[resolution] idle, no open position (poll #{poll_count})", flush=True)
+                    last_status_log = now
+            else:
+                time_past_resolution = now - pos.resolution_ts
+
+                # v5.5.30: HARD TIMEOUT FIRST.
+                # Run the timeout check BEFORE any Gamma / Chainlink / Binance
+                # fetch. If those external calls raise (Polymarket down, network
+                # flake), the prior code structure caught the exception and the
+                # timeout block at the bottom never executed → position could
+                # stay stuck for hours. This was observed 2026-04-28 09:51 UTC
+                # when Polymarket went down: open position from 09:51:17 was
+                # still un-VOIDed 90+ min later despite the 1800s timeout.
+                if time_past_resolution > 1800:
+                    print(f"[resolution] HARD TIMEOUT {time_past_resolution:.0f}s past "
+                          f"resolution; force-voiding {pos.trade_id}", flush=True)
+                    try:
+                        _close_with_pnl(state, pos, exit_price=pos.entry_price,
+                                        win=None, void=True)
+                    except Exception as e:
+                        print(f"[resolution] hard-timeout close failed: {e}", flush=True)
+                        traceback.print_exc()
+                elif time_past_resolution >= -1:
+                    poll_count += 1
+                    print(f"[resolution] checking trade_id={pos.trade_id} "
+                          f"market={pos.market_id[:10]} "
+                          f"past_resolution={time_past_resolution:.0f}s (poll #{poll_count})",
+                          flush=True)
+                    md = _fetch_market_resolution(pos.market_id)
+                    settled = False
+                    if md is not None:
+                        before = state.open_position
+                        _settle_position(state, pos, md)
+                        settled = state.open_position is None and before is not None
+
+                    if not settled and state.open_position is not None and time_past_resolution > 60:
+                        yes_won = _resolve_via_chainlink(state, pos)
+                        source = "chainlink"
+
+                        if yes_won is None:
+                            print(f"[resolution] gamma+chainlink failed after "
+                                  f"{time_past_resolution:.0f}s; trying binance fallback",
+                                  flush=True)
+                            yes_won = _resolve_via_binance(state, pos)
+                            source = "binance"
+
+                        if yes_won is not None:
+                            bet_was_up = pos.direction.upper() == "UP"
+                            win = (bet_was_up and yes_won) or ((not bet_was_up) and (not yes_won))
+                            payout = 1.0 if win else 0.0
+                            qty = pos.size_usdc / pos.entry_price if pos.entry_price > 0 else 0.0
+                            pnl = qty * payout - pos.size_usdc
+                            print(f"[resolution] settled via {source}: yes_won={yes_won}, "
+                                  f"bet={pos.direction}, win={win}, pnl={pnl:+.4f}",
+                                  flush=True)
+                            _close_with_pnl(state, pos, exit_price=payout, win=win, void=False, pnl=pnl)
+        except Exception as e:
+            print(f"[resolution] crash: {e}", flush=True)
+            traceback.print_exc()
+
+        slept = 0.0
+        while slept < cfg.resolution_poll_s and not state.kill_flag:
+            time.sleep(0.5)
+            slept += 0.5
+
+
+def _settle_position(state: BotState, position: Position, market_data: dict) -> None:
+    closed = bool(market_data.get("closed", False))
+    if not closed:
+        return
+
+    out_raw = market_data.get("outcomePrices")
+    try:
+        prices = json.loads(out_raw) if isinstance(out_raw, str) else out_raw
+    except Exception:
+        prices = None
+    if not isinstance(prices, list) or len(prices) != 2:
+        print(f"[resolution] {position.trade_id} closed but outcomes={out_raw!r} — treating as VOID", flush=True)
+        _close_with_pnl(state, position, exit_price=position.entry_price, win=None, void=True)
+        return
+
+    try:
+        yes_payout = float(prices[0])
+        no_payout = float(prices[1])
+    except Exception:
+        print(f"[resolution] {position.trade_id} bad outcome prices: {prices}", flush=True)
+        _close_with_pnl(state, position, exit_price=position.entry_price, win=None, void=True)
+        return
+
+    market = state.btc_5m_market
+    if market is None or position.market_id != market.condition_id:
+        token_ids = market_data.get("clobTokenIds")
+        outcomes = market_data.get("outcomes")
+        try:
+            token_ids = json.loads(token_ids) if isinstance(token_ids, str) else token_ids
+            outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
+        except Exception:
+            token_ids = []
+            outcomes = []
+
+        yes_id = no_id = None
+        if isinstance(token_ids, list) and isinstance(outcomes, list) and len(token_ids) == 2:
+            o0 = (outcomes[0] or "").strip().lower()
+            if o0 in ("up", "yes"):
+                yes_id, no_id = token_ids[0], token_ids[1]
+            else:
+                yes_id, no_id = token_ids[1], token_ids[0]
+
+        if position.token_id == yes_id:
+            payout = yes_payout
+        elif position.token_id == no_id:
+            payout = no_payout
+        else:
+            print(f"[resolution] {position.trade_id} token not in resolved market — VOID", flush=True)
+            _close_with_pnl(state, position, exit_price=position.entry_price, win=None, void=True)
+            return
+    else:
+        if position.token_id == market.yes_token_id:
+            payout = yes_payout
+        else:
+            payout = no_payout
+
+    qty = position.size_usdc / position.entry_price if position.entry_price > 0 else 0.0
+    proceeds = qty * payout
+    pnl = proceeds - position.size_usdc
+    win = payout >= 0.5
+
+    _close_with_pnl(state, position, exit_price=payout, win=win, void=False, pnl=pnl)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v5.7.0: TAKE-PROFIT EARLY EXIT
+# ═══════════════════════════════════════════════════════════════════
+
+def take_profit_tick(state: BotState) -> None:
+    """v5.7.0+v5.8.0: check whether the open position should be closed early
+    via take-profit (TP) or stop-loss (SL). Called once per main_loop tick.
+
+    No-op in any of these cases (all preserve existing behavior):
+      - both _TP_THRESHOLD <= 0 AND _STOP_LOSS_THRESHOLD <= 0  (both off)
+      - state.open_position is None     (nothing to exit)
+      - state.mode != "dry"             (LIVE early-exit not implemented)
+      - book is missing or has bid<=0   (no quotes — reset both counters)
+      - book stale (age > 5s)           (don't trust bid; reset counters)
+
+    Take-profit semantics: bid >= entry+TP_THRESHOLD for >= TP_PERSIST_S
+    seconds → exit at current bid.
+    Stop-loss semantics: bid <= STOP_LOSS_THRESHOLD (ABSOLUTE FLOOR) for
+    >= STOP_LOSS_PERSIST_S seconds → exit at current bid.
+
+    If both conditions are met simultaneously (mathematically possible only
+    if TP threshold is below SL threshold which would be nonsensical and
+    is rejected by env range guards), TP is checked first and short-circuits.
+
+    Recorded in trades_logger via _close_with_pnl with `,tp_exit:<thresh>`
+    or `,sl_exit:<thresh>` appended to existing notes — no schema change.
+    """
+    if _TP_THRESHOLD <= 0 and _STOP_LOSS_THRESHOLD <= 0 and _SL_LATE_MODE == "":
+        return  # all three exit features disabled — fast path
+    # v6.1.0: in both_sides_btc mode, the v5.8.1 single-leg TP/SL exit path
+    # is not used — both-sides positions are managed by both_sides_tick
+    # (entry + sell-loser) and _bs_resolution_tick (settle). We return
+    # early to ensure no v5.8.1 logic ever touches a v6.1.0 position
+    # (which it couldn't anyway — open_position is always None in v6.1.0
+    # since place_entry is gated upstream — but defense-in-depth).
+    if _BS_ACTIVE:
+        return
+    pos = state.open_position
+    if pos is None:
+        return
+    if state.mode != "dry":
+        # LIVE TP/SL/SL_LATE would require sell-order placement (signed FAK
+        # against the held token's bid); not implemented in v5.8.1.
+        return
+
+    book = state.poly_books.get(pos.token_id)
+    if book is None or book.bid <= 0:
+        pos.tp_consecutive_ticks = 0
+        pos.sl_consecutive_ticks = 0
+        pos.sl_late_consecutive_ticks = 0
+        return
+
+    now = time.time()
+    age = now - book.last_update_ts if book.last_update_ts else float("inf")
+    if age > 5.0:
+        pos.tp_consecutive_ticks = 0
+        pos.sl_consecutive_ticks = 0
+        pos.sl_late_consecutive_ticks = 0
+        return
+
+    # Track peak (for TRAILING_DROP hook; harmless when disabled).
+    if book.bid > pos.peak_mark:
+        pos.peak_mark = book.bid
+
+    # ─── Take-profit check ───────────────────────────────────────
+    if _TP_THRESHOLD > 0:
+        target = min(pos.entry_price + _TP_THRESHOLD, 0.99)
+        if book.bid >= target:
+            pos.tp_consecutive_ticks += 1
+        else:
+            pos.tp_consecutive_ticks = 0
+
+        persist_ticks = int(_TP_PERSIST_S)
+        if pos.tp_consecutive_ticks >= persist_ticks:
+            exit_price = book.bid
+            qty = pos.size_usdc / pos.entry_price if pos.entry_price > 0 else 0.0
+            pnl = qty * exit_price - pos.size_usdc
+            win = pnl > 0
+            held_s = now - pos.entry_ts
+            print(
+                f"[trade] TAKE-PROFIT trade_id={pos.trade_id} {pos.direction} "
+                f"entry={pos.entry_price:.3f} exit={exit_price:.3f} "
+                f"pnl={pnl:+.4f} held={held_s:.0f}s "
+                f"ticks_at_target={pos.tp_consecutive_ticks} "
+                f"peak_mark={pos.peak_mark:.3f}",
+                flush=True,
+            )
+            _close_with_pnl(
+                state, pos,
+                exit_price=exit_price,
+                win=win,
+                void=False,
+                pnl=pnl,
+                extra_notes=f",tp_exit:{_TP_THRESHOLD:.2f}",
+            )
+            return  # exited; don't also check SL
+
+    # ─── Stop-loss check (v5.8.0) ────────────────────────────────
+    # IMPORTANT: SL is gated by minimum entry price (_SL_MIN_ENTRY, default
+    # $0.30). Backtest showed an unconditional absolute-floor SL@$0.10
+    # destroys $114 of TP profit by cutting low-entry trades during normal
+    # volatility (every trade's bid touches near-zero at some point). The
+    # entry-price gate fires SL only when the trade entered above the floor
+    # — i.e., when reaching the floor represents a genuine catastrophic
+    # adverse move, not just normal noise on a low-priced lottery ticket.
+    if _STOP_LOSS_THRESHOLD > 0 and pos.entry_price >= _SL_MIN_ENTRY:
+        # Absolute floor: trigger when bid drops to or below the threshold.
+        if book.bid <= _STOP_LOSS_THRESHOLD:
+            pos.sl_consecutive_ticks += 1
+        else:
+            pos.sl_consecutive_ticks = 0
+
+        sl_persist_ticks = int(_SL_PERSIST_S)
+        if pos.sl_consecutive_ticks >= sl_persist_ticks:
+            exit_price = book.bid
+            qty = pos.size_usdc / pos.entry_price if pos.entry_price > 0 else 0.0
+            pnl = qty * exit_price - pos.size_usdc
+            win = pnl > 0  # SL exits are usually losses but tag honestly
+            held_s = now - pos.entry_ts
+            print(
+                f"[trade] STOP-LOSS trade_id={pos.trade_id} {pos.direction} "
+                f"entry={pos.entry_price:.3f} exit={exit_price:.3f} "
+                f"pnl={pnl:+.4f} held={held_s:.0f}s "
+                f"ticks_at_floor={pos.sl_consecutive_ticks} "
+                f"peak_mark={pos.peak_mark:.3f}",
+                flush=True,
+            )
+            _close_with_pnl(
+                state, pos,
+                exit_price=exit_price,
+                win=win,
+                void=False,
+                pnl=pnl,
+                extra_notes=f",sl_exit:{_STOP_LOSS_THRESHOLD:.2f}",
+            )
+            return
+
+    # ─── Late-stage SL check (v5.8.1) ────────────────────────────
+    # Two modes: "pct" (bid <= entry × pct) or "abs" (bid <= floor).
+    # Both require time_remaining_s <= window AND condition holds for
+    # persist consecutive ticks. Distinct counter from sl_consecutive_ticks.
+    if _SL_LATE_MODE in ("pct", "abs"):
+        # Compute time remaining (resolution_ts is in epoch seconds)
+        time_remaining_s = pos.resolution_ts - now
+        in_window = time_remaining_s <= _SL_LATE_WINDOW_S and time_remaining_s > 0
+        if not in_window:
+            pos.sl_late_consecutive_ticks = 0
+        else:
+            if _SL_LATE_MODE == "pct":
+                trigger_floor = pos.entry_price * _SL_LATE_PCT
+                marker = f",sl_late_pct:{_SL_LATE_PCT:.2f}"
+            else:  # "abs"
+                trigger_floor = _SL_LATE_FLOOR
+                marker = f",sl_late_abs:{_SL_LATE_FLOOR:.2f}"
+            if book.bid <= trigger_floor:
+                pos.sl_late_consecutive_ticks += 1
+            else:
+                pos.sl_late_consecutive_ticks = 0
+            late_persist_ticks = int(_SL_LATE_PERSIST_S)
+            if pos.sl_late_consecutive_ticks >= late_persist_ticks:
+                exit_price = book.bid
+                qty = pos.size_usdc / pos.entry_price if pos.entry_price > 0 else 0.0
+                pnl = qty * exit_price - pos.size_usdc
+                win = pnl > 0
+                held_s = now - pos.entry_ts
+                print(
+                    f"[trade] LATE-SL ({_SL_LATE_MODE}) trade_id={pos.trade_id} "
+                    f"{pos.direction} entry={pos.entry_price:.3f} "
+                    f"exit={exit_price:.3f} pnl={pnl:+.4f} held={held_s:.0f}s "
+                    f"time_remaining={time_remaining_s:.0f}s "
+                    f"trigger_floor={trigger_floor:.3f} "
+                    f"ticks_at_floor={pos.sl_late_consecutive_ticks}",
+                    flush=True,
+                )
+                _close_with_pnl(
+                    state, pos,
+                    exit_price=exit_price,
+                    win=win,
+                    void=False,
+                    pnl=pnl,
+                    extra_notes=marker,
+                )
+                return
+
+
+def _close_with_pnl(state: BotState, position: Position, exit_price: float,
+                    win: Optional[bool], void: bool, pnl: float = 0.0,
+                    extra_notes: str = "") -> None:
+    if not void:
+        state.pnl_today_usdc += pnl
+        if win is True:
+            state.trades_won += 1
+        elif win is False:
+            state.trades_lost += 1
+
+    # v5.7.0/v5.8.0/v5.8.1: classify exit and (where determinable) the market's outcome.
+    #   exit_type: "TP"      if extra_notes contains the take-profit marker,
+    #              "SL"      if it contains the entry-gated stop-loss marker,
+    #              "SL_LATE" if it contains the late-stage stop-loss marker (v5.8.1),
+    #              "RESOLUTION" otherwise (legacy hold-to-resolution exit).
+    notes_str = extra_notes or ""
+    is_tp_exit = "tp_exit" in notes_str
+    is_sl_exit = "sl_exit" in notes_str
+    is_sl_late_exit = "sl_late" in notes_str  # v5.8.1
+    if is_tp_exit:
+        exit_type = "TP"
+    elif is_sl_late_exit:
+        exit_type = "SL_LATE"
+    elif is_sl_exit:
+        exit_type = "SL"
+    else:
+        exit_type = "RESOLUTION"
+    if void:
+        resolution: Optional[str] = "VOID"
+    elif is_tp_exit or is_sl_exit or is_sl_late_exit:
+        resolution = None  # unknown — bot exited before market settled
+    else:
+        # Resolution exit: bot bet UP and won → market resolved UP, etc.
+        if position.direction == "UP":
+            resolution = "UP" if win else "DOWN"
+        elif position.direction == "DOWN":
+            resolution = "DOWN" if win else "UP"
+        else:
+            resolution = None
+
+    # v5.8.0: register this market_id as already-exited so re-entry blocker
+    # (in compute_strategy_decision) prevents the bot from buying back into
+    # the same market_id this session. Done before logger writes, so the
+    # state is consistent the moment _close_with_pnl returns.
+    state.exited_market_ids.add(position.market_id)
+
+    history_entry = {
+        "trade_id": position.trade_id,
+        "direction": position.direction,
+        "entry_price": position.entry_price,
+        "exit_price": exit_price,
+        "size_usdc": position.size_usdc,
+        "pnl_usdc": 0.0 if void else pnl,
+        "entry_ts": position.entry_ts,
+        "exit_ts": time.time(),
+        "win": "VOID" if void else ("YES" if win else "NO"),
+        "edge_at_entry": position.edge_at_entry,
+        "delta_pct_at_entry": position.delta_pct_at_entry,
+        "market_url": position.market_url,
+        "exit_type": exit_type,        # v5.7.0
+        "resolution": resolution,      # v5.7.0
+    }
+    state.trade_history.append(history_entry)
+    if len(state.trade_history) > 100:
+        state.trade_history = state.trade_history[-100:]
+
+    event_label = "VOID" if void else ("WIN" if win else "LOSS")
+    if state.trades_logger is not None:
+        # v5.7.0: notes field carries extra_notes (e.g. ',tp_exit:0.15') so
+        # downstream analysis can distinguish TP exits from resolution
+        # exits without changing the CSV schema.
+        state.trades_logger.log([
+            int(time.time() * 1000),
+            f"CLOSE_{event_label}",
+            position.trade_id,
+            position.direction,
+            f"{position.delta_pct_at_entry:+.5f}",
+            position.token_id,
+            0.0, 0.0, 0.0, 0.0,
+            f"{exit_price:.4f}",
+            position.size_usdc,
+            position.market_id,
+            "",
+            state.config.mode,
+            f"pnl={pnl:+.4f}{extra_notes}",
+        ])
+
+    print(
+        f"[trade] CLOSE {event_label} trade_id={position.trade_id} "
+        f"{position.direction} entry={position.entry_price:.3f} exit={exit_price:.3f} "
+        f"pnl={'VOID' if void else f'{pnl:+.4f}'}",
+        flush=True,
+    )
+
+    state.open_position = None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v6.2.5: LOG RETENTION (disk-space management)
+# ═══════════════════════════════════════════════════════════════════
+# When LOG_RETENTION_DAYS > 0, deletes daily-rotated CSVs whose date in
+# filename is older than the cutoff. Hard safety: never deletes files
+# dated today or yesterday (UTC), even if user sets LOG_RETENTION_DAYS=1.
+# Matches the regex used by list_log_files plus rotated variants
+# <name>_<YYYY-MM-DD>.vN.csv produced by CsvLogger schema rotation.
+
+_LOG_PURGE_FILENAME_RE = re.compile(
+    r"^[a-z0-9_]+_(\d{4})-(\d{2})-(\d{2})(?:\.v\d+)?\.csv$"
+)
+
+
+def _purge_old_logs(log_dir: Path, retention_days: int) -> Tuple[int, int]:
+    """One-shot purge pass. Returns (files_deleted, bytes_freed).
+    Safe to call when log_dir doesn't exist (returns 0, 0). Refuses to
+    delete files whose parsed date is today or yesterday UTC, regardless
+    of retention_days, to avoid clobbering live data after a clock skew.
+    """
+    if retention_days <= 0:
+        return 0, 0
+    if not log_dir.exists() or not log_dir.is_dir():
+        return 0, 0
+    today = datetime.now(timezone.utc).date()
+    cutoff_ordinal = today.toordinal() - retention_days
+    # Floor — never touch files dated today or yesterday no matter what the
+    # retention math says. Defensive against clock skew or a misconfigured
+    # LOG_RETENTION_DAYS=0 → 1 swap during a hot deploy.
+    safety_floor_ordinal = today.toordinal() - 1
+
+    files_deleted = 0
+    bytes_freed = 0
+    try:
+        entries = list(log_dir.iterdir())
+    except OSError as e:
+        print(f"[purge] cannot list {log_dir}: {e}", flush=True)
+        return 0, 0
+    for entry in entries:
+        try:
+            if entry.is_symlink() or not entry.is_file():
+                continue
+            m = _LOG_PURGE_FILENAME_RE.match(entry.name)
+            if m is None:
+                continue
+            try:
+                yr, mo, dy = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                file_date = datetime(yr, mo, dy, tzinfo=timezone.utc).date()
+            except (ValueError, OverflowError):
+                continue
+            file_ord = file_date.toordinal()
+            if file_ord >= cutoff_ordinal:
+                continue
+            if file_ord >= safety_floor_ordinal:
+                # Belt-and-braces: even if retention math says delete,
+                # never touch yesterday/today.
+                continue
+            try:
+                size = entry.stat().st_size
+            except OSError:
+                size = 0
+            try:
+                entry.unlink()
+                files_deleted += 1
+                bytes_freed += size
+                print(f"[purge] deleted {entry.name} ({size:,} bytes, "
+                      f"date={file_date.isoformat()})", flush=True)
+            except OSError as e:
+                print(f"[purge] failed to delete {entry.name}: {e}", flush=True)
+        except Exception as e:
+            print(f"[purge] error processing {entry.name}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+    return files_deleted, bytes_freed
+
+
+def log_retention_thread(state: BotState) -> None:
+    """Daemon thread: runs _purge_old_logs once on entry and every 24h
+    thereafter. No-op when LOG_RETENTION_DAYS=0. Sleeps in 60s slices so
+    kill_flag is honored within a minute of shutdown."""
+    if _LOG_RETENTION_DAYS <= 0:
+        print("[purge] LOG_RETENTION_DAYS=0 — retention thread idle",
+              flush=True)
+        return
+    if not state.log_dir:
+        print("[purge] no log_dir — retention thread idle", flush=True)
+        return
+    log_dir = Path(state.log_dir)
+    print(f"[purge] thread started; retention={_LOG_RETENTION_DAYS} days; "
+          f"log_dir={log_dir}", flush=True)
+    while not state.kill_flag:
+        try:
+            files, bytes_freed = _purge_old_logs(log_dir, _LOG_RETENTION_DAYS)
+            if files > 0:
+                print(f"[purge] cycle done — {files} files, "
+                      f"{bytes_freed:,} bytes freed", flush=True)
+            else:
+                print(f"[purge] cycle done — nothing to delete", flush=True)
+        except Exception as e:
+            print(f"[purge] crash: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+        # Sleep ~24h in 60s slices for graceful shutdown
+        slept = 0.0
+        while slept < 86400.0 and not state.kill_flag:
+            time.sleep(60.0)
+            slept += 60.0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# BOOT
+# ═══════════════════════════════════════════════════════════════════
+
+def boot() -> BotState:
+    print("[boot] Loading config...", flush=True)
+    cfg = load_config()
+    print(f"[boot] mode={cfg.mode} data_dir={cfg.data_dir} log_to_disk={cfg.log_to_disk}", flush=True)
+    if cfg.validation_mode:
+        print("[boot] *** VALIDATION_MODE active — gates loosened, DRY only ***", flush=True)
+        print(f"[boot]    delta>={cfg.delta_threshold_pct}%  band=[{cfg.entry_price_min},{cfg.entry_price_max}]  "
+              f"edge>={cfg.edge_min}  spread<={cfg.spread_max}  ws_age<={cfg.ws_freshness_s}s", flush=True)
+
+    if _SIGNAL_INVERT:
+        print("[boot] *** SIGNAL_INVERT ACTIVE — entry direction will be flipped UP↔DOWN ***", flush=True)
+        print("[boot]    set SIGNAL_INVERT=false to disable without redeploy", flush=True)
+
+    print("[boot] Verifying data_dir writable...", flush=True)
+    verify_data_dir_writable(cfg.data_dir)
+    print("[boot] data_dir: OK", flush=True)
+
+    print("[boot] Initializing CLOB client...", flush=True)
+    clob = init_clob_client(cfg)
+    print("[boot] CLOB client: OK", flush=True)
+
+    state = BotState(config=cfg, boot_ts=time.time(), clob_client=clob)
+
+    # v6.2.5: bot-isolated log subdir. When BOT_NAME is set, each bot writes
+    # to its own subfolder so two bots sharing infra don't trample each
+    # other's daily CSV files. Empty BOT_NAME → legacy {data_dir}/logs path.
+    if _BOT_NAME:
+        log_dir = Path(cfg.data_dir) / "logs" / _BOT_NAME
+        print(f"[boot][v6.2.5] BOT_NAME={_BOT_NAME!r} → log_dir={log_dir}",
+              flush=True)
+        _ensure_validation_csvs(state)
+    else:
+        log_dir = Path(cfg.data_dir) / "logs"
+    state.log_dir = str(log_dir)
+    state.binance_logger = CsvLogger(
+        log_dir, "binance_prices",
+        ["ts_ms", "price", "qty"],
+    )
+    state.signal_logger = CsvLogger(
+        log_dir, "signal_log",
+        ["ts_ms", "uptime_s", "binance_price", "binance_age_s", "binance_samples",
+         "lookback_s", "live_delta_pct", "signal_status",
+         "yes_bid", "yes_ask", "yes_age_s",
+         "no_bid", "no_ask", "no_age_s",
+         "market_question", "market_ends_in_s",
+         "market_open_btc", "delta_from_start_pct",  # v5.5.31: new columns
+         "validation_ok", "validation_reason"],
+    )
+    state.trades_logger = CsvLogger(
+        log_dir, "trades",
+        ["ts_ms", "event", "trade_id", "direction", "delta_pct",
+         "token_id", "ask", "bid", "spread", "edge",
+         "fill_price", "size_usdc", "market_id", "market_question", "mode", "notes"],
+    )
+
+    # v5.6.0: depth_log header. 51 columns.
+    # Order: ts_ms, market_id, slug, yes_bid p1..s5 (10), yes_ask p1..s5 (10),
+    #        no_bid p1..s5 (10), no_ask p1..s5 (10), aggregates (8).
+    depth_header: List[str] = ["ts_ms", "market_id", "slug"]
+    for side_label in ("yes_bid", "yes_ask", "no_bid", "no_ask"):
+        for i in range(1, DEPTH_LEVELS + 1):
+            depth_header.append(f"{side_label}_p{i}")
+            depth_header.append(f"{side_label}_s{i}")
+    depth_header += [
+        "yes_bid_depth_5", "yes_ask_depth_5",
+        "no_bid_depth_5", "no_ask_depth_5",
+        "yes_imbalance_5", "no_imbalance_5",
+        "yes_book_age_s", "no_book_age_s",
+    ]
+    state.depth_logger = CsvLogger(log_dir, "depth_log", depth_header)
+
+    # v5.6.0: flow_log header. 25 columns.
+    flow_header: List[str] = ["ts_ms", "market_id", "slug"]
+    for side_label in ("yes", "no"):
+        flow_header += [
+            f"{side_label}_n_20s",
+            f"{side_label}_buy_vol_20s",
+            f"{side_label}_sell_vol_20s",
+            f"{side_label}_net_20s",
+            f"{side_label}_vwap_20s",
+            f"{side_label}_n_120s",
+            f"{side_label}_buy_vol_120s",
+            f"{side_label}_sell_vol_120s",
+            f"{side_label}_net_120s",
+            f"{side_label}_vwap_120s",
+            f"{side_label}_last_fill_ts_ms",
+        ]
+    state.flow_logger = CsvLogger(log_dir, "flow_log", flow_header)
+
+    # v6.1.0: pre_market_books_<date>.csv — book snapshots for 5m/15m/60m
+    # BTC markets. Logged in BOTH lag_signal and both_sides_btc modes
+    # whenever LOG_TO_DISK=true; in lag_signal mode the discovery thread
+    # is idle so the dicts stay empty and this CSV simply gets no rows.
+    # v6.4.0: DISABLED — pre-market observation removed. Logger object
+    # is still constructed for compat but force-disabled below.
+    pre_market_books_header = [
+        "ts_ms", "duration_label", "market_id", "slug", "market_url", "end_ts", "ttr_s",
+        "yes_ask", "yes_bid", "yes_ask_size", "yes_bid_size",
+        "no_ask", "no_bid", "no_ask_size", "no_bid_size",
+        "sum_ask", "sum_bid", "btc_price_now", "mode", "has_position",
+    ]
+    state.pre_market_books_logger = CsvLogger(
+        log_dir, "pre_market_books", pre_market_books_header,
+    )
+    # v6.4.0: hard-disable. No pre-market logging in Skuld.
+    state.pre_market_books_logger.enabled = False
+
+    # v6.1.0: bs_trades_<date>.csv — both-sides entry/exit events.
+    # Independent from trades_<date>.csv (which is v5.8.1 single-leg
+    # lag-signal trades only). Schema rows are written by
+    # _bs_log_trade_event(). 18 columns (v6.1.2 added market_url).
+    bs_trades_header = [
+        "ts_ms", "event", "market_id", "slug", "market_url", "end_ts",
+        "side", "token_id",
+        "entry_ask", "entry_bid",
+        "size_usdc", "qty_shares",
+        "close_price", "close_ts", "pnl_usdc",
+        "sum_ask_at_entry", "mode", "notes",
+    ]
+    state.bs_trades_logger = CsvLogger(
+        log_dir, "bs_trades", bs_trades_header,
+    )
+
+    # v6.4.0 SKULD: resolution_audit_log_<date>.csv
+    # Per-market BTC-cross-check at resolution. Compares bot's claimed
+    # winner against actual BTC direction from the binance_prices feed.
+    # Lets us spot resolution-source bugs (like the source=live issue
+    # killed in v6.4.0) without needing offline analysis.
+    resolution_audit_header = [
+        "ts_ms", "market_id", "slug", "end_ts", "duration_s",
+        "claimed_winner", "claimed_source",
+        "btc_at_start", "btc_at_end", "btc_delta_usd", "btc_delta_pct",
+        "btc_implied_winner", "agreement", "pnl_usdc",
+    ]
+    state.resolution_audit_logger = CsvLogger(
+        log_dir, "resolution_audit", resolution_audit_header,
+    )
+
+    # v6.4.0 SKULD: health_log_<date>.csv
+    # WS + API health snapshot every BS_HEALTH_LOG_INTERVAL_S (default 10s).
+    # Lets us debug "why did the bot stop trading" with timestamped state.
+    health_log_header = [
+        "ts_ms", "uptime_s", "bot_version", "mode", "live_bss_enabled",
+        "binance_ws_last_msg_age_s", "binance_prices_n",
+        "poly_ws_last_msg_age_s", "poly_books_n",
+        "clob_calls_60s", "clob_2xx_60s", "clob_4xx_60s", "clob_5xx_60s",
+        "bs_open", "bs_total_entered", "bs_total_resolved", "pnl_today_usdc",
+        "bss_watching_n", "bss_state_counts",
+    ]
+    state.health_logger = CsvLogger(
+        log_dir, "health_log", health_log_header,
+    )
+
+    if not cfg.log_to_disk:
+        state.binance_logger.enabled = False
+        state.signal_logger.enabled = False
+        state.trades_logger.enabled = False
+        state.depth_logger.enabled = False
+        state.flow_logger.enabled = False
+        state.pre_market_books_logger.enabled = False
+        state.bs_trades_logger.enabled = False
+        state.resolution_audit_logger.enabled = False
+        state.health_logger.enabled = False
+        print("[boot] CSV logging DISABLED (LOG_TO_DISK=false)", flush=True)
+    else:
+        print(f"[boot] CSV logging enabled → {log_dir}", flush=True)
+        print(f"[boot]   datasets: binance_prices, signal_log, trades, "
+              f"depth_log, flow_log, bs_trades, resolution_audit, health_log",
+              flush=True)
+        print(f"[boot]   pre_market_books: DISABLED in v6.4.0 (no pre-market)",
+              flush=True)
+
+    # v6.4.0 SKULD: config_snapshot_<boot_ts>.json
+    # Dump every effective config value the bot is running with, once at boot.
+    # Filename includes boot ts so multiple runs in the same day don't overwrite.
+    try:
+        boot_ts_ms = int(time.time() * 1000)
+        snapshot = {
+            "boot_ts_ms": boot_ts_ms,
+            "boot_iso_utc": datetime.now(timezone.utc).isoformat(),
+            "bot_version": BOT_VERSION,
+            "mode": cfg.mode,
+            "live_bss_enabled": _LIVE_BSS_ENABLED,
+            "bot_name": _BOT_NAME,
+            "data_dir": cfg.data_dir,
+            "log_to_disk": cfg.log_to_disk,
+            "validation_mode": cfg.validation_mode,
+            "position_size_usdc": cfg.position_size_usdc,
+            "daily_loss_limit_usdc": cfg.daily_loss_limit_usdc,
+            "force_signature_type": cfg.force_signature_type,
+            "proxy_wallet": cfg.proxy_wallet,
+            "strategy": {
+                "strategy_mode": _STRATEGY_MODE,
+                "bs_strategy": _BS_STRATEGY,
+                "bs_active": _BS_ACTIVE,
+                "bs_lead_min_s": _BS_LEAD_MIN_S,
+                "bs_lead_max_s": _BS_LEAD_MAX_S,
+                "bs_sum_ask_max": _BS_SUM_ASK_MAX,
+            },
+            "bss_thresholds": {
+                "t_first": _BS_BSS_T_FIRST,
+                "sustain_first_s": _BS_BSS_SUSTAIN_FIRST_S,
+                "t_second_strict": _BS_BSS_T_SECOND_STRICT,
+                "t_second_relaxed": _BS_BSS_T_SECOND_RELAXED,
+                "sustain_second_s": _BS_BSS_SUSTAIN_SECOND_S,
+                "relax_at_s": _BS_BSS_RELAX_AT_S,
+                "abort_at_s": _BS_BSS_ABORT_AT_S,
+                "btc_vel_filter_pct": _BS_BSS_BTC_VEL_FILTER_PCT,
+                "btc_vel_lookback_s": _BS_BSS_BTC_VEL_LOOKBACK_S,
+                "tick_interval_s": _BS_BSS_TICK_INTERVAL_S,
+            },
+            "dry_simulation": {
+                "_design": "v6.5.0 — book-walk + taker fee, no latency sleep, no FOK-fail-on-drift",
+                "book_walk_enabled": _BS_BOOK_WALK_ENABLED,
+                "taker_fee_pct": _BS_TAKER_FEE_PCT,
+            },
+            "v640_deleted_envs": {
+                "BS_LIVE_SIM_ENABLED": os.environ.get("BS_LIVE_SIM_ENABLED", "<unset>"),
+                "BS_LIVE_SIM_LATENCY_MS": os.environ.get("BS_LIVE_SIM_LATENCY_MS", "<unset>"),
+                "BS_LIVE_SIM_FOK_TOLERANCE": os.environ.get("BS_LIVE_SIM_FOK_TOLERANCE", "<unset>"),
+                "_note": "These env vars from v6.4.0 are IGNORED in v6.5.0. The realism design they belonged to was deleted.",
+            },
+            "v640_inert_pre_market_envs": {
+                "BS_BSS_T_FIRST_PRE": _BS_BSS_T_FIRST_PRE,
+                "BS_BSS_T_SECOND_PRE": _BS_BSS_T_SECOND_PRE,
+                "BS_BSS_SUSTAIN_FIRST_PRE_S": _BS_BSS_SUSTAIN_FIRST_PRE_S,
+                "BS_BSS_SUSTAIN_SECOND_PRE_S": _BS_BSS_SUSTAIN_SECOND_PRE_S,
+                "_note": "These env vars are read but unused in v6.5.0 (pre-market path removed in v6.4.0).",
+            },
+            "infrastructure": {
+                "log_retention_days": _LOG_RETENTION_DAYS,
+                "skip_end_minutes": sorted(list(_SKIP_END_MINUTES)) if _SKIP_END_MINUTES else [],
+                "data_dir": cfg.data_dir,
+                "log_dir": str(log_dir),
+            },
+        }
+        snapshot_path = log_dir / f"config_snapshot_{boot_ts_ms}.json"
+        os.makedirs(log_dir, exist_ok=True)
+        snapshot_path.write_text(json.dumps(snapshot, indent=2, default=str))
+        print(f"[boot] config snapshot → {snapshot_path}", flush=True)
+    except Exception as e:
+        print(f"[boot] config snapshot failed: {type(e).__name__}: {e}",
+              flush=True)
+
+
+    _print_banner(state)
+    return state
+
+
+def _print_banner(state: BotState) -> None:
+    cfg = state.config
+    bar = "═" * 64
+    mode_label = "DRY MODE: no real orders will be placed" if cfg.mode == "dry" \
+        else "LIVE MODE: real orders WILL be placed"
+    invert_label = "ON  (UP↔DOWN flipped)" if _SIGNAL_INVERT else "off (raw signal)"
+    # v5.7.0/v5.8.0: take-profit and stop-loss status lines
+    if _TP_THRESHOLD > 0:
+        tp_label = f"+${_TP_THRESHOLD:.2f} for {_TP_PERSIST_S:.0f}s consecutive (DRY only)"
+    else:
+        tp_label = "off (TAKE_PROFIT_THRESHOLD=0)"
+    if _STOP_LOSS_THRESHOLD > 0:
+        sl_label = (f"floor ${_STOP_LOSS_THRESHOLD:.2f} for {_SL_PERSIST_S:.0f}s "
+                    f"consecutive (entry ≥${_SL_MIN_ENTRY:.2f}, DRY only)")
+    else:
+        sl_label = "off (STOP_LOSS_THRESHOLD=0)"
+    # v5.8.1: late-stage SL banner line
+    if _SL_LATE_MODE == "pct":
+        sl_late_label = (f"pct mode, ≤ entry × {_SL_LATE_PCT:.2f} in last "
+                         f"{_SL_LATE_WINDOW_S:.0f}s, persist {_SL_LATE_PERSIST_S:.0f}s")
+    elif _SL_LATE_MODE == "abs":
+        sl_late_label = (f"abs mode, ≤ ${_SL_LATE_FLOOR:.2f} in last "
+                         f"{_SL_LATE_WINDOW_S:.0f}s, persist {_SL_LATE_PERSIST_S:.0f}s")
+    else:
+        sl_late_label = "off (SL_LATE_MODE empty)"
+    reentry_label = "blocked" if _BLOCK_REENTRY else "ALLOWED (BLOCK_REENTRY_AFTER_EXIT=false)"
+    # v6.1.0: strategy mode + both-sides parameter banner lines
+    if _BS_ACTIVE:
+        bs_label = (
+            f"both_sides_btc — 5m trade (DRY), 15m+60m log only (BTC-only)"
+        )
+    else:
+        bs_label = "lag_signal (v5.8.1 path; STRATEGY_MODE=lag_signal)"
+    if _BS_TIER_ENABLED:
+        bs_params_line = (
+            f"lead=[{_BS_LEAD_MIN_S:.0f},{_BS_LEAD_MAX_S:.0f}]s  "
+            f"sum_ask≤{_BS_SUM_ASK_MAX:.2f}  "
+            f"TIER LADDER (v6.5.11): "
+            f"T0(any TTR,≥{_BS_TIER_T0_WINNER:.2f},strict) "
+            f"T1(≤{_BS_TIER_T1_TTR:.0f}s,≥{_BS_TIER_T1_WINNER:.2f}) "
+            f"T2(≤{_BS_TIER_T2_TTR:.0f}s,≥{_BS_TIER_T2_WINNER:.2f}) "
+            f"T3(≤{_BS_TIER_T3_TTR:.0f}s,≥{_BS_TIER_T3_WINNER:.2f}) "
+            f"persist={_BS_TIER_PERSIST_S:.0f}s  "
+            f"swing[{_BS_TIER_SWING_WINDOW_S:.0f}s,Δ{_BS_TIER_SWING_DRAWDOWN:.2f}/↑{_BS_TIER_SWING_BOUNCE:.2f}]  "
+            f"dip[{_BS_TIER_DIP_WINDOW_S:.0f}s,≥{_BS_TIER_DIP_FLOOR:.2f}]"
+        )
+    else:
+        bs_params_line = (
+            f"lead=[{_BS_LEAD_MIN_S:.0f},{_BS_LEAD_MAX_S:.0f}]s  "
+            f"sum_ask≤{_BS_SUM_ASK_MAX:.2f}  "
+            f"sell_loser≥{_BS_SELL_THRESH:.2f} ttr_floor={_BS_SELL_TTR_FLOOR_S:.0f}s "
+            f"persist={_BS_SELL_PERSIST_S:.0f}s min_loser_bid={_BS_SELL_MIN_BID:.2f}"
+        )
+    # v6.2.0: BTC guards line. v6.2.1: late-conviction override line.
+    btc_late_label = (f"{_BS_BTC_LATE_THRESHOLD_USD:.0f}"
+                      if _BS_BTC_LATE_THRESHOLD_USD < 999999.0 else "off")
+    bs_btc_line = (
+        f"min_btc_delta=${_BS_MIN_BTC_DELTA_USD:.0f}  "
+        f"btc_late_thresh=${btc_late_label}@TTR≤60s"
+    )
+    lc_disabled = (_BS_LATE_CONV_TTR_S <= 0.0
+                   or _BS_LATE_CONV_WINNER_THRESHOLD >= 1.0
+                   or _BS_LATE_CONV_MIN_BTC_USD >= 999.0)
+    if lc_disabled:
+        bs_lc_line = "late_conv: off"
+    else:
+        bs_lc_line = (f"late_conv: winner≥{_BS_LATE_CONV_WINNER_THRESHOLD:.2f} "
+                      f"+ TTR≤{_BS_LATE_CONV_TTR_S:.0f}s "
+                      f"+ |btcΔ|≥${_BS_LATE_CONV_MIN_BTC_USD:.0f}")
+    bs_log_line = (
+        f"15m_prefix={_LOG_15M_PREFIX!r}  60m_prefix={_LOG_60M_PREFIX!r}  "
+        f"window=[{_LOG_WINDOW_MIN_S:.0f},{_LOG_WINDOW_MAX_S:.0f}]s  "
+        f"sample_every={_LOG_SAMPLE_INTERVAL_S:.0f}s"
+    )
+    lines = [
+        bar,
+        f"  POLYBOT SIMPLE — v{BOT_VERSION} "
+        f"({'BOTH-SIDES + multi-duration logging' if _BS_ACTIVE else 'lag-signal (v5.8.1 path)'}, DRY only)",
+        bar,
+        f"  Mode:           {cfg.mode.upper()}    ({mode_label})",
+        f"  Strategy:       {bs_label}",
+        f"  v6.1.0 params:  {bs_params_line}",
+        f"  v6.2.0 guards:  {bs_btc_line}",
+        f"  v6.2.1 override: {bs_lc_line}",
+        f"  v6.2.3 strategy: {_BS_STRATEGY}"
+        + ("  ★ THE MONEY LOOSER ★" if _BS_STRATEGY == "verification_late" else ""),
+        (f"  v6.2.4 vl_freeze: arm≥{_BS_VL_ARM_THRESHOLD:.2f}  "
+         f"drop_tol={_BS_VL_DROP_TOLERANCE:.2f}  "
+         f"(freeze=permanent hold-both)"
+         if _BS_STRATEGY == "verification_late" else
+         f"  v6.2.4 vl_freeze: inert (only active when strategy=verification_late)"),
+        f"  v6.2.5 BOT_NAME: {_BOT_NAME!r}" + (
+            "  (log subdir + download prefix active)" if _BOT_NAME
+            else "  (legacy non-isolated paths)"),
+        f"  v6.2.5 skip_end_minutes: " + (
+            ",".join(f"{m:02d}" for m in sorted(_SKIP_END_MINUTES))
+            if _SKIP_END_MINUTES else "(none — no end-minute filter)"),
+        f"  v6.2.5 log_retention: " + (
+            f"{_LOG_RETENTION_DAYS} days (purges daily; today + yesterday "
+            f"protected)" if _LOG_RETENTION_DAYS > 0 else "off"),
+        f"  v6.3.0 bss_entry: " + (
+            f"ACTIVE  T_first={_BS_BSS_T_FIRST:.2f} "
+            f"sustain={_BS_BSS_SUSTAIN_FIRST_S:.0f}s, "
+            f"T_2nd={_BS_BSS_T_SECOND_STRICT:.2f}/{_BS_BSS_T_SECOND_RELAXED:.2f} "
+            f"sustain={_BS_BSS_SUSTAIN_SECOND_S:.0f}s, "
+            f"relax@{_BS_BSS_RELAX_AT_S:.0f}s abort@{_BS_BSS_ABORT_AT_S:.0f}s  "
+            f"★ BOTH-SIDES SEE-SAW ★"
+            if _BS_STRATEGY == "bss_entry" else
+            "inert (only active when BS_STRATEGY=bss_entry)"),
+        f"  v6.3.1 btc_vel_filter: " + (
+            f"ON  threshold={_BS_BSS_BTC_VEL_FILTER_PCT:.4f}% "
+            f"lookback={_BS_BSS_BTC_VEL_LOOKBACK_S:.0f}s "
+            f"(LIVE only, v6.3.6: skipped in pre-market)"
+            if (_BS_STRATEGY == "bss_entry" and _BS_BSS_BTC_VEL_FILTER_PCT > 0)
+            else "OFF (set BS_BSS_BTC_VEL_FILTER_PCT>0 to enable)"),
+        f"  v6.3.2 bss_pre_market: " + (
+            f"T_first_pre={_BS_BSS_T_FIRST_PRE:.2f} "
+            f"T_2nd_pre={_BS_BSS_T_SECOND_PRE:.2f} "
+            f"sustain={_BS_BSS_SUSTAIN_FIRST_PRE_S:.0f}s/{_BS_BSS_SUSTAIN_SECOND_PRE_S:.0f}s "
+            f"(no abort during pre-market; switches to live at T=0)"
+            if _BS_STRATEGY == "bss_entry"
+            else "inert (only active when BS_STRATEGY=bss_entry)"),
+        f"  v6.3.2 bss_fast_tick: " + (
+            f"{1.0/_BS_BSS_TICK_INTERVAL_S:.0f} Hz "
+            f"({_BS_BSS_TICK_INTERVAL_S*1000:.0f}ms tick) "
+            f"— dedicated thread, main_loop unaffected"
+            if _BS_STRATEGY == "bss_entry"
+            else "inert (only active when BS_STRATEGY=bss_entry)"),
+        f"  v6.3.3 patience+chart: " + (
+            f"relax@{_BS_BSS_RELAX_AT_S:.0f}s abort@{_BS_BSS_ABORT_AT_S:.0f}s "
+            f"(was 30/45) · sim shows +$0.19/fire vs −$0.007 · "
+            f"dashboard: design-3 chart for active trade"
+            if _BS_STRATEGY == "bss_entry"
+            else "inert (only active when BS_STRATEGY=bss_entry)"),
+        f"  v6.3.7 patient_2nd: " + (
+            f"floor={_BS_BSS_T_SECOND_FLOOR:.2f} (fire-immediately) · "
+            f"patient_drop={_BS_BSS_OPP_VEL_PATIENT_DROP:.4f} over "
+            f"{_BS_BSS_OPP_VEL_LOOKBACK_S:.0f}s "
+            f"(wait at strict if still falling)"
+            if (_BS_STRATEGY == "bss_entry" and _BS_BSS_OPP_VEL_PATIENT_DROP > 0)
+            else "OFF (set BS_BSS_OPP_VEL_PATIENT_DROP>0 to enable)"),
+        f"  v6.3.8 sampling:   ALWAYS (was: skipped on stale books) · "
+        f"fire-staleness threshold 30s→120s (pre-market quiet tokens are normal)",
+        f"  v6.3.9 DIAGNOSTIC: per-market evaluator trace every 30s "
+        f"(grep '[bss_diag]' in logs to find why fires aren't happening)",
+        f"  v6.3.11 gamma_poll: REST polling every 2.5s on gamma-api/markets "
+        f"(replaces v6.3.10 WS refresh; proven scalper3 pattern that went LIVE)",
+        f"  v6.3.12 watch_through_live: BSS watch list keeps markets through "
+        f"pre-market AND live phases until end_ts (was: dropped at TTR<600s, "
+        f"5min BEFORE live window opens — caused zero live-phase fires)",
+        f"  v6.1.0 logging: {bs_log_line}",
+        bar,
+        f"  Signal invert:  {invert_label}",
+        f"  Take-profit:    {tp_label}",
+        f"  Stop-loss:      {sl_label}",
+        f"  Late-SL:        {sl_late_label}",
+        f"  Re-entry:       {reentry_label}",
+        f"  Proxy wallet:   {cfg.proxy_wallet}",
+        f"  Sig type:       {cfg.force_signature_type} (Polymarket native)",
+        f"  Position size:  ${cfg.position_size_usdc:.2f} USDC",
+        f"  Daily loss cap: ${cfg.daily_loss_limit_usdc:.2f} USDC (enforced LIVE only)",
+        f"  Entry band:     {cfg.entry_price_min:.2f} – {cfg.entry_price_max:.2f}  (lag-signal path only)",
+        f"  Edge min:       {cfg.edge_min:.2f}    Spread max: {cfg.spread_max:.2f}",
+        f"  Signal:         |Δ| ≥ {cfg.delta_threshold_pct:.2f}% over {cfg.lookback_s}s",
+        f"  WS freshness:   ≤ {cfg.ws_freshness_s}s    Binance tol: {cfg.binance_tolerance_pct:.2f}%",
+        f"  Data dir:       {cfg.data_dir}",
+        f"  HTTP port:      {cfg.port}",
+        bar,
+        f"  {'BOTH-SIDES path active' if _BS_ACTIVE else 'lag-signal path active'}. "
+        f"{'VALIDATION_MODE active' if cfg.validation_mode else 'production gates'}.",
+        "  Dashboard at public URL. CSV files under <data_dir>/logs/.",
+        "  Set KILL=true on Railway to halt without a redeploy.",
+        bar,
+    ]
+    for line in lines:
+        print(line, flush=True)
+    # v5.7.0/v5.8.0/v5.8.1: explicit warnings if features set with LIVE mode
+    # (TP/SL/SL_LATE skipped silently in LIVE — no sell-order placement implemented).
+    if (_TP_THRESHOLD > 0 or _STOP_LOSS_THRESHOLD > 0 or _SL_LATE_MODE != "") \
+            and cfg.mode == "live":
+        print("  *** WARNING: TP / SL / Late-SL set but mode=live — early-exit "
+              "paths are DRY only in v5.8.1. All early exits will be SKIPPED ***",
+              flush=True)
+    if _TRAILING_DROP > 0:
+        print(f"  *** NOTE: TRAILING_DROP={_TRAILING_DROP} set, but trailing-stop "
+              f"is a RESERVED HOOK in v5.8.0 (not implemented). Ignored. ***",
+              flush=True)
+    # v6.5.0 SKULD: LIVE BSS gating + DRY book-walk simulation status
+    if _BS_ACTIVE:
+        if cfg.mode == "live":
+            if _LIVE_BSS_ENABLED:
+                ttr_floor = _BS_BSS_MIN_TTR_AT_LEG1_S
+                if ttr_floor > 0:
+                    first_s = max(0, 300 - int(ttr_floor))
+                    ttr_msg = (f" v6.5.2 entry filter: leg-1 only fires "
+                               f"in first {first_s}s (TTR>={int(ttr_floor)}s).")
+                else:
+                    ttr_msg = " v6.5.2 entry filter: OFF."
+                print("  *** LIVE MODE: BSS entries ENABLED. Real CLOB orders "
+                      "will be placed at $1/leg via FAK (proven April 13 pattern). "
+                      "Both MODE=live AND LIVE_BSS_ENABLED=true are set." +
+                      ttr_msg + " ***",
+                      flush=True)
+            else:
+                print("  *** LIVE MODE but LIVE_BSS_ENABLED=false → BSS entries "
+                      "REFUSED. To enable real orders, also set "
+                      "LIVE_BSS_ENABLED=true. ***",
+                      flush=True)
+        else:
+            walk_status = ("ON" if _BS_BOOK_WALK_ENABLED else "OFF")
+            ttr_floor = _BS_BSS_MIN_TTR_AT_LEG1_S
+            if ttr_floor > 0:
+                first_s = max(0, 300 - int(ttr_floor))
+                ttr_status = (f"leg-1 only fires in first {first_s}s "
+                              f"(TTR>={int(ttr_floor)}s)")
+            else:
+                ttr_status = "OFF (no TTR floor — v6.5.1 behavior)"
+            shadow_status = (f"{_BS_BSS_SHADOW_TICK_INTERVAL_S:.0f}s cadence"
+                             if _BS_BSS_SHADOW_TICK_INTERVAL_S > 0 else "OFF")
+            orphan_sell_status = (
+                f"ENABLED (pnl>=${_BS_BSS_ORPHAN_SELL_MIN_PNL:.2f}, "
+                f"elapsed>={_BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S:.0f}s, "
+                f"adv>={_BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS:.0f}bps, "
+                f"persist={_BS_BSS_ORPHAN_SELL_PERSIST_TICKS} ticks)"
+                if _BS_BSS_ORPHAN_SELL_ENABLED
+                else "DISABLED (flip BS_BSS_ORPHAN_SELL_ENABLED=true to activate)"
+            )
+            tp_status = (
+                f"ENABLED (ratio>={_BS_BSS_ORPHAN_TP_RATIO:.2f}, "
+                f"persist={_BS_BSS_ORPHAN_TP_PERSIST_TICKS} tick)"
+                if _BS_BSS_ORPHAN_TP_ENABLED
+                else "DISABLED (flip BS_BSS_ORPHAN_TP_ENABLED=true to activate)"
+            )
+            fee_status = (
+                f"Polymarket curved ({_BS_POLYMARKET_TAKER_FEE_RATE*100:.0f}%×p×(1-p))"
+                if _BS_USE_POLYMARKET_FEE_FORMULA
+                else f"legacy flat {_BS_TAKER_FEE_PCT*100:.1f}%"
+            )
+            rs_status = (
+                f"ENABLED tiered v6.5.10: "
+                f"T1≥{_BS_BSS_ORPHAN_RS_TIER1_WIN:.2f}(any TTR) | "
+                f"T2≥{_BS_BSS_ORPHAN_RS_TIER2_WIN:.2f}+TTR≤{_BS_BSS_ORPHAN_RS_TIER2_TTR_S:.0f}s | "
+                f"T3≥{_BS_BSS_ORPHAN_RS_TIER3_WIN:.2f}+TTR≤{_BS_BSS_ORPHAN_RS_TIER3_TTR_S:.0f}s | "
+                f"hold≥{_BS_BSS_ORPHAN_RS_MIN_ELAPSED_S:.0f}s | "
+                f"btc_guard=${_BS_BSS_ORPHAN_RS_BTC_GUARD_USD:.0f}"
+                if _BS_BSS_ORPHAN_RS_ENABLED
+                else "DISABLED (flip BS_BSS_ORPHAN_RS_ENABLED=true to activate)"
+            )
+            leg1_pat_status = (
+                f"ON drop>={_BS_BSS_LEG1_PATIENT_DROP:.4f} "
+                f"over {_BS_BSS_OPP_VEL_LOOKBACK_S:.0f}s"
+                if _BS_BSS_LEG1_PATIENT_DROP > 0
+                else "OFF (BS_BSS_LEG1_PATIENT_DROP=0)"
+            )
+            print(f"  *** DRY MODE v6.5.8 — per-leg placement, no abort, "
+                  f"book-walk={walk_status} (taker_fee={fee_status}). "
+                  f"v6.5.2 entry filter: {ttr_status}. "
+                  f"v6.5.3 Tier-1 logging: ring buffer + extra_json + "
+                  f"BSS_CANDIDATE_DRY (pre-entry feats: leg2 microstructure, "
+                  f"depth-delta, leg1 bid trajectory, latency, regime). "
+                  f"v6.5.3.1 hold-shadow: BSS_HOLD_SHADOW_DRY at "
+                  f"{shadow_status} — raw state per tick. "
+                  f"v6.5.3.2 dashboard: Speranța hero header — Toate Pânzele Sus. "
+                  f"v6.5.4 orphan-sell (positive-exit): {orphan_sell_status}. "
+                  f"v6.5.4 dashboard P&L: fees in counter. "
+                  f"v6.5.4 cleanup: GET /api/cleanup?confirm=true. "
+                  f"v6.5.5 take-profit (TP): {tp_status}. "
+                  f"v6.5.5 fee formula: corrected to Polymarket curved. "
+                  f"v6.5.5.1 CASHOUT FIX: orphan-sell uses leg1_bid_now (cashout), "
+                  f"no longer gated on book-walk. "
+                  f"v6.5.5.2 LOCKED-SPREAD REJECT: skip ticks where "
+                  f"yes_ask==yes_bid or no_ask==no_bid (ghost snapshots). "
+                  f"v6.5.5.2 BAND-SUSTAIN: orphan-sell uses time-based "
+                  f"sustain ({_BS_BSS_ORPHAN_SELL_SUSTAIN_S:.0f}s with "
+                  f"{_BS_BSS_ORPHAN_SELL_GRACE_S:.0f}s wobble grace), "
+                  f"TP uses {_BS_BSS_ORPHAN_TP_SUSTAIN_S:.0f}s sustain / "
+                  f"{_BS_BSS_ORPHAN_TP_GRACE_S:.0f}s grace. "
+                  f"v6.5.5.2 phase visibility: floor/strict tagged in CSV. "
+                  f"v6.5.5.3 HOTFIX: resolution gate runs BEFORE locked-"
+                  f"spread reject (fixes v6.5.5.2 silent-drop of natural orphans). "
+                  f"v6.5.5.3 dashboard in-flight indicator: WAITING_2ND positions "
+                  f"show orphan-sell sustain progress + would-sell pnl. "
+                  f"v6.5.6 LIVE SELL: orphan-sell now submits real FAK orders "
+                  f"in LIVE mode via _bss_place_live_sell (no GTC fallback). "
+                  f"Partial fills → ORPHAN_SOLD_PARTIAL (proportional P&L, "
+                  f"remaining qty held to resolution). Rejected/error → "
+                  f"BSS_ORPHAN_SELL_LIVE_FAIL logged, state stays WAITING_2ND, "
+                  f"retry next tick. DRY behavior unchanged. "
+                  f"v6.5.6.1 HOTFIX: fixed PolyBook-as-price crash in dashboard. "
+                  f"v6.5.7 reverse-sniper cashout (Rule C): {rs_status}. "
+                  f"Fires when winner_ask>={_BS_BSS_ORPHAN_RS_WINNER_THRESHOLD:.2f} "
+                  f"AND ttr<={_BS_BSS_ORPHAN_RS_TTR_MAX_S:.0f}s; sells losing orphan "
+                  f"leg at cashout bid (~$0.27 avg recovery vs full -$1.02 loss). "
+                  f"reason=reverse_sniper in CSV. "
+                  f"v6.5.8 leg1-patience: {leg1_pat_status}. "
+                  f"Holds leg1 fire when same-side ask still falling fast — "
+                  f"yields deeper entry (avg 11c better in 43pct of paired trades), "
+                  f"more shares, better wins, smaller orphan RS losses. "
+                  f"FIRST_LEG_PATIENT logged when held. "
+                  f"v6.5.5 dashboard: last-15 trades with ORPHAN_SOLD render. ***",
+                  flush=True)
+        # Note v6.4.0 deleted env vars if user still has them set
+        deleted_set = [v for v in (
+            "BS_LIVE_SIM_ENABLED", "BS_LIVE_SIM_LATENCY_MS",
+            "BS_LIVE_SIM_FOK_TOLERANCE") if os.environ.get(v, "")]
+        if deleted_set:
+            print(f"  *** NOTE: v6.4.0 env vars detected ({', '.join(deleted_set)}) — "
+                  f"these are IGNORED in v6.5.0 (deleted from realism design). ***",
+                  flush=True)
+        # Note inert pre-market env vars if user set any
+        pre_set = any(os.environ.get(v, "") for v in (
+            "BS_BSS_T_FIRST_PRE", "BS_BSS_T_SECOND_PRE",
+            "BS_BSS_SUSTAIN_FIRST_PRE_S", "BS_BSS_SUSTAIN_SECOND_PRE_S"))
+        if pre_set:
+            print("  *** NOTE: BS_BSS_*_PRE_* env vars detected — these are "
+                  "INERT in v6.5.0 (pre-market path removed in v6.4.0). ***",
+                  flush=True)
+        # Note that BS_BSS_ABORT_AT_S is now soft-diagnostic only
+        abort_set = os.environ.get("BS_BSS_ABORT_AT_S", "")
+        if abort_set:
+            print(f"  *** NOTE: BS_BSS_ABORT_AT_S={abort_set} is now SOFT-DIAGNOSTIC "
+                  f"in v6.5.0. Leg 2 attempts continue until window end_ts. "
+                  f"Single-leg positions hold to resolution (no abort, no fake sell). ***",
+                  flush=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# THREAD STARTUP
+# ═══════════════════════════════════════════════════════════════════
+
+def start_feed_threads(state: BotState) -> None:
+    threads = [
+        ("binance_ws", binance_ws_thread),
+        ("market_disc", market_discovery_thread),
+        ("poly_ws", poly_ws_thread),
+        ("http", http_server_thread),
+        ("resolution", resolution_thread),
+    ]
+    # v6.1.0: add both-sides discovery thread when STRATEGY_MODE=both_sides_btc.
+    # The thread itself short-circuits on _BS_ACTIVE check, but we only add it
+    # when active to keep the thread list visibly minimal in lag_signal mode.
+    if _BS_ACTIVE:
+        threads.append(("bs_disc", both_sides_discovery_thread))
+    # v6.3.2: BSS fast-tick thread (20Hz default). Only spawned when
+    # bss_entry strategy is active.
+    if _BS_ACTIVE and _BS_STRATEGY == "bss_entry":
+        threads.append(("bss_fast", bss_fast_tick_thread))
+    # v6.3.11: Gamma REST polling thread. Replaces v6.3.10's ws_refresh hack.
+    # Polls Polymarket Gamma /markets endpoint every 2.5s for each BSS-watched
+    # market and updates state.poly_books with fresh prices. This is the
+    # proven pattern from scalper3 (April 2026) which went live successfully —
+    # Polymarket WS drops on Railway and silently degrades for non-active
+    # markets, so REST is the reliable path.
+    if _BS_ACTIVE and _BS_STRATEGY == "bss_entry":
+        threads.append(("bss_gamma_poll", bss_gamma_poll_thread))
+    # v6.2.5: log-retention purger thread (no-op when LOG_RETENTION_DAYS=0).
+    # Always added — the thread itself early-exits if retention is disabled.
+    if _LOG_RETENTION_DAYS > 0:
+        threads.append(("log_retention", log_retention_thread))
+    for name, target in threads:
+        t = threading.Thread(target=target, args=(state,), name=name, daemon=True)
+        t.start()
+        print(f"[boot] started thread: {name}", flush=True)
+
+    if _CHAINLINK_AVAILABLE and chainlink_stream_log is not None:
+        try:
+            chainlink_stream_log.start(add_log_fn=lambda msg, lvl="info": print(msg, flush=True))
+            print(f"[boot] started chainlink_stream_log (Polymarket RTDS relay)", flush=True)
+        except Exception as e:
+            print(f"[boot] chainlink_stream_log start failed: {type(e).__name__}: {e}", flush=True)
+    else:
+        print(f"[boot] chainlink_stream_log not available — Binance-only resolution", flush=True)
+
+    def _kill_check():
+        return state.kill_flag
+
+    for logger_name, logger in (("csv_binance", state.binance_logger),
+                                 ("csv_signal", state.signal_logger),
+                                 ("csv_trades", state.trades_logger),
+                                 ("csv_depth", state.depth_logger),    # v5.6.0
+                                 ("csv_flow", state.flow_logger),      # v5.6.0
+                                 # v6.1.0:
+                                 ("csv_pre_market_books", state.pre_market_books_logger),
+                                 ("csv_bs_trades", state.bs_trades_logger)):
+        if logger is None:
+            continue
+        t = threading.Thread(
+            target=logger.writer_loop, args=(_kill_check,),
+            name=logger_name, daemon=True,
+        )
+        t.start()
+        print(f"[boot] started thread: {logger_name} (enabled={logger.enabled})", flush=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MAIN LOOP
+# ═══════════════════════════════════════════════════════════════════
+
+def _format_heartbeat(state: BotState) -> str:
+    now = time.time()
+
+    # v5.5.24-fix: snapshot for safe iteration
+    prices_snapshot = list(state.binance_prices)
+
+    if state.binance_last_msg_ts > 0:
+        age_s = now - state.binance_last_msg_ts
+        latest_price = prices_snapshot[-1][1] if prices_snapshot else 0.0
+        if age_s < 5 and state.binance_ws_connected:
+            binance = f"binance=OK({age_s*1000:.0f}ms,${latest_price:,.0f})"
+        else:
+            binance = f"binance=STALE({age_s:.0f}s)"
+    else:
+        binance = "binance=DOWN"
+
+    if state.poly_last_msg_ts > 0:
+        age_s = now - state.poly_last_msg_ts
+        if age_s < 10 and state.poly_ws_connected:
+            poly = f"poly_ws=OK({age_s*1000:.0f}ms)"
+        else:
+            poly = f"poly_ws=STALE({age_s:.0f}s)"
+    elif state.poly_ws_connected:
+        poly = "poly_ws=CONN(no_msgs)"
+    else:
+        poly = "poly_ws=DOWN"
+
+    if state.btc_5m_market:
+        time_left = state.btc_5m_market.end_ts - now
+        q = state.btc_5m_market.question
+        if len(q) > 50:
+            q = q[:47] + "…"
+        market = f"market='{q}' ends_in={time_left:.0f}s"
+    else:
+        market = "market=NONE"
+
+    books = f"books={len(state.poly_books)}"
+    pos = "OPEN" if state.open_position else "NONE"
+
+    if state.live_delta_pct is None:
+        sig = f"signal=NONE({state.signal_status_msg})"
+    elif state.last_validation_ok is True:
+        sig = f"signal=VALID({state.live_delta_pct:+.2f}%)"
+    elif state.last_validation_ok is False:
+        sig = f"signal=SKIP({state.last_validation_reason})"
+    else:
+        sig = f"signal=NONE({state.live_delta_pct:+.2f}%<thr)"
+
+    invert_tag = " INVERT" if _SIGNAL_INVERT else ""
+
+    # v6.1.0: when both_sides_btc is active, the "position=" / "trades=" /
+    # "pnl=" fields are dominated by both-sides activity, not the v5.8.1
+    # single-leg counters. Add a parallel summary line.
+    if _BS_ACTIVE:
+        bs_open = len(state.both_sides_positions)
+        d5 = len(state.bs_5m_in_window)
+        d15 = len(state.bs_15m_in_window)
+        d60 = len(state.bs_60m_in_window)
+        # v6.1.2: count pending positions (none in v6.1.1 — VOID was used)
+        bs_pending = sum(1 for p in state.both_sides_positions.values()
+                          if p.pending_since > 0)
+        bs_summary = (
+            f" bs_open={bs_open} disc=[5m:{d5},15m:{d15},60m:{d60}] "
+            f"bs_entered={state.bs_total_entered} "
+            f"bs_sold={state.bs_total_sold_loser} "
+            f"bs_resolved={state.bs_total_resolved} "
+            f"bs_pending={bs_pending} "
+            f"bs_pnl=${state.bs_pnl_today_usdc:+.2f}"
+        )
+    else:
+        bs_summary = ""
+
+    return (f"[heartbeat] uptime={state.uptime_s:.0f}s mode={state.mode}{invert_tag} "
+            f"position={pos} {binance} {poly} {market} {books} {sig} "
+            f"trades={state.trades_today}({state.trades_won}W/{state.trades_lost}L) "
+            f"pnl=${state.pnl_today_usdc:+.2f} skips={state.skips_today}{bs_summary}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v6.3.2: BSS FAST TICK THREAD
+# ═══════════════════════════════════════════════════════════════════
+# Runs the BSS evaluator at high frequency (default 20Hz / 50ms ticks)
+# in its own thread. Main loop stays at 1Hz for everything else.
+#
+# Only spawned when _BS_STRATEGY == 'bss_entry'. Otherwise inert.
+#
+# Thread safety:
+#   - state.bs_5m_in_window: iterated as list(.values()) snapshot
+#   - state.poly_books: read-only here, GIL-safe dict access
+#   - state.both_sides_positions: writes are dict assignment (GIL-safe);
+#       BSS only writes a fresh entry, never overwrites
+#   - mdm.bss_*: written only here. No concurrent writer.
+#   - state.bs_trades_logger: queued logger, thread-safe.
+
+def _fetch_market_live_prices(condition_id: str) -> Optional[Dict[str, Any]]:
+    """v6.3.11: fetch CURRENT yes/no prices from Polymarket Gamma for a live
+    (open) market. Single HTTP request (no closed/archived filter).
+
+    Returns the market dict from Gamma containing outcomePrices and outcomes,
+    or None on any failure. Designed to be called frequently (every 2-3s)
+    so failures must be silent and cheap.
+    """
+    import requests
+    headers = {
+        "User-Agent": "polybot-simple-v1/0.6 (+https://polymarket.com)",
+        "Accept": "application/json",
+    }
+    try:
+        r = requests.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"condition_ids": condition_id},
+            headers=headers, timeout=4,
+        )
+    except Exception:
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        data = r.json()
+    except Exception:
+        return None
+    items = data if isinstance(data, list) else (data.get("data") or data.get("markets") or [])
+    if not items:
+        return None
+    return items[0]
+
+
+def _gamma_refresh_one_market(state: BotState,
+                                mdm: MultiDurationMarket) -> bool:
+    """v6.3.11: refresh poly_books for one market using Gamma data.
+    Returns True if books were updated, False otherwise. Silent on failure."""
+    md = _fetch_market_live_prices(mdm.market.condition_id)
+    if md is None:
+        return False
+    out_raw = md.get("outcomePrices")
+    try:
+        prices = json.loads(out_raw) if isinstance(out_raw, str) else out_raw
+    except Exception:
+        return False
+    if not isinstance(prices, list) or len(prices) != 2:
+        return False
+    try:
+        # Gamma outcomePrices order matches outcomes order, which is
+        # ['Up','Down'] (== ['Yes','No']) for BTC Up/Down markets.
+        # The bot's convention: yes_token_id corresponds to 'Up', no_token_id
+        # to 'Down', mirroring outcomes[0]/outcomes[1].
+        yes_p = float(prices[0])
+        no_p = float(prices[1])
+    except Exception:
+        return False
+    if yes_p <= 0 or no_p <= 0 or yes_p >= 1 or no_p >= 1:
+        return False
+    now = time.time()
+    yb = state.poly_books.get(mdm.market.yes_token_id)
+    nb = state.poly_books.get(mdm.market.no_token_id)
+    # Update existing books if present. Gamma gives mid/last-trade only —
+    # we set bid==ask==price, which matches the scalper3 pattern that
+    # went live successfully. Fine for threshold-based entry decisions.
+    if yb is not None:
+        yb.bid = yes_p
+        yb.ask = yes_p
+        yb.last_update_ts = now
+    else:
+        # Book doesn't exist yet (token not in WS subscription) — create
+        # minimal PolyBook so the BSS evaluator can read prices.
+        state.poly_books[mdm.market.yes_token_id] = PolyBook(
+            token_id=mdm.market.yes_token_id,
+            bid=yes_p, ask=yes_p, bid_size=0.0, ask_size=0.0,
+            last_update_ts=now, bid_levels=[], ask_levels=[],
+            last_book_snapshot_ts=now,
+        )
+    if nb is not None:
+        nb.bid = no_p
+        nb.ask = no_p
+        nb.last_update_ts = now
+    else:
+        state.poly_books[mdm.market.no_token_id] = PolyBook(
+            token_id=mdm.market.no_token_id,
+            bid=no_p, ask=no_p, bid_size=0.0, ask_size=0.0,
+            last_update_ts=now, bid_levels=[], ask_levels=[],
+            last_book_snapshot_ts=now,
+        )
+    return True
+
+
+def bss_gamma_poll_thread(state: BotState) -> None:
+    """v6.3.11: poll Polymarket Gamma REST API for fresh prices on every
+    BSS-watched market. Replaces the v6.3.10 ws_refresh hack.
+
+    Background: on May 7 we discovered that Polymarket's WS subscription
+    delivers initial book snapshots but only sends ongoing price_change
+    events to the most-recently active market. BSS-watched pre-market
+    5-min and 15-min markets go silent forever after the initial snapshot.
+
+    The proven workaround (scalper3, April 2026, went live successfully)
+    is to poll Gamma's REST /markets endpoint, which always returns the
+    latest outcomePrices regardless of WS state. Each market costs one
+    HTTP request (~200-500ms). At 3 markets every 2.5s, total load is
+    well under 2 RPS to Gamma — orders of magnitude below rate limit.
+
+    DRY trade-off: Gamma returns last-trade-price, not top-of-book bid/ask.
+    In thin markets this can lag by a few seconds. Acceptable for sustain-
+    based entry triggers (4s sustain) which already smooth over short
+    spikes. Future v6.3.12 may add CLOB REST get_order_book for
+    bid/ask precision when LIVE mode arrives.
+    """
+    POLL_INTERVAL_S = 2.5
+    print(f"[bss_gamma_poll] v6.3.11 starting "
+          f"(interval={POLL_INTERVAL_S:.1f}s, source=gamma-api/markets)",
+          flush=True)
+    cycle_count = 0
+    err_count = 0
+    last_log_ts = 0.0
+    while not state.kill_flag:
+        loop_start = time.time()
+        try:
+            # Snapshot the watch list (avoid mutation during iteration)
+            mdms = list(state.bs_5m_in_window.values())
+            updated = 0
+            for mdm in mdms:
+                try:
+                    if _gamma_refresh_one_market(state, mdm):
+                        updated += 1
+                except Exception as e:
+                    err_count += 1
+                    if err_count <= 3 or err_count % 50 == 0:
+                        print(f"[bss_gamma_poll] error refreshing "
+                              f"{mdm.market.condition_id[:10]}…: "
+                              f"{type(e).__name__}: {e}", flush=True)
+            cycle_count += 1
+            now = time.time()
+            # Heartbeat every 30s so we can confirm the thread is alive
+            if now - last_log_ts >= 30.0:
+                print(f"[bss_gamma_poll] cycle={cycle_count} "
+                      f"watched={len(mdms)} updated_last_cycle={updated} "
+                      f"errs_total={err_count}", flush=True)
+                last_log_ts = now
+        except Exception as e:
+            print(f"[bss_gamma_poll] outer error: "
+                  f"{type(e).__name__}: {e}", flush=True)
+        # Sleep remainder of interval (account for time spent polling)
+        elapsed = time.time() - loop_start
+        sleep_s = max(0.1, POLL_INTERVAL_S - elapsed)
+        slept = 0.0
+        while slept < sleep_s and not state.kill_flag:
+            time.sleep(min(0.5, sleep_s - slept))
+            slept += 0.5
+
+
+def bss_fast_tick_thread(state: BotState) -> None:
+    """v6.3.2: dedicated BSS evaluator loop. ~20Hz default."""
+    interval_s = _BS_BSS_TICK_INTERVAL_S
+    print(f"[bss_fast] starting at {1.0/interval_s:.0f} Hz "
+          f"(interval={interval_s*1000:.0f}ms)", flush=True)
+    last_err_ts = 0.0
+    err_count = 0
+    while not state.kill_flag:
+        now = time.time()
+        try:
+            for mdm in list(state.bs_5m_in_window.values()):
+                try:
+                    _bs_evaluate_bss_entry(state, mdm, now)
+                except Exception as e:
+                    # Suppress per-market errors but count them — don't
+                    # let a bad market kill the loop
+                    err_count += 1
+                    if now - last_err_ts > 5.0:  # rate-limit error log
+                        print(f"[bss_fast] eval error market="
+                              f"{mdm.market.condition_id[:10]}: "
+                              f"{type(e).__name__}: {e} "
+                              f"(suppressed errors since last: {err_count})",
+                              flush=True)
+                        last_err_ts = now
+                        err_count = 0
+        except Exception as e:
+            # Outer try catches things like dict-mutation-during-iteration
+            print(f"[bss_fast] OUTER error: {type(e).__name__}: {e}",
+                  flush=True)
+            traceback.print_exc()
+        time.sleep(interval_s)
+    print("[bss_fast] thread exiting (kill_flag set)", flush=True)
+
+
+def main_loop(state: BotState) -> None:
+    print("[main_loop] Entering heartbeat loop.", flush=True)
+    last_heartbeat = 0.0
+    while not state.kill_flag:
+        now = time.time()
+
+        try:
+            signal_tick(state)
+        except Exception as e:
+            print(f"[signal] tick error: {e}", flush=True)
+            traceback.print_exc()
+
+        # v5.7.0: take-profit check (no-op when TP env vars unset or no position).
+        # Wrapped independently so a TP fault never breaks signal/depth/flow.
+        try:
+            take_profit_tick(state)
+        except Exception as e:
+            print(f"[take_profit] tick error: {e}", flush=True)
+            traceback.print_exc()
+
+        # v6.1.0: both-sides entry + sell-loser tick. No-op when
+        # STRATEGY_MODE=lag_signal (default). Wrapped independently so
+        # a both-sides fault can never break the v5.8.1 path.
+        try:
+            both_sides_tick(state)
+        except Exception as e:
+            print(f"[both_sides] tick error: {e}", flush=True)
+            traceback.print_exc()
+
+        # v6.1.0: both-sides resolution settle. No-op when v6.1.0 inactive
+        # OR no positions are at/past end_ts.
+        try:
+            _bs_resolution_tick(state)
+        except Exception as e:
+            print(f"[bs_resolution] tick error: {e}", flush=True)
+            traceback.print_exc()
+
+        # v6.1.0: pre-market books logger. Writes to CSV only when
+        # discovery has populated bs_*_in_window dicts (i.e. when
+        # v6.1.0 is active). No-op otherwise.
+        # v6.4.0 SKULD: pre_market_books_logger force-disabled at boot;
+        # this call is a no-op early-return.
+        try:
+            pre_market_books_log_tick(state)
+        except Exception as e:
+            print(f"[pre_market_books] tick error: {e}", flush=True)
+            traceback.print_exc()
+
+        # v6.4.0 SKULD: health log tick (10s default cadence).
+        try:
+            _health_log_tick(state)
+        except Exception as e:
+            print(f"[health_log] tick error: {e}", flush=True)
+            traceback.print_exc()
+
+        # v5.6.0: depth + flow logging ticks. Both wrapped independently so
+        # a transient logger fault never breaks the trading-relevant path.
+        try:
+            _log_depth_tick(state)
+        except Exception as e:
+            print(f"[depth] tick error: {e}", flush=True)
+            traceback.print_exc()
+
+        try:
+            _log_flow_tick(state)
+        except Exception as e:
+            print(f"[flow] tick error: {e}", flush=True)
+            traceback.print_exc()
+
+        if now - last_heartbeat >= 30.0:
+            print(_format_heartbeat(state), flush=True)
+            last_heartbeat = now
+        if os.environ.get("KILL", "").strip().lower() == "true":
+            print("[main_loop] KILL=true detected. Exiting.", flush=True)
+            state.kill_flag = True
+            break
+        time.sleep(1.0)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SIGNAL HANDLING
+# ═══════════════════════════════════════════════════════════════════
+
+def install_signal_handlers(state: BotState) -> None:
+    def _handler(signum, frame):
+        print(f"\n[signal] received {signum}, shutting down gracefully...", flush=True)
+        state.kill_flag = True
+        try:
+            if state.poly_ws_handle:
+                state.poly_ws_handle.close()
+        except Exception:
+            pass
+
+    signal_module.signal(signal_module.SIGTERM, _handler)
+    signal_module.signal(signal_module.SIGINT, _handler)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════
+
+def main() -> int:
+    try:
+        state = boot()
+    except RuntimeError as e:
+        print(f"\n[boot] FATAL: {e}\n", flush=True, file=sys.stderr)
+        return 1
+
+    install_signal_handlers(state)
+    start_feed_threads(state)
+
+    try:
+        main_loop(state)
+    except Exception as e:
+        print(f"\n[main_loop] CRASH: {e}\n", flush=True, file=sys.stderr)
+        traceback.print_exc()
+        return 2
+
+    print("[main] Clean shutdown.", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
