@@ -1,7 +1,7 @@
 """
 main.py — polybot_skuld_v1 (unified paired both-sides strategy).
-Active strategy: paired entry + tiered paired sell-loser exit + keep-both fallback.
-Legacy BSS/orphan code remains in file but is gated inactive.
+Active strategy: paired entry (49–51¢ zone) + tiered paired sell-loser exit + keep-both fallback.
+Legacy BSS/orphan/sequential-leg code remains gated inactive.
 v6.5.6 base — unified strategy refactor applied.
 
 ═══════════════════════════════════════════════════════════════════════
@@ -70,25 +70,22 @@ Originally based on v5.8.1 (2026-04-29):
 NEW IN v5.8.1: late-stage stop-loss (LATE-SL).
 
 ═══════════════════════════════════════════════════════════════════════
-v6.5.0 "SKULD" rev 2 — per-leg placement, no abort, real DRY numbers
+# LEGACY INACTIVE PATH: v6.5.0 "SKULD" rev 2 — per-leg placement, no abort, real DRY numbers
+# (Sequential first-leg/second-leg runtime. Inactive under unified paired strategy.)
 ═══════════════════════════════════════════════════════════════════════
 
 v6.4.0 was broken at an architectural level: both legs committed at
-second-leg-decision time using a fictional first-leg price from minutes
-ago. The v6.4.0 "DRY realism simulator" then attempted to validate
+    # LEGACY INACTIVE PATH: second-leg-decision time using a fictional first-leg price from minutes
+    # LEGACY INACTIVE PATH: ago. The v6.4.0 "DRY realism simulator" then attempted to validate
 that fictional price against current book and FOK-failed itself ~5,400
 times in 5 hours (May 8 morning data). v6.5.0 fixes the architecture.
 
-CORE BEHAVIOR (changes from v6.4.0):
-  - Per-leg placement: each leg is placed at its OWN decision moment.
-    Leg 1 fires when first sustain completes. Leg 2 fires when second
-    sustain completes. No deferred fictional fills.
-  - DRY simulation modeled on proven April 13 LIVE pattern: book-walk
-    if top-of-book size insufficient, taker fee applied. NO latency
-    sleep, NO fake FOK-fail-on-drift. FAK semantics (partial fills OK).
-  - Abort REMOVED entirely. There is no abort. Single-leg positions
-    held to resolution like every other position. New ORPHAN_END
-    event logged at window close for downstream analysis only.
+CORE BEHAVIOR (changes from v6.4.0) — LEGACY INACTIVE PATH:
+  # LEGACY INACTIVE PATH: Per-leg placement: each leg placed at its OWN decision moment.
+  #   Leg 1 fires when first sustain completes. Leg 2 when second sustain completes.
+  # LEGACY INACTIVE PATH: Abort REMOVED. Single-leg positions held to resolution.
+  #   ORPHAN_END logged at window close for downstream analysis.
+  # Active strategy: paired entry only. No sequential legs. No orphan states.
 Originally based on v5.8.1 (2026-04-29):
 
 NEW IN v5.8.1: late-stage stop-loss (LATE-SL).
@@ -487,19 +484,11 @@ def _read_v610_env() -> Tuple[
     #                          Designed for side-by-side A/B testing on a second
     #                          Railway service (DRY only, same markets, same entry).
     #   "bss_entry" (v6.3.0) — Both-Sides See-Saw entry. REPLACES the standard
-    #                          sum_ask<1.10 entry path AND replaces verification_late.
-    #                          Bot watches every 5m market and waits for ONE side
-    #                          to dip below BS_BSS_T_FIRST sustained for
-    #                          BS_BSS_SUSTAIN_FIRST_S seconds → buy first leg.
-    #                          Then waits for OTHER side to dip below
-    #                          BS_BSS_T_SECOND_STRICT (or relaxed threshold after
-    #                          BS_BSS_RELAX_AT_S) sustained for
-    #                          BS_BSS_SUSTAIN_SECOND_S seconds → buy second leg.
-    #                          Holds both to resolution. If second never confirms
-    #                          by BS_BSS_ABORT_AT_S, sells first leg at current bid.
-    #                          Mirror-of-verification_late structure: sustain →
-    #                          fire pattern, just inverted (buy low instead of
-    #                          confirm high). DRY-only.
+    # LEGACY INACTIVE PATH: "bss_entry" (v6.3.0) sequential first-leg/second-leg strategy.
+    #   Bot watched for first-leg sustain → buy first leg → wait for second-leg sustain →
+    #   buy second leg. Single-leg orphan if second never confirmed. NOT part of the
+    #   unified paired strategy. bss_entry is rejected at boot and _bs_bss_runtime_active()
+    #   always returns False.
     bs_strategy_raw = os.environ.get("BS_STRATEGY", "v621").strip().lower()
     if bs_strategy_raw not in ("v621", "verification_late"):
         print(f"[boot][v6.2.2] warning: BS_STRATEGY={bs_strategy_raw!r} "
@@ -520,8 +509,8 @@ def _read_v610_env() -> Tuple[
     bs_vl_arm_thresh = _f("BS_VL_ARM_THRESHOLD", 0.70, 0.50, 0.99)
     bs_vl_drop_tol = _f("BS_VL_DROP_TOLERANCE", 0.03, 0.0, 0.50)
 
-    # v6.3.0: BSS (Both-Sides See-Saw) parameters. Inert unless
-    # BS_STRATEGY == 'bss_entry'.
+    # LEGACY INACTIVE PATH: BSS (Both-Sides See-Saw) sequential parameters.
+    # Inert. _bs_bss_runtime_active() always returns False under unified strategy.
     bs_bss_t_first         = _f("BS_BSS_T_FIRST",          0.45, 0.10, 0.50)
     bs_bss_sustain_first_s = _f("BS_BSS_SUSTAIN_FIRST_S",  4.0,  0.0,  30.0)
     bs_bss_t_second_strict = _f("BS_BSS_T_SECOND_STRICT",  0.50, 0.30, 0.99)
@@ -659,7 +648,7 @@ def _read_v610_env() -> Tuple[
 _BS_ACTIVE = (_STRATEGY_MODE == "both_sides_btc")
 
 # Active strategy invariant:
-# - paired entry only
+# - paired entry only (49-51¢ zone, sum≤1.02)
 # - no orphan states in the active runtime
 # - one unitary exit strategy: paired sell-loser via the tiered ladder
 # - if paired sell-loser does not fire, keep both legs until settlement
@@ -814,9 +803,12 @@ _BS_BSS_SHADOW_TICK_INTERVAL_S = float(
 
 
 # ═══════════════════════════════════════════════════════════════════
-# v6.5.4 SKULD: orphan-sell rule (positive-exit)
+# LEGACY INACTIVE PATH: v6.5.4 SKULD: orphan-sell rule (positive-exit)
+# Operates during WAITING_2ND (sequential-leg mode only).
+# WAITING_2ND is inactive in the unified paired strategy.
+# _bs_bss_runtime_active() always returns False; this block is unreachable.
 # ═══════════════════════════════════════════════════════════════════
-# When enabled, during the WAITING_2ND hold, the bot evaluates an exit
+# When enabled (legacy), during the WAITING_2ND hold, the bot evaluates an exit
 # rule on every shadow tick (default 3s cadence). If conditions hold for
 # a configurable number of consecutive ticks, leg-1 is sold at the
 # current bid, locking in a small profit and avoiding the orphan loss.
@@ -848,9 +840,11 @@ _BS_BSS_ORPHAN_SELL_PERSIST_TICKS = int(float(
 
 
 # ═══════════════════════════════════════════════════════════════════
-# v6.5.5 SKULD: orphan take-profit (TP) rule
+# LEGACY INACTIVE PATH: v6.5.5 SKULD: orphan take-profit (TP) rule
+# Operates during WAITING_2ND (sequential-leg mode only). Unreachable
+# in unified paired strategy. _bs_bss_runtime_active() always False.
 # ═══════════════════════════════════════════════════════════════════
-# Complementary to the orphan-sell defensive exit (which fires at
+# (Legacy) Complementary to the orphan-sell defensive exit (which fires at
 # break-even when BTC is adverse). The TP rule fires OPPORTUNISTICALLY
 # when leg-1 bid has recovered substantially above entry — locking in a
 # real profit before potential reversal.
@@ -922,9 +916,12 @@ _BS_BSS_ORPHAN_TP_GRACE_S = float(
 
 
 # ═══════════════════════════════════════════════════════════════════
-# v6.5.7 SKULD: reverse-sniper cashout (Rule C)
+# LEGACY INACTIVE PATH: v6.5.7 SKULD: reverse-sniper cashout (Rule C)
+# Operates on orphan positions in WAITING_2ND (sequential-leg mode only).
+# WAITING_2ND is inactive in the unified paired strategy.
+# _bs_bss_runtime_active() always False; this block is unreachable.
 # ═══════════════════════════════════════════════════════════════════
-# When the other side reaches conviction (winner_ask >= threshold),
+# (Legacy) When the other side reaches conviction (winner_ask >= threshold),
 # sell the losing orphan leg at cashout bid to recover partial value
 # rather than holding to a near-certain -$1 loss at resolution.
 #
@@ -1807,24 +1804,13 @@ class MultiDurationMarket:
     # ask for a re-subscribe.
     ws_subscribed: bool = False
 
-    # ─── v6.3.0: BSS (Both-Sides See-Saw) per-market state ─────────────
-    # Inert unless _BS_STRATEGY == 'bss_entry'. Mirrors the pattern of
-    # BothSidesPosition.vl_* fields — sustain-and-fire state for entry,
-    # rather than for sell. Lifecycle:
-    #   bss_state='WATCH'        → looking for first-leg sustain
-    #   bss_state='WAITING_2ND'  → first leg "filled"; looking for second
-    #   bss_state='BOTH'         → both legs filled; held to resolution
-    #                              (a real BothSidesPosition has been
-    #                              created and lives in
-    #                              state.both_sides_positions)
-    #   bss_state='ABORT'        → second leg never confirmed; first leg
-    #                              "sold" at last bid; done
-    #   bss_state='RESOLVED'     → terminal (only used for ABORT path;
-    #                              BOTH path is resolved by the existing
-    #                              both_sides_positions resolution flow)
-    # v6.5.0: states are WATCH → WAITING_2ND (semantic: HALF, leg 1 actually
-    # held) → BOTH (PAIRED) → RESOLVED. ABORT is NEVER entered. Window-end
-    # transitions HALF directly to ORPHAN_END logging then RESOLVED.
+    # ─── LEGACY INACTIVE PATH: v6.3.0 BSS sequential per-market state ──
+    # Inert. _bs_bss_runtime_active() always returns False.
+    # Legacy lifecycle (unreachable):
+    #   bss_state='WATCH'       → looking for first-leg sustain
+    #   bss_state='WAITING_2ND' → first leg held; looking for second
+    #   bss_state='BOTH'        → both legs filled (BothSidesPosition created)
+    #   bss_state='ORPHAN_END'  → window closed with only leg 1 held
     bss_state: str = "WATCH"
     bss_yes_below_first_start_ts: Optional[float] = None
     bss_no_below_first_start_ts: Optional[float] = None
@@ -3299,9 +3285,9 @@ function fmtAgeShort(sec){if(sec==null||!isFinite(sec))return '';if(sec<60)retur
 function fmtPrice(p){if(p==null)return '—';return Number(p).toFixed(2);}
 function renderRecentTrades(s){
 const list=$('recent-trades-list');
-// v6.5.5: last 15 trades (was 10). Now includes ORPHAN_SOLD positions
-// from the orphan-sell (positive-exit) and take-profit rules — these
-// are leg-1-only closes that didn't reach resolution.
+// LEGACY INACTIVE PATH: v6.5.5 last 15 trades — includes ORPHAN_SOLD positions
+// from legacy bss_entry orphan-sell and take-profit rules. These are unreachable
+// in the unified paired strategy but the rendering is kept for historical log display.
 //   Schema per row (single line):
 //     [pill] [sold|resolved · winner_badge]   [sparkline 100x24]   [+$X.XX BTC]   [pnl]
 //   Color rule (sparkline + tinted bg):
@@ -3447,7 +3433,8 @@ const watching=st.bss_watching||[];
 const aborted=st.bss_aborted_today||[];
 const bssActive=!!st.bss_strategy_active;
 const list=$('bs-positions');
-// Unified paired strategy rendering. bss_entry is inactive; paired runtime always active.
+// LEGACY INACTIVE PATH: BSS-aware rendering. bss_entry state cards (WATCH/WAITING_2ND)
+// are shown only if present in historical data. bss_entry is not the active strategy.
 // BSS state cards (WATCH / WAITING_2ND / ABORT) alongside BOTH-state
 // positions. Old-style sum_ask@entry hidden in bss mode.
 if(bssActive){
@@ -3841,12 +3828,11 @@ def _build_status_payload(state: BotState) -> dict:
     # Sort by TTR ascending (closest to resolution first — most actionable)
     bs_open_positions.sort(key=lambda x: x["ttr_s"])
 
-    # v6.3.1: BSS watching list — markets in WATCH/WAITING_2ND/ABORT state
-    # that don't yet have a BothSidesPosition. Surfaces what BSS is actually
-    # doing in real-time. Only populated when _BS_STRATEGY=='bss_entry'.
+    # LEGACY INACTIVE PATH: BSS watching list — markets in WATCH/WAITING_2ND state.
+    # Populated only if _BS_STRATEGY=='bss_entry', which is never set under unified strategy.
     bss_watching = []
     bss_aborted_today = []
-    if _BS_STRATEGY == "bss_entry":
+    if _BS_STRATEGY == "bss_entry":  # always False under unified strategy
         for cid, mdm in state.bs_5m_in_window.items():
             if mdm.duration_s != 300:
                 continue
@@ -4069,10 +4055,10 @@ def _build_status_payload(state: BotState) -> dict:
             "pnl_today_usdc": round(state.bs_pnl_today_usdc, 4),
             "discovery": dict(state.bs_discovery_diag),
             "open_positions": bs_open_positions,
-            # v6.3.1: BSS state surfaces — only populated in bss_entry mode
+            # LEGACY INACTIVE PATH: BSS state surfaces — bss_entry not active under unified strategy
             "bss_watching": bss_watching,
             "bss_aborted_today": bss_aborted_today[-20:],
-            "bss_strategy_active": _BS_STRATEGY == "bss_entry",
+            "bss_strategy_active": False,  # bss_entry inactive; _bs_bss_runtime_active() always False
             # v6.1.2: rolling history for "Last 5 trades" panel.
             "trade_history": state.bs_trade_history[-15:],
         },
@@ -4322,7 +4308,6 @@ def http_server_thread(state: BotState) -> None:
                 self.wfile.write(b"ok\n")
                 return
 
-            # GET /api/logs/download?name=filename.csv
             if path == "/api/logs/download":
                 qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 name = (qs.get("name") or [""])[0]
@@ -6378,18 +6363,15 @@ def _bs_evaluate_late_conviction(
 
 def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
                             now: float) -> None:
-    """Run one tick of the BSS state machine for one market. Mutates
-    mdm.bss_* directly. Mirrors the structural pattern of
-    _bs_evaluate_verification_late but for ENTRY rather than SELL.
-    Only invoked when _BS_STRATEGY == 'bss_entry'.
+    """LEGACY INACTIVE PATH: BSS sequential entry evaluator.
+    Only invoked from bss_fast_tick_thread, which is never spawned because
+    _bs_bss_runtime_active() always returns False under the unified strategy.
 
-    States:
-      WATCH         → looking for first-leg sustain trigger
-      WAITING_2ND   → first leg "filled"; looking for second-leg sustain
-      BOTH          → both legs filled (BothSidesPosition created); done
-                       handing off to existing resolution flow
-      ABORT         → second never confirmed; first leg sold at bid; done
-      RESOLVED      → terminal (only used internally for ABORT path)
+    Legacy states (unreachable in active runtime):
+      WATCH       → looking for first-leg sustain trigger
+      WAITING_2ND → first leg held; looking for second-leg sustain
+      BOTH        → both legs filled (BothSidesPosition created); done
+      ORPHAN_END  → window closed with leg 1 still held (no leg 2)
     """
     market = mdm.market
 
@@ -7334,13 +7316,9 @@ def _bss_place_leg2(state: BotState, mdm: MultiDurationMarket, now: float,
 def _bss_handle_window_end_orphan(state: BotState, mdm: MultiDurationMarket,
                                     now: float, yes_ask: float, no_ask: float,
                                     yes_bid: float, no_bid: float) -> None:
-    """v6.5.0: when market end_ts is reached and we're still in WAITING_2ND
-    (semantic: HALF), the held leg becomes an orphan. Build a BothSidesPosition
-    with the held leg + a zero-size empty leg so the resolution flow handles
-    payout naturally. CTF will pay $1/share to whoever holds the winning side.
-    
-    No sell, no flatten, no fake P&L. Just record the orphan event for
-    downstream analysis and let resolution take over.
+    """LEGACY INACTIVE PATH: v6.5.0 orphan handler.
+    Only reachable from _bs_evaluate_bss_entry → bss_fast_tick_thread.
+    That thread is never spawned (_bs_bss_runtime_active() always False).
     """
     if mdm.bss_leg1_orphan_end_logged:
         return  # already handled
@@ -7982,7 +7960,8 @@ def _bs_log_bss_hold_shadow_event(state: "BotState", mdm: "MultiDurationMarket",
 
 
 # ═══════════════════════════════════════════════════════════════════
-# v6.5.4 SKULD: orphan-sell rule (positive-exit) + v6.5.5 TP
+# LEGACY INACTIVE PATH: v6.5.4 SKULD: orphan-sell rule (positive-exit) + v6.5.5 TP
+# Unreachable under unified strategy (_bs_bss_runtime_active() always False).
 # ═══════════════════════════════════════════════════════════════════
 
 def _bs_is_book_locked(yes_ask: Optional[float], no_ask: Optional[float],
@@ -8057,30 +8036,11 @@ def _bs_evaluate_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
                               now: float,
                               yes_ask: float, no_ask: float,
                               yes_bid: float, no_bid: float) -> None:
-    """v6.5.4/v6.5.5: evaluate orphan exit rules on this shadow tick.
-
-    Two independent triggers can fire (whichever first):
-
-    (A) POSITIVE-EXIT (v6.5.4 defensive — BTC adverse, breakeven):
-        sell_pnl_now            >= _BS_BSS_ORPHAN_SELL_MIN_PNL
-        hold_elapsed_s          >= _BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S
-        bin_adverse_since_leg1  >= _BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS
-        for N consecutive shadow ticks → sell leg-1, lock in profit.
-
-    (B) TAKE-PROFIT (v6.5.5 opportunistic — bid up ratio×):
-        leg1_bid_now / leg1_entry >= _BS_BSS_ORPHAN_TP_RATIO
-        for M consecutive shadow ticks → sell leg-1, lock in gain.
-
-    Both rules NO-OP when their respective ENABLED flags are false.
-
-    v6.5.5.1 CASHOUT FIX: sell pnl uses `leg1_top_bid` directly (the
-    cashout proxy) rather than walking the bid book. Matches the May 1
-    "cashout style" agreement: "cashout always works — no liquidity
-    concerns". Polymarket curved fee formula (rate × p × (1-p)) is
-    applied as before. The book-walk simulator (`_bss_simulate_dry_sell`)
-    remains in the codebase for future LIVE-realism work but no longer
-    gates firing decisions.
+    """LEGACY INACTIVE PATH: v6.5.4/v6.5.5 orphan exit evaluator.
+    Only callable during WAITING_2ND (sequential-leg mode).
+    Unreachable under unified strategy (_bs_bss_runtime_active() always False).
     """
+    market = mdm.market
     if mdm.bss_state != "WAITING_2ND":
         return
     if not (_BS_BSS_ORPHAN_SELL_ENABLED or _BS_BSS_ORPHAN_TP_ENABLED):
@@ -8319,33 +8279,9 @@ def _bs_fire_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
                           yes_ask: float, no_ask: float,
                           yes_bid: float, no_bid: float,
                           tp_ratio: Optional[float] = None) -> None:
-    """v6.5.5/v6.5.6: execute the orphan-sell action.
-
-    v6.5.6: In LIVE mode, this now submits a REAL FAK sell order to the
-    Polymarket CLOB via `_bss_place_live_sell`. Three branches:
-
-      - filled_live  → actual full fill. Use ACTUAL fill price (not the
-                       snapshot caller passed in) for P&L. Update state
-                       to ORPHAN_SOLD, book P&L, log event.
-      - partial_live → some shares matched, less than full. Book P&L for
-                       sold portion proportionally, reduce mdm.bss_leg1_*
-                       to reflect remaining shares, transition state to
-                       ORPHAN_SOLD_PARTIAL. Remaining shares hold to
-                       resolution (no further orphan-sell attempts).
-      - rejected/error/no_client → don't change state, don't update P&L
-                       counter. Log BSS_ORPHAN_SELL_LIVE_FAIL. Position
-                       stays in WAITING_2ND. Band-sustain timestamps
-                       remain valid; rule may fire again next tick.
-
-    v6.5.4/v6.5.5: in DRY mode, no real order. Logs BSS_ORPHAN_SELL_DRY
-    (positive-exit) or BSS_ORPHAN_TP_DRY (take-profit) event, updates
-    dashboard P&L counter, records to trade history for dashboard
-    last-15-trades display, transitions state to terminal.
-
-    Caller passes (sell_avg_p, qty_sold, sell_fee, sell_pnl_now)
-    computed from the cashout convention as the DESIRED sale. In LIVE
-    these are inputs to the order; the actual fill may differ. In DRY
-    these become the recorded values directly.
+    """LEGACY INACTIVE PATH: v6.5.5/v6.5.6 orphan-sell executor.
+    Only callable from _bs_evaluate_orphan_sell during WAITING_2ND.
+    Unreachable under unified strategy (_bs_bss_runtime_active() always False).
     """
     leg1_side = mdm.bss_first_side
     market = mdm.market
@@ -9471,17 +9407,15 @@ def _bs_settle_position(state: BotState, pos: BothSidesPosition,
 
 
 def both_sides_tick(state: BotState) -> None:
-    """Called from main_loop.
+    """Called from main_loop. No-op when STRATEGY_MODE=lag_signal.
+    Otherwise: (a) attempt to enter both-sides on every 5m market in
+    the lead-time window we haven't entered before, and (b) evaluate
+    sell-loser preconditions on every open both-sides position.
 
-    UNIFIED PAIRED BOTH-SIDES RUNTIME (_bs_default_runtime_active()):
-      (a) attempt paired YES+NO entry in the 49–51¢ zone (skipped when
-          state.trading_paused=True), and
-      (b) evaluate tiered sell-loser on every open paired position.
-          If sell-loser does not fire, both legs are held until settlement.
-      No orphan states. No WAITING_2ND. No half-position fallback.
-
-    Legacy bss_entry runtime (_bs_bss_runtime_active()) always returns False;
-    dedicated BSS threads are never spawned.
+    v6.3.0: When _BS_STRATEGY == 'bss_entry', the entry path is REPLACED
+    (b) evaluate tiered sell-loser on every open paired position.
+        If sell-loser does not fire, both legs are held until settlement.
+    No orphan states. No WAITING_2ND. No half-position fallback.
     """
     if not _BS_ACTIVE:
         return
@@ -9540,11 +9474,9 @@ def both_sides_tick(state: BotState) -> None:
                         pos.no_leg.peak_bid = no_bid_now
                         pos.no_leg.peak_bid_ts = now
         try:
-            # Active fallback rule:
-            # if paired sell-loser does not fire, keep both legs until settlement.
-            # No orphan/half-position fallback is active.
             # v6.2.2: BS_STRATEGY selects which sell-loser logic is active.
-            # verification_late is redirected to v621 by the unified strategy boot patch.
+            # In "verification_late" mode, ALL v6.2.1 paths are bypassed and
+            # only the pure BTC-tiered Phase B/C/D logic fires.
             if _BS_STRATEGY == "verification_late":
                 vl_fire, vl_reason, vl_loser_side, vl_loser_bid, vl_winner_ask = \
                     _bs_evaluate_verification_late(state, pos, now)
@@ -10830,15 +10762,7 @@ def _print_banner(state: BotState) -> None:
         f"  v6.2.5 log_retention: " + (
             f"{_LOG_RETENTION_DAYS} days (purges daily; today + yesterday "
             f"protected)" if _LOG_RETENTION_DAYS > 0 else "off"),
-        f"  v6.3.0 bss_entry: " + (
-            f"ACTIVE  T_first={_BS_BSS_T_FIRST:.2f} "
-            f"sustain={_BS_BSS_SUSTAIN_FIRST_S:.0f}s, "
-            f"T_2nd={_BS_BSS_T_SECOND_STRICT:.2f}/{_BS_BSS_T_SECOND_RELAXED:.2f} "
-            f"sustain={_BS_BSS_SUSTAIN_SECOND_S:.0f}s, "
-            f"relax@{_BS_BSS_RELAX_AT_S:.0f}s abort@{_BS_BSS_ABORT_AT_S:.0f}s  "
-            f"★ BOTH-SIDES SEE-SAW ★"
-            if _BS_STRATEGY == "bss_entry" else
-            "inert (only active when BS_STRATEGY=bss_entry)"),
+        f"  v6.3.0 bss_entry: LEGACY INACTIVE PATH — _bs_bss_runtime_active() always False.",
         f"  v6.3.1 btc_vel_filter: " + (
             f"ON  threshold={_BS_BSS_BTC_VEL_FILTER_PCT:.4f}% "
             f"lookback={_BS_BSS_BTC_VEL_LOOKBACK_S:.0f}s "
@@ -10984,52 +10908,13 @@ def _print_banner(state: BotState) -> None:
                 if _BS_BSS_LEG1_PATIENT_DROP > 0
                 else "OFF (BS_BSS_LEG1_PATIENT_DROP=0)"
             )
-            print(f"  *** DRY MODE v6.5.8 — per-leg placement, no abort, "
-                  f"book-walk={walk_status} (taker_fee={fee_status}). "
-                  f"v6.5.2 entry filter: {ttr_status}. "
-                  f"v6.5.3 Tier-1 logging: ring buffer + extra_json + "
-                  f"BSS_CANDIDATE_DRY (pre-entry feats: leg2 microstructure, "
-                  f"depth-delta, leg1 bid trajectory, latency, regime). "
-                  f"v6.5.3.1 hold-shadow: BSS_HOLD_SHADOW_DRY at "
-                  f"{shadow_status} — raw state per tick. "
-                  f"v6.5.3.2 dashboard: Speranța hero header — Toate Pânzele Sus. "
-                  f"v6.5.4 orphan-sell (positive-exit): {orphan_sell_status}. "
-                  f"v6.5.4 dashboard P&L: fees in counter. "
-                  f"v6.5.4 cleanup: GET /api/cleanup?confirm=true. "
-                  f"v6.5.5 take-profit (TP): {tp_status}. "
-                  f"v6.5.5 fee formula: corrected to Polymarket curved. "
-                  f"v6.5.5.1 CASHOUT FIX: orphan-sell uses leg1_bid_now (cashout), "
-                  f"no longer gated on book-walk. "
-                  f"v6.5.5.2 LOCKED-SPREAD REJECT: skip ticks where "
-                  f"yes_ask==yes_bid or no_ask==no_bid (ghost snapshots). "
-                  f"v6.5.5.2 BAND-SUSTAIN: orphan-sell uses time-based "
-                  f"sustain ({_BS_BSS_ORPHAN_SELL_SUSTAIN_S:.0f}s with "
-                  f"{_BS_BSS_ORPHAN_SELL_GRACE_S:.0f}s wobble grace), "
-                  f"TP uses {_BS_BSS_ORPHAN_TP_SUSTAIN_S:.0f}s sustain / "
-                  f"{_BS_BSS_ORPHAN_TP_GRACE_S:.0f}s grace. "
-                  f"v6.5.5.2 phase visibility: floor/strict tagged in CSV. "
-                  f"v6.5.5.3 HOTFIX: resolution gate runs BEFORE locked-"
-                  f"spread reject (fixes v6.5.5.2 silent-drop of natural orphans). "
-                  f"v6.5.5.3 dashboard in-flight indicator: WAITING_2ND positions "
-                  f"show orphan-sell sustain progress + would-sell pnl. "
-                  f"v6.5.6 LIVE SELL: orphan-sell now submits real FAK orders "
-                  f"in LIVE mode via _bss_place_live_sell (no GTC fallback). "
-                  f"Partial fills → ORPHAN_SOLD_PARTIAL (proportional P&L, "
-                  f"remaining qty held to resolution). Rejected/error → "
-                  f"BSS_ORPHAN_SELL_LIVE_FAIL logged, state stays WAITING_2ND, "
-                  f"retry next tick. DRY behavior unchanged. "
-                  f"v6.5.6.1 HOTFIX: fixed PolyBook-as-price crash in dashboard. "
-                  f"v6.5.7 reverse-sniper cashout (Rule C): {rs_status}. "
-                  f"Fires when winner_ask>={_BS_BSS_ORPHAN_RS_WINNER_THRESHOLD:.2f} "
-                  f"AND ttr<={_BS_BSS_ORPHAN_RS_TTR_MAX_S:.0f}s; sells losing orphan "
-                  f"leg at cashout bid (~$0.27 avg recovery vs full -$1.02 loss). "
-                  f"reason=reverse_sniper in CSV. "
-                  f"v6.5.8 leg1-patience: {leg1_pat_status}. "
-                  f"Holds leg1 fire when same-side ask still falling fast — "
-                  f"yields deeper entry (avg 11c better in 43pct of paired trades), "
-                  f"more shares, better wins, smaller orphan RS losses. "
-                  f"FIRST_LEG_PATIENT logged when held. "
-                  f"v6.5.5 dashboard: last-15 trades with ORPHAN_SOLD render. ***",
+            print(f"  *** DRY MODE — unified paired both-sides strategy active. "
+                  f"Entry: paired YES+NO in 49–51¢ zone (sum≤1.02). "
+                  f"Exit: tiered sell-loser ladder (T0≥0.96, T1≥0.90, T2≥0.87, T3≥0.80). "
+                  f"Fallback: keep both legs until settlement. "
+                  f"No orphan states. No sequential-leg runtime. No WAITING_2ND. "
+                  f"Legacy BSS/orphan code is present but gated inactive "
+                  f"(_bs_bss_runtime_active() always False). ***",
                   flush=True)
         # Note v6.4.0 deleted env vars if user still has them set
         deleted_set = [v for v in (
