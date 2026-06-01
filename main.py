@@ -215,6 +215,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -436,18 +437,14 @@ def _read_v610_env() -> Tuple[
     strategy_mode = _s("STRATEGY_MODE", "both_sides_btc",
                        ("lag_signal", "both_sides_btc"))
 
-    # Lead-time window: enter both legs when 5m market TTR is in
-    # [BS_LEAD_TIME_MIN_S, BS_LEAD_TIME_MAX_S]. Default 600-900 = 10-15 min
-    # before resolution. Same window used as "entry-window" TTR for 15m/60m
-    # logging (so the data we collect is what we'd have seen at entry time
-    # if we were also trading those durations).
-    bs_lead_min = _f("BS_LEAD_TIME_MIN_S", 600.0, 60.0, 3600.0)
-    bs_lead_max = _f("BS_LEAD_TIME_MAX_S", 900.0, 60.0, 3600.0)
+    # Lead-time window: default 1200-1800 = 20-30 min before resolution.
+    bs_lead_min = _f("BS_LEAD_TIME_MIN_S", 1200.0, 60.0, 3600.0)
+    bs_lead_max = _f("BS_LEAD_TIME_MAX_S", 1800.0, 60.0, 3600.0)
     if bs_lead_min >= bs_lead_max:
         print(f"[boot][v6.1.0] warning: BS_LEAD_TIME_MIN_S ({bs_lead_min}) "
-              f">= BS_LEAD_TIME_MAX_S ({bs_lead_max}); resetting to 600/900",
+              f">= BS_LEAD_TIME_MAX_S ({bs_lead_max}); resetting to 1200/1800",
               flush=True)
-        bs_lead_min, bs_lead_max = 600.0, 900.0
+        bs_lead_min, bs_lead_max = 1200.0, 1800.0
 
     bs_sum_ask_max = _f("BS_SUM_ASK_MAX", 1.03, 1.00, 1.20)
     bs_sell_thresh = _f("BS_SELL_LOSER_THRESHOLD", 0.93, 0.50, 0.99)
@@ -478,7 +475,16 @@ def _read_v610_env() -> Tuple[
 
     # v6.2.2: BS_STRATEGY selects which sell-loser logic is active.
     # Values:
-    #   "bss_entry" (default, v6.3.0) — Both-Sides See-Saw entry. REPLACES the standard
+    #   "v621" (default) — full v6.2.1 stack: PROD path + BTC late-fallback +
+    #                       late-conviction override + BTC guard. Production bot.
+    #   "verification_late" — pure BTC-tiered logic, no book check, no BTC
+    #                          guard. Fires only:
+    #                            - TTR ≤ 60s + |BTC Δ| ≥ $90  (Phase B)
+    #                            - TTR ≤ 30s + |BTC Δ| ≥ $85  (Phase C)
+    #                            - TTR ≤ 10s + |BTC Δ| ≥ $80  (Phase D)
+    #                          Designed for side-by-side A/B testing on a second
+    #                          Railway service (DRY only, same markets, same entry).
+    #   "bss_entry" (v6.3.0) — Both-Sides See-Saw entry. REPLACES the standard
     #                          sum_ask<1.10 entry path AND replaces verification_late.
     #                          Bot watches every 5m market and waits for ONE side
     #                          to dip below BS_BSS_T_FIRST sustained for
@@ -492,20 +498,11 @@ def _read_v610_env() -> Tuple[
     #                          Mirror-of-verification_late structure: sustain →
     #                          fire pattern, just inverted (buy low instead of
     #                          confirm high). DRY-only.
-    #   "v621"       — full v6.2.1 stack: PROD path + BTC late-fallback +
-    #                  late-conviction override + BTC guard. Legacy mode.
-    #   "verification_late" — pure BTC-tiered logic, no book check, no BTC
-    #                          guard. Fires only:
-    #                            - TTR ≤ 60s + |BTC Δ| ≥ $90  (Phase B)
-    #                            - TTR ≤ 30s + |BTC Δ| ≥ $85  (Phase C)
-    #                            - TTR ≤ 10s + |BTC Δ| ≥ $80  (Phase D)
-    #                          Designed for side-by-side A/B testing on a second
-    #                          Railway service (DRY only, same markets, same entry).
-    bs_strategy_raw = os.environ.get("BS_STRATEGY", "bss_entry").strip().lower()
+    bs_strategy_raw = os.environ.get("BS_STRATEGY", "v621").strip().lower()
     if bs_strategy_raw not in ("v621", "verification_late", "bss_entry"):
         print(f"[boot][v6.2.2] warning: BS_STRATEGY={bs_strategy_raw!r} "
-              f"not recognized; using default 'bss_entry'", flush=True)
-        bs_strategy_raw = "bss_entry"
+              f"not recognized; using default 'v621'", flush=True)
+        bs_strategy_raw = "v621"
     bs_strategy = bs_strategy_raw
 
     # v6.2.4: verification_late freeze logic (whipsaw detection).
@@ -519,9 +516,9 @@ def _read_v610_env() -> Tuple[
 
     # v6.3.0: BSS (Both-Sides See-Saw) parameters. Inert unless
     # BS_STRATEGY == 'bss_entry'.
-    bs_bss_t_first         = _f("BS_BSS_T_FIRST",          0.50, 0.10, 0.55)
+    bs_bss_t_first         = _f("BS_BSS_T_FIRST",          0.45, 0.10, 0.50)
     bs_bss_sustain_first_s = _f("BS_BSS_SUSTAIN_FIRST_S",  4.0,  0.0,  30.0)
-    bs_bss_t_second_strict = _f("BS_BSS_T_SECOND_STRICT",  0.52, 0.30, 0.99)
+    bs_bss_t_second_strict = _f("BS_BSS_T_SECOND_STRICT",  0.50, 0.30, 0.99)
     bs_bss_t_second_relax  = _f("BS_BSS_T_SECOND_RELAXED", 0.62, 0.30, 0.99)
     bs_bss_sustain_2nd_s   = _f("BS_BSS_SUSTAIN_SECOND_S", 3.0,  0.0,  30.0)
     bs_bss_relax_at_s      = _f("BS_BSS_RELAX_AT_S",       240.0, 1.0, 280.0)
@@ -537,7 +534,7 @@ def _read_v610_env() -> Tuple[
     bs_bss_btc_vel_lookback_s = _f("BS_BSS_BTC_VEL_LOOKBACK_S", 30.0, 5.0, 120.0)
 
     # v6.3.7: PATIENT SECOND LEG. When the opposite side hits the strict
-    # threshold (0.52), don't fire immediately if the price is still
+    # threshold (0.50), don't fire immediately if the price is still
     # actively falling — wait one more tick for a better fill. The bot
     # checks the opposite-side ask velocity over the last
     # OPP_VEL_LOOKBACK_S seconds. If price has dropped by at least
@@ -546,7 +543,7 @@ def _read_v610_env() -> Tuple[
     #
     # Floor backstop: if opposite side ever hits T_SECOND_FLOOR or below
     # (default 0.40), fire IMMEDIATELY regardless of velocity. The dip is
-    # so deep that risking a bounce above 0.52 is worse than firing now.
+    # so deep that risking a bounce above 0.50 is worse than firing now.
     #
     # Set OPP_VEL_PATIENT_DROP=0 to disable patience (= v6.3.6 behavior).
     bs_bss_t_second_floor = _f("BS_BSS_T_SECOND_FLOOR", 0.40, 0.10, 0.50)
@@ -564,24 +561,24 @@ def _read_v610_env() -> Tuple[
 
     # v6.3.2: PRE-MARKET BSS phase. Polymarket creates 5m markets ~30 min
     # before the window opens. Books form, prices wobble, sometimes one
-    # side drops below $0.52 in this period. We can buy then. To use this
+    # side drops below $0.49 in this period. We can buy then. To use this
     # phase you also need to extend BS_LEAD_TIME_MAX_S to 1800 (or
     # whatever pre-market window you want covered).
     #
-    # Pre-market thresholds are LOOSER than live (0.52 vs 0.48 first leg)
+    # Pre-market thresholds are LOOSER than live (0.49 vs 0.45 first leg)
     # because pre-market dips tend to be shallower — books are thinner,
     # market makers haven't tightened yet.
     #
     # No abort timer during pre-market (time is abundant). When the live
     # window opens (T=0) and we're still WAITING_2ND, the bot switches to
-    # standard live thresholds (0.52/0.62) and starts the abort timer
+    # standard live thresholds (0.50/0.62) and starts the abort timer
     # from T=0 (not from pre-market first-leg fill).
     #
     # If neither side ever dipped below T_FIRST_PRE during the entire
     # pre-market period, the bot enters the live window in WATCH state
     # and runs standard BSS logic.
-    bs_bss_t_first_pre   = _f("BS_BSS_T_FIRST_PRE",   0.50, 0.10, 0.99)
-    bs_bss_t_second_pre  = _f("BS_BSS_T_SECOND_PRE",  0.52, 0.10, 0.99)
+    bs_bss_t_first_pre   = _f("BS_BSS_T_FIRST_PRE",   0.49, 0.10, 0.99)
+    bs_bss_t_second_pre  = _f("BS_BSS_T_SECOND_PRE",  0.49, 0.10, 0.99)
     bs_bss_sustain_first_pre_s  = _f("BS_BSS_SUSTAIN_FIRST_PRE_S", 4.0, 0.0, 60.0)
     bs_bss_sustain_second_pre_s = _f("BS_BSS_SUSTAIN_SECOND_PRE_S", 3.0, 0.0, 60.0)
 
@@ -654,6 +651,45 @@ def _read_v610_env() -> Tuple[
  ) = _read_v610_env()
 
 _BS_ACTIVE = (_STRATEGY_MODE == "both_sides_btc")
+
+
+def _bs_default_runtime_active() -> bool:
+    """Default paired both-sides runtime (BS_STRATEGY != bss_entry).
+    Paired YES+NO entry + sell-loser. BSS threads unreachable.
+    """
+    return _BS_ACTIVE and _BS_STRATEGY != "bss_entry"
+
+
+def _bs_bss_runtime_active() -> bool:
+    """Legacy bss_entry runtime. Only True when BS_STRATEGY == 'bss_entry'.
+    Enables BSS threads, WAITING_2ND, ORPHAN_END, orphan machinery.
+    """
+    return _BS_ACTIVE and _BS_STRATEGY == "bss_entry"
+
+
+if _bs_default_runtime_active():
+    print("[boot] default both-sides runtime = paired entry + sell-loser; BSS threads disabled", flush=True)
+elif _bs_bss_runtime_active():
+    print("[boot] legacy bss_entry runtime active; dedicated BSS threads enabled", flush=True)
+
+
+def _set_trading_paused(state: "BotState", paused: bool) -> None:
+    state.trading_paused = bool(paused)
+
+
+def _trading_pause_reason(state: "BotState") -> str:
+    return "paused_by_operator" if getattr(state, "trading_paused", False) else ""
+
+
+def _entry_blocked_by_pause(state: "BotState", tag: str = "entry") -> bool:
+    if not getattr(state, "trading_paused", False):
+        return False
+    now = time.time()
+    last = getattr(state, "_pause_log_last_ts", 0.0)
+    if now - last >= 15.0:
+        print(f"[pause] trading paused — skipping new entry ({tag})", flush=True)
+        state._pause_log_last_ts = now
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1423,6 +1459,56 @@ def list_log_files(base_dir: Path) -> List[Dict[str, Any]]:
     return out
 
 
+def _safe_log_file_path(state: "BotState", name: str) -> Optional[Path]:
+    try:
+        raw = (name or "").strip()
+        if not raw or "/" in raw or "\\" in raw:
+            return None
+        if not raw.lower().endswith(".csv"):
+            return None
+        if not state.log_dir:
+            return None
+        allowed = {item.get("filename", "") for item in list_log_files(Path(state.log_dir))}
+        if raw not in allowed:
+            return None
+        p = (Path(state.log_dir) / raw).resolve()
+        base = Path(state.log_dir).resolve()
+        try:
+            p.relative_to(base)
+        except Exception:
+            return None
+        if not p.exists() or not p.is_file():
+            return None
+        return p
+    except Exception:
+        return None
+
+
+def _manual_purge_old_logs(state: "BotState") -> Dict[str, Any]:
+    if _LOG_RETENTION_DAYS <= 0 or not state.log_dir:
+        return {"ok": True, "files_deleted": 0, "bytes_freed": 0}
+    log_dir = Path(state.log_dir)
+    before: Dict[str, int] = {}
+    try:
+        for p in log_dir.glob("*.csv"):
+            try:
+                before[str(p)] = p.stat().st_size
+            except Exception:
+                pass
+    except Exception:
+        before = {}
+    _purge_old_logs(log_dir, _LOG_RETENTION_DAYS)
+    after_keys: set = set()
+    try:
+        for p in log_dir.glob("*.csv"):
+            after_keys.add(str(p))
+    except Exception:
+        pass
+    files_deleted = sum(1 for k in before if k not in after_keys)
+    bytes_freed = sum(sz for k, sz in before.items() if k not in after_keys)
+    return {"ok": True, "files_deleted": files_deleted, "bytes_freed": int(bytes_freed)}
+
+
 # ═══════════════════════════════════════════════════════════════════
 # v6.1.3: CLOB HTTP HEALTH MONITOR
 # ═══════════════════════════════════════════════════════════════════
@@ -1898,6 +1984,7 @@ class BotState:
     skips_by_reason: Dict[str, int] = field(default_factory=dict)
 
     kill_flag: bool = False
+    trading_paused: bool = False  # pauses new entries only; exits/management unaffected
 
     binance_logger: Optional[Any] = None
     signal_logger: Optional[Any] = None
@@ -3057,7 +3144,7 @@ main{padding:20px;max-width:1100px;margin:0 auto;}
 .bs-leg-pnl.down{color:var(--red);font-weight:600;}
 .bs-leg-closed-tag{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.04em;}
 </style></head><body>
-<header class="skuld-hero"><h1 id="header-title">polybot simple v1</h1><span id="version-badge" class="badge badge-version">v—</span><span id="mode-badge" class="badge badge-dry">DRY</span><span id="strategy-badge" class="badge badge-bs" style="display:none">BOTH-SIDES</span><span id="variant-badge" class="badge badge-bs" style="display:none">v621</span><span class="uptime" id="uptime">uptime —</span><span class="skuld-tagline">Toate Pânzele Sus</span></header>
+<header class="skuld-hero"><h1 id="header-title">polybot simple v1</h1><span id="version-badge" class="badge badge-version">v—</span><span id="mode-badge" class="badge badge-dry">DRY</span><span id="strategy-badge" class="badge badge-bs" style="display:none">BOTH-SIDES</span><span id="variant-badge" class="badge badge-bs" style="display:none">v621</span><span id="tradingPausedBadge" style="background:#14532d;color:#fff;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:700;margin-left:6px;">TRADING ACTIVE</span><button id="pauseTradingBtn" style="margin-left:6px;padding:3px 10px;border-radius:5px;border:1px solid var(--muted);background:rgba(255,255,255,.07);color:var(--text);cursor:pointer;font-size:11px;font-weight:600;">Pause trading</button><button id="resumeTradingBtn" style="display:none;margin-left:6px;padding:3px 10px;border-radius:5px;border:1px solid #f8c849;background:rgba(248,200,73,.12);color:#f8c849;cursor:pointer;font-size:11px;font-weight:600;">Resume trading</button><button id="purgeOldLogsBtn" style="margin-left:6px;padding:3px 10px;border-radius:5px;border:1px solid var(--muted);background:rgba(255,255,255,.07);color:var(--muted);cursor:pointer;font-size:11px;">Purge old logs</button><span class="uptime" id="uptime">uptime —</span><span class="skuld-tagline">Toate Pânzele Sus</span></header>
 <main>
 <div id="clob-warning" class="clob-warning" style="display:none">⚠ Polymarket rate-limiting detected — <span id="clob-warning-detail"></span></div>
 <div class="grid">
@@ -3118,7 +3205,8 @@ return `<div class="log-row">`
 +`<span class="log-date">${f.date}</span>`
 +`<span class="log-size">${fmtBytes(f.size_bytes)}</span>`
 +`<span class="log-rows">${rows!=null?rows.toLocaleString()+' rows':'—'}</span>`
-+`<a class="log-dl" href="/api/download/${f.filename}" download>download</a>`
++`<a class="log-dl" href="/api/logs/download?name=${encodeURIComponent(f.filename)}" target="_blank" rel="noopener noreferrer">download</a>`
++`<button onclick="deleteLogFile(${JSON.stringify(f.filename)})" style="margin-left:6px;padding:2px 8px;border-radius:4px;border:1px solid #c0392b;background:rgba(192,57,43,.12);color:#e74c3c;cursor:pointer;font-size:10px;">delete</button>`
 +`</div>`;
 }).join('');
 list.innerHTML=rowsHtml;
@@ -3156,6 +3244,22 @@ setTimeout(()=>{st.textContent='';},8000);
 tickDatasets();
 }
 async function tick(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw 0;const s=await r.json();render(s);}catch(e){$('uptime').textContent='connection lost';}}
+async function refreshStatus(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)return;render(await r.json());}catch(e){}}
+async function refreshLogs(){try{await tickDatasets();}catch(e){}}
+async function postJson(url){const r=await fetch(url,{method:'POST'});return await r.json();}
+async function deleteLogFile(name){
+  if(!window.confirm('Delete '+name+'?'))return;
+  await fetch('/api/logs/delete?name='+encodeURIComponent(name),{method:'POST'});
+  await refreshLogs();
+}
+(function(){
+  const pb=document.getElementById('pauseTradingBtn');
+  if(pb)pb.onclick=async()=>{await postJson('/api/pause_trading');await refreshStatus();};
+  const rb=document.getElementById('resumeTradingBtn');
+  if(rb)rb.onclick=async()=>{await postJson('/api/resume_trading');await refreshStatus();};
+  const pg=document.getElementById('purgeOldLogsBtn');
+  if(pg)pg.onclick=async()=>{const r=await postJson('/api/logs/purge_old');alert('Purged: '+(r.files_deleted||0)+' files, '+(r.bytes_freed||0)+' bytes');await refreshLogs();};
+})();
 function render(s){
 $('uptime').textContent='uptime '+fmtUptime(s.uptime_s);
 const badge=$('mode-badge');badge.textContent=(s.mode||'dry').toUpperCase();badge.className='badge '+(s.mode==='live'?'badge-live':'badge-dry');
@@ -3166,6 +3270,15 @@ $('poly-detail').textContent=s.polymarket_ws&&s.polymarket_ws.last_msg_age_s!=nu
 renderRecentTrades(s);
 renderBothSides(s);
 renderClobHealth(s);
+(function(){
+  const paused=!!s.trading_paused;
+  const badge=document.getElementById('tradingPausedBadge');
+  const pb=document.getElementById('pauseTradingBtn');
+  const rb=document.getElementById('resumeTradingBtn');
+  if(badge){badge.textContent=paused?'TRADING PAUSED':'TRADING ACTIVE';badge.style.background=paused?'#7f1d1d':'#14532d';}
+  if(pb)pb.style.display=paused?'none':'';
+  if(rb)rb.style.display=paused?'':'none';
+})();
 }
 function renderClobHealth(s){
   // v6.1.3: CLOB rate-limit banner — visible only when alert_425 is true.
@@ -3432,7 +3545,7 @@ if(bssActive){
       <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted);">
         ${p.bss_state==='WAITING_2ND'?`<span>${p.in_pre_market?`pre-market · live opens in <b style="color:var(--yellow);">${fmtCountdown(p.pre_market_remaining_s||0)}</b> · `:`elapsed <b style="color:var(--text);">${(p.elapsed_s||0).toFixed(0)}s</b> · `}phase <b>${escapeHtml(p.phase||'')}</b> · sustain ${(p.second_sustain_s||0).toFixed(1)}/${(p.sustain_second_s||3).toFixed(0)}s</span><span>${p.in_pre_market?`<span style="color:var(--muted);">no abort during pre-market</span>`:`abort in <b style="color:${(p.abort_in_s||0)<30?'var(--red)':'var(--yellow)'};">${(p.abort_in_s||0).toFixed(0)}s</b>`}</span>`:''}
         ${p.bss_state==='BOTH'?`<span>cost <b style="color:var(--text);">$${((p.first_price||0)+(p.second_price||0)).toFixed(4)}</b></span><span>if win: <b style="color:var(--green);">+$${(1.0/Math.max(p.first_price||1,p.second_price||1) - 2.0).toFixed(4)}</b></span>`:''}
-        ${p.bss_state==='WATCH'?`<span>need either side &lt;${(p.t_first||0.48).toFixed(2)} for ${(p.sustain_first_s||4).toFixed(0)}s · YES sus ${(p.yes_sustain_s||0).toFixed(1)}s · NO sus ${(p.no_sustain_s||0).toFixed(1)}s</span>`:''}
+        ${p.bss_state==='WATCH'?`<span>need either side &lt;${(p.t_first||0.45).toFixed(2)} for ${(p.sustain_first_s||4).toFixed(0)}s · YES sus ${(p.yes_sustain_s||0).toFixed(1)}s · NO sus ${(p.no_sustain_s||0).toFixed(1)}s</span>`:''}
       </div>
       ${p.bss_state==='WAITING_2ND' && (p.orphan_sell_enabled || p.orphan_tp_enabled)?(()=>{
         // v6.5.5.3: in-flight orphan-sell indicator
@@ -3485,7 +3598,7 @@ if(bssActive){
     const stateColor=isWaiting?'var(--yellow)':'var(--muted)';
     const detail=isWaiting
       ? `1st ${escapeHtml(p.first_side||'')}@${(p.first_price||0).toFixed(3)} · 2nd ${escapeHtml(p.first_side==='YES'?'NO':'YES')} ${(p.other_ask||0).toFixed(3)}/<${(p.current_threshold||0).toFixed(2)} · ${p.in_pre_market?'pre':'abort '+(p.abort_in_s||0).toFixed(0)+'s'}`
-      : `YES ${(p.yes_ask||0).toFixed(3)} · NO ${(p.no_ask||0).toFixed(3)} · need <${(p.t_first||0.48).toFixed(2)}`;
+      : `YES ${(p.yes_ask||0).toFixed(3)} · NO ${(p.no_ask||0).toFixed(3)} · need <${(p.t_first||0.45).toFixed(2)}`;
     return `<div style="padding:6px 10px;background:rgba(255,255,255,0.02);border-radius:4px;margin-top:4px;font-size:11px;display:flex;gap:10px;align-items:center;">
       <span style="font-family:monospace;color:var(--muted);">${escapeHtml((p.market_id||'').slice(0,10))}…</span>
       <span style="color:${stateColor};font-weight:600;min-width:80px;">${escapeHtml(p.bss_state)}</span>
@@ -3922,8 +4035,11 @@ def _build_status_payload(state: BotState) -> dict:
         # v6.1.0: strategy mode + both-sides config + state
         "strategy_mode": _STRATEGY_MODE,
         "bs_active": _BS_ACTIVE,
-        # v6.2.2: strategy variant (selects sell-loser logic)
+        # v6.2.2: strategy variant
         "bs_strategy": _BS_STRATEGY,
+        "trading_paused": bool(getattr(state, "trading_paused", False)),
+        "bot_name": _BOT_NAME,
+        "log_retention_days": _LOG_RETENTION_DAYS,
         # v6.1.3: CLOB HTTP health snapshot for the dashboard banner
         "clob_health": _compute_clob_health(60.0),
         "bs_config": {
@@ -4211,10 +4327,81 @@ def http_server_thread(state: BotState) -> None:
                 self.wfile.write(b"ok\n")
                 return
 
+            # GET /api/logs/download?name=filename.csv
+            if path == "/api/logs/download":
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                name = (qs.get("name") or [""])[0]
+                lp = _safe_log_file_path(state, name) if state.log_dir else None
+                if lp is None:
+                    body = json.dumps({"ok": False, "error": "file_not_found"}).encode("utf-8")
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                data = lp.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Disposition", f'attachment; filename="{lp.name}"')
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
             self.send_response(404)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"not found\n")
+
+        def _send_json(self, payload: dict, status: int = 200) -> None:
+            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            parsed_url = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(parsed_url.query)
+            p = parsed_url.path
+
+            if p == "/api/pause_trading":
+                _set_trading_paused(state, True)
+                self._send_json({"ok": True, "trading_paused": True})
+                print("[dashboard] trading PAUSED — new entries blocked", flush=True)
+                return
+
+            if p == "/api/resume_trading":
+                _set_trading_paused(state, False)
+                self._send_json({"ok": True, "trading_paused": False})
+                print("[dashboard] trading RESUMED — new entries allowed", flush=True)
+                return
+
+            if p == "/api/logs/delete":
+                name = (qs.get("name") or [""])[0]
+                lp = _safe_log_file_path(state, name) if state.log_dir else None
+                if lp is None:
+                    self._send_json({"ok": False, "error": "file_not_found"}, status=404)
+                    return
+                try:
+                    lp.unlink()
+                    self._send_json({"ok": True, "deleted": lp.name})
+                except Exception as e:
+                    self._send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, status=500)
+                return
+
+            if p == "/api/logs/purge_old":
+                if not state.log_dir:
+                    self._send_json({"ok": False, "error": "log_dir not configured"}, status=400)
+                    return
+                self._send_json(_manual_purge_old_logs(state))
+                return
+
+            self.send_response(404)
+            self.end_headers()
 
         def log_message(self, fmt, *args):
             return
@@ -4359,6 +4546,8 @@ def signal_tick(state: BotState) -> None:
             state.last_decision_reason = decision.reason
 
             if decision.should_trade:
+                if _entry_blocked_by_pause(state, "lag_signal"):
+                    return
                 pos = place_entry(state, signal, decision)
                 if pos is not None:
                     state.open_position = pos
@@ -5162,6 +5351,8 @@ def _bs_should_enter(state: BotState, mdm: MultiDurationMarket,
     Returns: (should_enter, reason, yes_ask, no_ask, sum_ask)
     """
     market = mdm.market
+    if _entry_blocked_by_pause(state, "both_sides"):
+        return (False, _trading_pause_reason(state), 0.0, 0.0, 0.0)
     # 1) Re-entry block
     if market.condition_id in state.bs_entered_market_ids:
         return False, "already_entered", 0.0, 0.0, 0.0
@@ -6171,7 +6362,7 @@ def _bs_evaluate_late_conviction(
 # Mirror of _bs_evaluate_verification_late. Same skeleton, opposite
 # direction:
 #   verification_late:  arm on winner_ask ≥ 0.70, sustain, fire SELL_LOSER
-#   bss_entry:          arm on cheap_ask ≤ 0.48, sustain, fire BUY_FIRST_LEG
+#   bss_entry:          arm on cheap_ask ≤ 0.45, sustain, fire BUY_FIRST_LEG
 #
 # State lives on MultiDurationMarket.bss_* (mirroring how VL state lives
 # on BothSidesPosition.vl_*). Both halves of the strategy use the same
@@ -6481,6 +6672,8 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
             _bs_log_bss_first_leg_event(state, mdm, now,
                                          yes_ask, no_ask, yes_bid, no_bid,
                                          sus_s=sus_s_at_fire)
+            if _entry_blocked_by_pause(state, "bss_leg1"):
+                return
             _bss_place_leg1(state, mdm, now,
                              fire_side=fire_side,
                              decision_ask=fire_price,
@@ -6524,7 +6717,7 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
                     return
 
         # ── Live-window second-leg detection (v6.3.7: patient + floor) ──
-        # Maintain sustain timers for both strict (0.52) and relaxed (0.62) tiers.
+        # Maintain sustain timers for both strict (0.50) and relaxed (0.62) tiers.
         if other_ask < _BS_BSS_T_SECOND_STRICT:
             if mdm.bss_other_below_strict_start_ts is None:
                 mdm.bss_other_below_strict_start_ts = now
@@ -9284,26 +9477,20 @@ def _bs_settle_position(state: BotState, pos: BothSidesPosition,
 
 
 def both_sides_tick(state: BotState) -> None:
-    """Called from main_loop. No-op when STRATEGY_MODE=lag_signal.
-    Otherwise: (a) attempt to enter both-sides on every 5m market in
-    the lead-time window we haven't entered before, and (b) evaluate
-    sell-loser preconditions on every open both-sides position.
+    """Called from main_loop.
 
-    v6.3.0: When _BS_STRATEGY == 'bss_entry', the entry path is REPLACED
-    by the BSS state-machine evaluator (which lazily creates positions
-    only when both legs sustain), and the sell-loser pass is suppressed
-    (BSS holds both legs to resolution; existing resolution flow handles
-    the payout).
+    DEFAULT (_bs_default_runtime_active()): paired YES+NO entry + sell-loser.
+      Entry skipped when state.trading_paused=True. WAITING_2ND/ORPHAN_END
+      unreachable under default env.
+
+    LEGACY (_bs_bss_runtime_active()): handled by bss_fast_tick_thread +
+      bss_gamma_poll_thread. Returns immediately.
     """
     if not _BS_ACTIVE:
         return
+    if not _bs_default_runtime_active():
+        return
     now = time.time()
-
-    # v6.3.2: BSS_ENTRY MODE — evaluation now runs in dedicated fast
-    # thread (bss_fast_tick_thread, 20Hz). main_loop's 1Hz pass for
-    # BSS would just duplicate work. Suppress entry + VL passes here.
-    if _BS_STRATEGY == "bss_entry":
-        return  # BSS handled by fast thread; nothing else to do
 
     # ── ENTRY PASS ──
     # Iterate over a snapshot so the discovery thread can mutate the dict
@@ -10323,7 +10510,6 @@ def boot() -> BotState:
         log_dir = Path(cfg.data_dir) / "logs" / _BOT_NAME
         print(f"[boot][v6.2.5] BOT_NAME={_BOT_NAME!r} → log_dir={log_dir}",
               flush=True)
-        _ensure_validation_csvs(state)
     else:
         log_dir = Path(cfg.data_dir) / "logs"
     state.log_dir = str(log_dir)
@@ -10464,6 +10650,10 @@ def boot() -> BotState:
               flush=True)
         print(f"[boot]   pre_market_books: DISABLED in v6.4.0 (no pre-market)",
               flush=True)
+
+    # Called here: state.log_dir set, all loggers initialized, both BOT_NAME
+    # and legacy branches covered.
+    _ensure_validation_csvs(state)
 
     # v6.4.0 SKULD: config_snapshot_<boot_ts>.json
     # Dump every effective config value the bot is running with, once at boot.
@@ -10885,17 +11075,11 @@ def start_feed_threads(state: BotState) -> None:
     # when active to keep the thread list visibly minimal in lag_signal mode.
     if _BS_ACTIVE:
         threads.append(("bs_disc", both_sides_discovery_thread))
-    # v6.3.2: BSS fast-tick thread (20Hz default). Only spawned when
-    # bss_entry strategy is active.
-    if _BS_ACTIVE and _BS_STRATEGY == "bss_entry":
+    # BSS fast-tick thread (20Hz). Only when _bs_bss_runtime_active().
+    if _bs_bss_runtime_active():
         threads.append(("bss_fast", bss_fast_tick_thread))
-    # v6.3.11: Gamma REST polling thread. Replaces v6.3.10's ws_refresh hack.
-    # Polls Polymarket Gamma /markets endpoint every 2.5s for each BSS-watched
-    # market and updates state.poly_books with fresh prices. This is the
-    # proven pattern from scalper3 (April 2026) which went live successfully —
-    # Polymarket WS drops on Railway and silently degrades for non-active
-    # markets, so REST is the reliable path.
-    if _BS_ACTIVE and _BS_STRATEGY == "bss_entry":
+    # BSS Gamma REST polling thread. Same gate.
+    if _bs_bss_runtime_active():
         threads.append(("bss_gamma_poll", bss_gamma_poll_thread))
     # v6.2.5: log-retention purger thread (no-op when LOG_RETENTION_DAYS=0).
     # Always added — the thread itself early-exits if retention is disabled.
