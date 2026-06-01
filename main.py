@@ -1,6 +1,8 @@
 """
-main.py — polybot_skuld_v1 (v6.5.6 "Skuld" — LIVE orphan-sell: real CLOB FAK orders for orphan-sell + take-profit rules).
-v6.5.1 — applied 2026-05-09.
+main.py — polybot_skuld_v1 (unified paired both-sides strategy).
+Active strategy: paired entry + tiered paired sell-loser exit + keep-both fallback.
+Legacy BSS/orphan code remains in file but is gated inactive.
+v6.5.6 base — unified strategy refactor applied.
 
 ═══════════════════════════════════════════════════════════════════════
 v6.5.1 "SKULD" — price_change ladder tracking + simulator no-liquidity
@@ -54,8 +56,8 @@ EXPECTED IMPACT:
     → eliminated on price_change-driven updates
 
 EVERYTHING ELSE FROM v6.5.0 CARRIED FORWARD UNCHANGED:
-  - Per-leg placement architecture (no abort, ORPHAN_END at end_ts)
-  - State machine: WATCH → WAITING_2ND → BOTH (or → ORPHAN_END)
+  # LEGACY INACTIVE PATH: Per-leg placement architecture (no abort, ORPHAN_END at end_ts)
+  # LEGACY INACTIVE PATH: State machine: WATCH → WAITING_2ND → BOTH (or → ORPHAN_END)
   - Position sizing $1/leg, 2% taker fee model
   - LIVE_BSS_ENABLED gate, BS_BOOK_WALK_ENABLED, all thresholds
   - Resolution cascade (chainlink → binance → cache → gamma)
@@ -446,7 +448,7 @@ def _read_v610_env() -> Tuple[
               flush=True)
         bs_lead_min, bs_lead_max = 1200.0, 1800.0
 
-    bs_sum_ask_max = _f("BS_SUM_ASK_MAX", 1.03, 1.00, 1.20)
+    bs_sum_ask_max = _f("BS_SUM_ASK_MAX", 1.02, 1.00, 1.20)
     bs_sell_thresh = _f("BS_SELL_LOSER_THRESHOLD", 0.93, 0.50, 0.99)
     bs_sell_ttr_floor = _f("BS_SELL_LOSER_TTR_FLOOR_S", 120.0, 0.0, 300.0)
     bs_sell_persist = _f("BS_SELL_LOSER_PERSIST_S", 5.0, 0.0, 60.0)
@@ -499,11 +501,15 @@ def _read_v610_env() -> Tuple[
     #                          fire pattern, just inverted (buy low instead of
     #                          confirm high). DRY-only.
     bs_strategy_raw = os.environ.get("BS_STRATEGY", "v621").strip().lower()
-    if bs_strategy_raw not in ("v621", "verification_late", "bss_entry"):
+    if bs_strategy_raw not in ("v621", "verification_late"):
         print(f"[boot][v6.2.2] warning: BS_STRATEGY={bs_strategy_raw!r} "
               f"not recognized; using default 'v621'", flush=True)
         bs_strategy_raw = "v621"
     bs_strategy = bs_strategy_raw
+
+    if bs_strategy == "verification_late":
+        print("[boot] verification_late selected but unified paired strategy required; using v621", flush=True)
+        bs_strategy = "v621"
 
     # v6.2.4: verification_late freeze logic (whipsaw detection).
     # vl_arm_thresh: at TTR ≤ 60s, if winner_ask ≥ this, ARM the verification.
@@ -652,25 +658,29 @@ def _read_v610_env() -> Tuple[
 
 _BS_ACTIVE = (_STRATEGY_MODE == "both_sides_btc")
 
+# Active strategy invariant:
+# - paired entry only
+# - no orphan states in the active runtime
+# - one unitary exit strategy: paired sell-loser via the tiered ladder
+# - if paired sell-loser does not fire, keep both legs until settlement
+# Legacy bss/orphan code may remain in the file only as inactive compatibility code.
+
 
 def _bs_default_runtime_active() -> bool:
-    """Default paired both-sides runtime (BS_STRATEGY != bss_entry).
-    Paired YES+NO entry + sell-loser. BSS threads unreachable.
+    """Unified active runtime: paired both-sides entry plus paired sell-loser exit.
+    No orphan states are allowed in the active strategy.
+    If sell-loser does not fire, both legs are held until settlement.
     """
     return _BS_ACTIVE and _BS_STRATEGY != "bss_entry"
 
 
 def _bs_bss_runtime_active() -> bool:
-    """Legacy bss_entry runtime. Only True when BS_STRATEGY == 'bss_entry'.
-    Enables BSS threads, WAITING_2ND, ORPHAN_END, orphan machinery.
-    """
-    return _BS_ACTIVE and _BS_STRATEGY == "bss_entry"
+    """Legacy bss_entry runtime disabled under the unified paired strategy."""
+    return False
 
 
 if _bs_default_runtime_active():
-    print("[boot] default both-sides runtime = paired entry + sell-loser; BSS threads disabled", flush=True)
-elif _bs_bss_runtime_active():
-    print("[boot] legacy bss_entry runtime active; dedicated BSS threads enabled", flush=True)
+    print("[boot] unified paired both-sides runtime active; tiered sell-loser exit; keep-both fallback", flush=True)
 
 
 def _set_trading_paused(state: "BotState", paused: bool) -> None:
@@ -3247,18 +3257,11 @@ async function tick(){try{const r=await fetch('/api/status',{cache:'no-store'});
 async function refreshStatus(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)return;render(await r.json());}catch(e){}}
 async function refreshLogs(){try{await tickDatasets();}catch(e){}}
 async function postJson(url){const r=await fetch(url,{method:'POST'});return await r.json();}
-async function deleteLogFile(name){
-  if(!window.confirm('Delete '+name+'?'))return;
-  await fetch('/api/logs/delete?name='+encodeURIComponent(name),{method:'POST'});
-  await refreshLogs();
-}
+async function deleteLogFile(name){if(!window.confirm('Delete '+name+'?'))return;await fetch('/api/logs/delete?name='+encodeURIComponent(name),{method:'POST'});await refreshLogs();}
 (function(){
-  const pb=document.getElementById('pauseTradingBtn');
-  if(pb)pb.onclick=async()=>{await postJson('/api/pause_trading');await refreshStatus();};
-  const rb=document.getElementById('resumeTradingBtn');
-  if(rb)rb.onclick=async()=>{await postJson('/api/resume_trading');await refreshStatus();};
-  const pg=document.getElementById('purgeOldLogsBtn');
-  if(pg)pg.onclick=async()=>{const r=await postJson('/api/logs/purge_old');alert('Purged: '+(r.files_deleted||0)+' files, '+(r.bytes_freed||0)+' bytes');await refreshLogs();};
+  const pb=document.getElementById('pauseTradingBtn');if(pb)pb.onclick=async()=>{await postJson('/api/pause_trading');await refreshStatus();};
+  const rb=document.getElementById('resumeTradingBtn');if(rb)rb.onclick=async()=>{await postJson('/api/resume_trading');await refreshStatus();};
+  const pg=document.getElementById('purgeOldLogsBtn');if(pg)pg.onclick=async()=>{const r=await postJson('/api/logs/purge_old');alert('Purged: '+(r.files_deleted||0)+' files, '+(r.bytes_freed||0)+' bytes');await refreshLogs();};
 })();
 function render(s){
 $('uptime').textContent='uptime '+fmtUptime(s.uptime_s);
@@ -3270,15 +3273,7 @@ $('poly-detail').textContent=s.polymarket_ws&&s.polymarket_ws.last_msg_age_s!=nu
 renderRecentTrades(s);
 renderBothSides(s);
 renderClobHealth(s);
-(function(){
-  const paused=!!s.trading_paused;
-  const badge=document.getElementById('tradingPausedBadge');
-  const pb=document.getElementById('pauseTradingBtn');
-  const rb=document.getElementById('resumeTradingBtn');
-  if(badge){badge.textContent=paused?'TRADING PAUSED':'TRADING ACTIVE';badge.style.background=paused?'#7f1d1d':'#14532d';}
-  if(pb)pb.style.display=paused?'none':'';
-  if(rb)rb.style.display=paused?'':'none';
-})();
+(function(){const paused=!!s.trading_paused;const badge=document.getElementById('tradingPausedBadge');const pb=document.getElementById('pauseTradingBtn');const rb=document.getElementById('resumeTradingBtn');if(badge){badge.textContent=paused?'TRADING PAUSED':'TRADING ACTIVE';badge.style.background=paused?'#7f1d1d':'#14532d';}if(pb)pb.style.display=paused?'none':'';if(rb)rb.style.display=paused?'':'none';})();
 }
 function renderClobHealth(s){
   // v6.1.3: CLOB rate-limit banner — visible only when alert_425 is true.
@@ -3452,7 +3447,7 @@ const watching=st.bss_watching||[];
 const aborted=st.bss_aborted_today||[];
 const bssActive=!!st.bss_strategy_active;
 const list=$('bs-positions');
-// v6.3.1: BSS-aware rendering. When bss_entry strategy active, show
+// Unified paired strategy rendering. bss_entry is inactive; paired runtime always active.
 // BSS state cards (WATCH / WAITING_2ND / ABORT) alongside BOTH-state
 // positions. Old-style sum_ask@entry hidden in bss mode.
 if(bssActive){
@@ -4367,19 +4362,16 @@ def http_server_thread(state: BotState) -> None:
             parsed_url = urllib.parse.urlparse(self.path)
             qs = urllib.parse.parse_qs(parsed_url.query)
             p = parsed_url.path
-
             if p == "/api/pause_trading":
                 _set_trading_paused(state, True)
                 self._send_json({"ok": True, "trading_paused": True})
-                print("[dashboard] trading PAUSED — new entries blocked", flush=True)
+                print("[dashboard] trading PAUSED", flush=True)
                 return
-
             if p == "/api/resume_trading":
                 _set_trading_paused(state, False)
                 self._send_json({"ok": True, "trading_paused": False})
-                print("[dashboard] trading RESUMED — new entries allowed", flush=True)
+                print("[dashboard] trading RESUMED", flush=True)
                 return
-
             if p == "/api/logs/delete":
                 name = (qs.get("name") or [""])[0]
                 lp = _safe_log_file_path(state, name) if state.log_dir else None
@@ -4392,14 +4384,12 @@ def http_server_thread(state: BotState) -> None:
                 except Exception as e:
                     self._send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, status=500)
                 return
-
             if p == "/api/logs/purge_old":
                 if not state.log_dir:
                     self._send_json({"ok": False, "error": "log_dir not configured"}, status=400)
                     return
                 self._send_json(_manual_purge_old_logs(state))
                 return
-
             self.send_response(404)
             self.end_headers()
 
@@ -5388,6 +5378,10 @@ def _bs_should_enter(state: BotState, mdm: MultiDurationMarket,
         return False, "zero_ask", yes_ask, no_ask, 0.0
     # 5) Sum-ask gate (the core both-sides risk control)
     sum_ask = yes_ask + no_ask
+    if yes_ask < 0.49 or yes_ask > 0.51:
+        return False, f"yes_ask_out_of_50_50_zone:{yes_ask:.3f}", yes_ask, no_ask, sum_ask
+    if no_ask < 0.49 or no_ask > 0.51:
+        return False, f"no_ask_out_of_50_50_zone:{no_ask:.3f}", yes_ask, no_ask, sum_ask
     if sum_ask > _BS_SUM_ASK_MAX:
         return False, f"sum_ask_too_high:{sum_ask:.4f}", yes_ask, no_ask, sum_ask
     # 6) Sanity: each side must individually be within a reasonable price
@@ -9479,12 +9473,15 @@ def _bs_settle_position(state: BotState, pos: BothSidesPosition,
 def both_sides_tick(state: BotState) -> None:
     """Called from main_loop.
 
-    DEFAULT (_bs_default_runtime_active()): paired YES+NO entry + sell-loser.
-      Entry skipped when state.trading_paused=True. WAITING_2ND/ORPHAN_END
-      unreachable under default env.
+    UNIFIED PAIRED BOTH-SIDES RUNTIME (_bs_default_runtime_active()):
+      (a) attempt paired YES+NO entry in the 49–51¢ zone (skipped when
+          state.trading_paused=True), and
+      (b) evaluate tiered sell-loser on every open paired position.
+          If sell-loser does not fire, both legs are held until settlement.
+      No orphan states. No WAITING_2ND. No half-position fallback.
 
-    LEGACY (_bs_bss_runtime_active()): handled by bss_fast_tick_thread +
-      bss_gamma_poll_thread. Returns immediately.
+    Legacy bss_entry runtime (_bs_bss_runtime_active()) always returns False;
+    dedicated BSS threads are never spawned.
     """
     if not _BS_ACTIVE:
         return
@@ -9543,9 +9540,11 @@ def both_sides_tick(state: BotState) -> None:
                         pos.no_leg.peak_bid = no_bid_now
                         pos.no_leg.peak_bid_ts = now
         try:
+            # Active fallback rule:
+            # if paired sell-loser does not fire, keep both legs until settlement.
+            # No orphan/half-position fallback is active.
             # v6.2.2: BS_STRATEGY selects which sell-loser logic is active.
-            # In "verification_late" mode, ALL v6.2.1 paths are bypassed and
-            # only the pure BTC-tiered Phase B/C/D logic fires.
+            # verification_late is redirected to v621 by the unified strategy boot patch.
             if _BS_STRATEGY == "verification_late":
                 vl_fire, vl_reason, vl_loser_side, vl_loser_bid, vl_winner_ask = \
                     _bs_evaluate_verification_late(state, pos, now)
@@ -10651,8 +10650,7 @@ def boot() -> BotState:
         print(f"[boot]   pre_market_books: DISABLED in v6.4.0 (no pre-market)",
               flush=True)
 
-    # Called here: state.log_dir set, all loggers initialized, both BOT_NAME
-    # and legacy branches covered.
+    # state.log_dir set and all loggers initialized; safe to init validation CSVs.
     _ensure_validation_csvs(state)
 
     # v6.4.0 SKULD: config_snapshot_<boot_ts>.json
@@ -11075,10 +11073,10 @@ def start_feed_threads(state: BotState) -> None:
     # when active to keep the thread list visibly minimal in lag_signal mode.
     if _BS_ACTIVE:
         threads.append(("bs_disc", both_sides_discovery_thread))
-    # BSS fast-tick thread (20Hz). Only when _bs_bss_runtime_active().
+    # BSS fast-tick and gamma threads: _bs_bss_runtime_active() always returns
+    # False under the unified strategy. These threads are never spawned.
     if _bs_bss_runtime_active():
         threads.append(("bss_fast", bss_fast_tick_thread))
-    # BSS Gamma REST polling thread. Same gate.
     if _bs_bss_runtime_active():
         threads.append(("bss_gamma_poll", bss_gamma_poll_thread))
     # v6.2.5: log-retention purger thread (no-op when LOG_RETENTION_DAYS=0).
