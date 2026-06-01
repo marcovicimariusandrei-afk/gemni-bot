@@ -518,58 +518,21 @@ def _read_v610_env() -> Tuple[
     bs_bss_sustain_2nd_s   = _f("BS_BSS_SUSTAIN_SECOND_S", 3.0,  0.0,  30.0)
     bs_bss_relax_at_s      = _f("BS_BSS_RELAX_AT_S",       240.0, 1.0, 280.0)
     bs_bss_abort_at_s      = _f("BS_BSS_ABORT_AT_S",       270.0, 5.0, 300.0)
-    # v6.3.1: BTC-velocity first-leg filter. At first-leg fire moment,
-    # compute BTC % change over last 30s. If BTC is moving WITH the
-    # buy side (= we'd be buying the temporary winner), skip the fire.
-    # On May 5-6 depth_log: 95 "with-BTC" fires (67% second-leg confirm)
-    # vs 32 "against-BTC" fires (88% confirm) vs 36 "neutral" (78%).
-    # Default 0.02 (= 2bps) blocks strong-with moves only. Set 0.0 to
-    # disable the filter entirely (= v6.3.0 behavior).
+    # LEGACY INACTIVE PATH: v6.3.1: BTC-velocity first-leg filter (sequential BSS only).
     bs_bss_btc_vel_filter = _f("BS_BSS_BTC_VEL_FILTER_PCT", 0.02, 0.0, 1.0)
     bs_bss_btc_vel_lookback_s = _f("BS_BSS_BTC_VEL_LOOKBACK_S", 30.0, 5.0, 120.0)
 
-    # v6.3.7: PATIENT SECOND LEG. When the opposite side hits the strict
-    # threshold (0.50), don't fire immediately if the price is still
-    # actively falling — wait one more tick for a better fill. The bot
-    # checks the opposite-side ask velocity over the last
-    # OPP_VEL_LOOKBACK_S seconds. If price has dropped by at least
-    # OPP_VEL_PATIENT_DROP in that window, it's "still falling" and we
-    # wait. If the price is flat or rising, we fire (we caught the bottom).
-    #
-    # Floor backstop: if opposite side ever hits T_SECOND_FLOOR or below
-    # (default 0.40), fire IMMEDIATELY regardless of velocity. The dip is
-    # so deep that risking a bounce above 0.50 is worse than firing now.
-    #
-    # Set OPP_VEL_PATIENT_DROP=0 to disable patience (= v6.3.6 behavior).
+    # LEGACY INACTIVE PATH: v6.3.7: PATIENT SECOND LEG (sequential BSS only).
     bs_bss_t_second_floor = _f("BS_BSS_T_SECOND_FLOOR", 0.40, 0.10, 0.50)
     bs_bss_opp_vel_lookback_s = _f("BS_BSS_OPP_VEL_LOOKBACK_S", 10.0, 2.0, 60.0)
     bs_bss_opp_vel_patient_drop = _f("BS_BSS_OPP_VEL_PATIENT_DROP", 0.005, 0.0, 0.5)
-    # v6.5.8: patience drop threshold for LEG1 (same side as entry).
-    # If leg1 side is still falling faster than this per lookback window,
-    # hold one tick — we'll get a better fill. 0 = disabled.
+    # LEGACY INACTIVE PATH: v6.5.8 leg1 patience (sequential BSS only).
     bs_bss_leg1_patient_drop = _f("BS_BSS_LEG1_PATIENT_DROP", 0.005, 0.0, 0.5)
-    # v6.5.11: max allowed bounce above the running low seen during the
-    # leg1 sustain streak. If fire_price > streak_low + this → wait.
-    # Prevents buying at $0.33 when the streak low was $0.30.
-    # 0 = disabled (fire on any bounce, legacy behaviour).
+    # LEGACY INACTIVE PATH: v6.5.11 leg1 max bounce (sequential BSS only).
     bs_bss_leg1_max_bounce = _f("BS_BSS_LEG1_MAX_BOUNCE", 0.02, 0.0, 0.5)
 
-    # v6.3.2: PRE-MARKET BSS phase. Polymarket creates 5m markets ~30 min
-    # before the window opens. Books form, prices wobble, sometimes one
-    # side drops below $0.49 in this period. We can buy then. To use this
-    # phase you also need to extend BS_LEAD_TIME_MAX_S to 1800 (or
-    # whatever pre-market window you want covered).
-    #
-    # Pre-market thresholds are LOOSER than live (0.49 vs 0.45 first leg)
-    # because pre-market dips tend to be shallower — books are thinner,
-    # market makers haven't tightened yet.
-    #
-    # No abort timer during pre-market (time is abundant). When the live
-    # window opens (T=0) and we're still WAITING_2ND, the bot switches to
-    # standard live thresholds (0.50/0.62) and starts the abort timer
-    # from T=0 (not from pre-market first-leg fill).
-    #
-    # If neither side ever dipped below T_FIRST_PRE during the entire
+    # LEGACY INACTIVE PATH: v6.3.2 PRE-MARKET BSS phase (sequential BSS only).
+    # WAITING_2ND and first-leg/second-leg mechanics below are inactive.
     # pre-market period, the bot enters the live window in WATCH state
     # and runs standard BSS logic.
     bs_bss_t_first_pre   = _f("BS_BSS_T_FIRST_PRE",   0.49, 0.10, 0.99)
@@ -9409,10 +9372,6 @@ def _bs_settle_position(state: BotState, pos: BothSidesPosition,
 def both_sides_tick(state: BotState) -> None:
     """Called from main_loop. No-op when STRATEGY_MODE=lag_signal.
     Otherwise: (a) attempt to enter both-sides on every 5m market in
-    the lead-time window we haven't entered before, and (b) evaluate
-    sell-loser preconditions on every open both-sides position.
-
-    v6.3.0: When _BS_STRATEGY == 'bss_entry', the entry path is REPLACED
     (b) evaluate tiered sell-loser on every open paired position.
         If sell-loser does not fire, both legs are held until settlement.
     No orphan states. No WAITING_2ND. No half-position fallback.
