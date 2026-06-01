@@ -2610,118 +2610,6 @@ def _force_poly_ws_resubscribe(state: BotState) -> None:
 # ═══════════════════════════════════════════════════════════════════
 
 POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-POLY_CLOB_BOOK_URL = "https://clob.polymarket.com/book"
-
-
-def _poly_rest_get_book(token_id: str, timeout_s: float = 4.0) -> Optional["PolyBook"]:
-    """Fetch a single token's order book from Polymarket CLOB REST.
-
-    Returns a PolyBook on success, None on any failure. Used as a fallback
-    when the WS subscription has not delivered (or has not re-delivered) a
-    book snapshot for an active-market token. Does not raise.
-    """
-    try:
-        import urllib.request
-        url = f"{POLY_CLOB_BOOK_URL}?token_id={token_id}"
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "polybot-simple-v1/0.3 (+https://polymarket.com)",
-            "Accept": "application/json",
-        })
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        print(f"[rest_book] fetch failed token={token_id[:10]}… "
-              f"err={type(e).__name__}: {e}", flush=True)
-        return None
-
-    try:
-        bids = data.get("bids") or []
-        asks = data.get("asks") or []
-        best_bid = max((float(b["price"]) for b in bids if "price" in b),
-                       default=0.0)
-        best_ask = min((float(a["price"]) for a in asks if "price" in a),
-                       default=0.0)
-        bid_size = sum(float(b.get("size", 0)) for b in bids
-                       if "price" in b and float(b["price"]) == best_bid) if best_bid else 0.0
-        ask_size = sum(float(a.get("size", 0)) for a in asks
-                       if "price" in a and float(a["price"]) == best_ask) if best_ask else 0.0
-
-        bid_levels: List[Tuple[float, float]] = []
-        for b in bids:
-            try:
-                p = float(b.get("price", 0))
-                s = float(b.get("size", 0))
-            except (ValueError, TypeError):
-                continue
-            if p > 0 and s > 0:
-                bid_levels.append((p, s))
-        bid_levels.sort(key=lambda x: x[0], reverse=True)
-        bid_levels = bid_levels[:DEPTH_LEVELS]
-
-        ask_levels: List[Tuple[float, float]] = []
-        for a in asks:
-            try:
-                p = float(a.get("price", 0))
-                s = float(a.get("size", 0))
-            except (ValueError, TypeError):
-                continue
-            if p > 0 and s > 0:
-                ask_levels.append((p, s))
-        ask_levels.sort(key=lambda x: x[0])
-        ask_levels = ask_levels[:DEPTH_LEVELS]
-
-        now = time.time()
-        return PolyBook(
-            token_id=token_id,
-            bid=best_bid,
-            ask=best_ask,
-            bid_size=bid_size,
-            ask_size=ask_size,
-            last_update_ts=now,
-            bid_levels=bid_levels,
-            ask_levels=ask_levels,
-            last_book_snapshot_ts=now,
-        )
-    except Exception as e:
-        print(f"[rest_book] parse failed token={token_id[:10]}… "
-              f"err={type(e).__name__}: {e}", flush=True)
-        return None
-
-
-def _poly_bootstrap_active_market_books(state: "BotState",
-                                         market: "MarketInfo",
-                                         now: float,
-                                         stale_after_s: float = 30.0) -> int:
-    """Ensure the active market's YES and NO books exist and are fresh.
-
-    For each of the two token_ids: if the book is missing or older than
-    `stale_after_s`, fetch a fresh snapshot from CLOB REST and store it in
-    state.poly_books keyed by token_id. Returns the number of legs (0, 1, or 2)
-    that are present and fresh after this call.
-
-    Idempotent and safe to call from the hot path; uses REST only when needed.
-    """
-    hydrated = 0
-    for tid in (market.yes_token_id, market.no_token_id):
-        if not tid:
-            continue
-        existing = state.poly_books.get(tid)
-        needs_fetch = (
-            existing is None
-            or (now - existing.last_update_ts) > stale_after_s
-        )
-        if needs_fetch:
-            book = _poly_rest_get_book(tid)
-            if book is not None:
-                state.poly_books[tid] = book
-                print(f"[rest_book] bootstrap hydrated active_books="
-                      f"{('yes' if tid == market.yes_token_id else 'no')} "
-                      f"token={tid[:10]}… bid={book.bid:.3f} ask={book.ask:.3f}",
-                      flush=True)
-                hydrated += 1
-        else:
-            hydrated += 1
-    return hydrated
 
 
 def poly_ws_thread(state: BotState) -> None:
@@ -2982,11 +2870,7 @@ def poly_ws_thread(state: BotState) -> None:
         finally:
             state.poly_ws_handle = None
             state.poly_ws_connected = False
-            # NOTE: do NOT clear state.poly_books here. Polymarket WS only
-            # delivers full book snapshots on subscribe and is unreliable about
-            # re-sending them on reconnect. Wiping the dict on every disconnect
-            # leaves the bot with books=0 indefinitely. Bootstrap from REST in
-            # _bs_should_enter when an active-market book is missing or stale.
+            state.poly_books.clear()
 
         if state.kill_flag:
             break
@@ -3404,16 +3288,29 @@ list.innerHTML=hist.map(tr=>{
   // v6.2.3: clickable Polymarket link (↗ icon)
   const pmUrl=tr.market_url||'';
   const pmLink=pmUrl
-    ? `<a href="${pmUrl}" target="_blank" rel="noopener" style="color:var(--blue);text-decoration:none;font-size:11px;margin-left:6px;" title="Open on Polymarket">↗</a>`
+    ? `<a href="${pmUrl}" target="_blank" rel="noopener" style="color:var(--blue);text-decoration:none;font-size:11px;margin-left:4px;" title="Open on Polymarket">↗</a>`
     : '';
+  // Polymarket independent-verification badge.
+  //   verified   → ✓ green: bot's recorded winner matches Polymarket Gamma API
+  //   mismatch   → ✗ red:   bot's winner differs from Polymarket — hallucination signal
+  //   unverified → ?  gray: Gamma unavailable / not yet settled / network error
+  const verifyStatus=tr.polymarket_verified||'unverified';
+  let verifyBadge='';
+  if(verifyStatus==='verified'){
+    verifyBadge=`<span style="color:#5cbd5c;font-weight:700;font-size:11px;margin-right:2px;" title="Bot's recorded winner matches Polymarket Gamma API">✓</span>`;
+  }else if(verifyStatus==='mismatch'){
+    verifyBadge=`<span style="color:#d96666;font-weight:700;font-size:12px;margin-right:2px;" title="MISMATCH — bot's recorded winner differs from Polymarket Gamma. Possible hallucination.">✗</span>`;
+  }else{
+    verifyBadge=`<span style="color:var(--muted);font-weight:600;font-size:11px;margin-right:2px;" title="Polymarket Gamma not yet available or unreachable — verification pending">?</span>`;
+  }
 
-  return `<div class="trade-row" style="display:grid;grid-template-columns:55px 130px 100px 80px 90px 24px;gap:10px;align-items:center;padding:6px 10px;background:transparent;border:none;border-bottom:0.5px solid var(--border-soft);border-radius:0;font-family:var(--mono);font-size:11px;">`
+  return `<div class="trade-row" style="display:grid;grid-template-columns:55px 130px 100px 80px 90px 40px;gap:10px;align-items:center;padding:6px 10px;background:transparent;border:none;border-bottom:0.5px solid var(--border-soft);border-radius:0;font-family:var(--mono);font-size:11px;">`
     +`<span>${resHtml}</span>`
     +`<span style="color:var(--muted);font-size:10px;">${sold}${winnerBadge}</span>`
     +sparkSvg
     +`<span style="color:var(--muted);font-size:10px;text-align:right;">${deltaStr}</span>`
     +`<span class="${pnlCls}" style="text-align:right;font-weight:600;">${pnlStr} <span style="color:var(--muted);font-weight:400;">· ${fmtAgeShort(ageSec)}</span></span>`
-    +`<span style="text-align:center;">${pmLink}</span>`
+    +`<span style="text-align:center;white-space:nowrap;">${verifyBadge}${pmLink}</span>`
     +`</div>`;
 }).join('');
 }
@@ -5272,20 +5169,9 @@ def _bs_should_enter(state: BotState, mdm: MultiDurationMarket,
         return False, f"ttr_below_min:{ttr:.0f}s", 0.0, 0.0, 0.0
     if ttr > _BS_LEAD_MAX_S:
         return False, f"ttr_above_max:{ttr:.0f}s", 0.0, 0.0, 0.0
-    # 3) Both books must be present and fresh. If either is missing or stale,
-    # try to hydrate from CLOB REST before failing (WS may have dropped or never
-    # delivered the initial snapshot for this token).
+    # 3) Both books must be present and fresh
     yes_book = state.poly_books.get(market.yes_token_id)
     no_book = state.poly_books.get(market.no_token_id)
-    needs_bootstrap = (
-        yes_book is None or no_book is None
-        or (now - yes_book.last_update_ts) > 30.0
-        or (now - no_book.last_update_ts) > 30.0
-    )
-    if needs_bootstrap:
-        _poly_bootstrap_active_market_books(state, market, now)
-        yes_book = state.poly_books.get(market.yes_token_id)
-        no_book = state.poly_books.get(market.no_token_id)
     if yes_book is None or no_book is None:
         return False, "no_book", 0.0, 0.0, 0.0
     book_age_max = max(now - yes_book.last_update_ts,
@@ -9119,6 +9005,33 @@ def _bs_collect_btc_samples(state: BotState, pos: BothSidesPosition,
     return round(strike, 2), samples
 
 
+def _verify_outcome_with_polymarket(pos: "BothSidesPosition",
+                                     recorded_market_winner: str) -> str:
+    """Independently query Polymarket Gamma API for the market's authoritative
+    outcome and compare against what the bot recorded.
+
+    Returns one of:
+      'verified'   — Gamma confirms the same winner the bot decided
+      'mismatch'   — Gamma returned a winner DIFFERENT from the bot's record
+                     (hallucination signal — bot's resolution cascade lied)
+      'unverified' — Gamma not yet available / network error / market not closed
+
+    The recorded_market_winner is 'YES' | 'NO' | '' (empty for EVEN/tie).
+    Empty string is treated as unverifiable.
+    """
+    if not recorded_market_winner:
+        return "unverified"
+    try:
+        gamma_yes_won = _resolve_btc_winner_via_gamma(
+            pos.market_id, pos.yes_leg.token_id, pos.no_leg.token_id)
+    except Exception:
+        return "unverified"
+    if gamma_yes_won is None:
+        return "unverified"
+    gamma_winner = "YES" if gamma_yes_won else "NO"
+    return "verified" if gamma_winner == recorded_market_winner else "mismatch"
+
+
 def _bs_record_trade_history(state: BotState, pos: BothSidesPosition,
                               source: str) -> None:
     """v6.1.2: append the resolved both-sides position to bs_trade_history
@@ -9205,6 +9118,27 @@ def _bs_record_trade_history(state: BotState, pos: BothSidesPosition,
     btc_strike, btc_samples = _bs_collect_btc_samples(state, pos)
     entry["btc_strike"] = btc_strike
     entry["btc_samples"] = btc_samples
+    # Polymarket independent verification: ask Gamma API directly for the
+    # authoritative winner and compare against what the bot recorded above.
+    # Result: 'verified' | 'mismatch' | 'unverified'. A 'mismatch' is the
+    # hallucination signal — bot's resolution cascade returned a different
+    # answer than Polymarket's on-chain outcome. Logged loudly on mismatch.
+    try:
+        verify_status = _verify_outcome_with_polymarket(pos, market_winner)
+    except Exception as e:
+        print(f"[verify] error market={pos.market_id[:10]}…: "
+              f"{type(e).__name__}: {e}", flush=True)
+        verify_status = "unverified"
+    entry["polymarket_verified"] = verify_status
+    if verify_status == "mismatch":
+        print(f"[verify] !! MISMATCH market={pos.market_id[:10]}… "
+              f"bot_winner={market_winner} differs from Polymarket Gamma "
+              f"— possible hallucination in resolution cascade "
+              f"(source={source})", flush=True)
+    elif verify_status == "verified":
+        print(f"[verify] OK market={pos.market_id[:10]}… "
+              f"winner={market_winner} confirmed by Polymarket Gamma",
+              flush=True)
     state.bs_trade_history.append(entry)
     if len(state.bs_trade_history) > 100:
         state.bs_trade_history = state.bs_trade_history[-100:]
@@ -9414,26 +9348,8 @@ def both_sides_tick(state: BotState) -> None:
             should_enter, reason, yes_ask, no_ask, sum_ask = \
                 _bs_should_enter(state, mdm, now)
             if not should_enter:
-                # Rate-limited block-reason logging: one line per (market, reason)
-                # per 30s, so the operator can see exactly why entry was refused.
-                cid = mdm.market.condition_id
-                bucket = getattr(state, "_bs_block_log_ts", None)
-                if bucket is None:
-                    bucket = {}
-                    state._bs_block_log_ts = bucket
-                key = (cid, reason.split(":")[0])
-                last = bucket.get(key, 0.0)
-                if now - last >= 30.0:
-                    yb = state.poly_books.get(mdm.market.yes_token_id)
-                    nb = state.poly_books.get(mdm.market.no_token_id)
-                    yb_age = (now - yb.last_update_ts) if yb else -1.0
-                    nb_age = (now - nb.last_update_ts) if nb else -1.0
-                    ttr = mdm.market.end_ts - now
-                    print(f"[bs_entry] BLOCK market={cid[:10]}… reason={reason} "
-                          f"ttr={ttr:.0f}s yes_age={yb_age:.0f}s no_age={nb_age:.0f}s "
-                          f"yes_ask={yes_ask:.3f} no_ask={no_ask:.3f} sum={sum_ask:.3f}",
-                          flush=True)
-                    bucket[key] = now
+                # Most reasons aren't worth logging every tick (would spam).
+                # Only log on first encounter of a new market_id.
                 continue
             _bs_place_entry(state, mdm, yes_ask, no_ask, sum_ask)
         except Exception as e:
@@ -11094,44 +11010,7 @@ def _format_heartbeat(state: BotState) -> str:
     else:
         market = "market=NONE"
 
-    # Active-market book health: report YES/NO presence + freshness for the
-    # 5m market(s) currently in the lead-time window, not the entire cache.
-    # Under unified paired strategy this is what actually gates entry.
-    active_books_n = 0
-    active_books_total = 0
-    if _BS_ACTIVE:
-        for mdm in list(state.bs_5m_in_window.values()):
-            ttr = mdm.market.end_ts - now
-            if ttr < _BS_LEAD_MIN_S or ttr > _BS_LEAD_MAX_S:
-                continue
-            active_books_total += 2
-            yb = state.poly_books.get(mdm.market.yes_token_id)
-            nb = state.poly_books.get(mdm.market.no_token_id)
-            if yb is not None and (now - yb.last_update_ts) <= 30.0:
-                active_books_n += 1
-            if nb is not None and (now - nb.last_update_ts) <= 30.0:
-                active_books_n += 1
-        if active_books_total == 0:
-            # No market in window — fall back to legacy 5m market check.
-            if state.btc_5m_market is not None:
-                active_books_total = 2
-                yb = state.poly_books.get(state.btc_5m_market.yes_token_id)
-                nb = state.poly_books.get(state.btc_5m_market.no_token_id)
-                if yb is not None and (now - yb.last_update_ts) <= 30.0:
-                    active_books_n += 1
-                if nb is not None and (now - nb.last_update_ts) <= 30.0:
-                    active_books_n += 1
-        books = f"books={active_books_n}/{max(active_books_total, 2)}"
-    else:
-        active_books_total = 2 if state.btc_5m_market else 0
-        if state.btc_5m_market:
-            yb = state.poly_books.get(state.btc_5m_market.yes_token_id)
-            nb = state.poly_books.get(state.btc_5m_market.no_token_id)
-            if yb is not None and (now - yb.last_update_ts) <= 30.0:
-                active_books_n += 1
-            if nb is not None and (now - nb.last_update_ts) <= 30.0:
-                active_books_n += 1
-        books = f"books={active_books_n}/{max(active_books_total, 2)}"
+    books = f"books={len(state.poly_books)}"
     pos = "OPEN" if state.open_position else "NONE"
 
     if state.live_delta_pct is None:
