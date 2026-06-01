@@ -519,7 +519,7 @@ def _read_v610_env() -> Tuple[
 
     # v6.3.0: BSS (Both-Sides See-Saw) parameters. Inert unless
     # BS_STRATEGY == 'bss_entry'.
-    bs_bss_t_first         = _f("BS_BSS_T_FIRST",          0.48, 0.10, 0.50)
+    bs_bss_t_first         = _f("BS_BSS_T_FIRST",          0.50, 0.10, 0.55)
     bs_bss_sustain_first_s = _f("BS_BSS_SUSTAIN_FIRST_S",  4.0,  0.0,  30.0)
     bs_bss_t_second_strict = _f("BS_BSS_T_SECOND_STRICT",  0.52, 0.30, 0.99)
     bs_bss_t_second_relax  = _f("BS_BSS_T_SECOND_RELAXED", 0.62, 0.30, 0.99)
@@ -580,7 +580,7 @@ def _read_v610_env() -> Tuple[
     # If neither side ever dipped below T_FIRST_PRE during the entire
     # pre-market period, the bot enters the live window in WATCH state
     # and runs standard BSS logic.
-    bs_bss_t_first_pre   = _f("BS_BSS_T_FIRST_PRE",   0.52, 0.10, 0.99)
+    bs_bss_t_first_pre   = _f("BS_BSS_T_FIRST_PRE",   0.50, 0.10, 0.99)
     bs_bss_t_second_pre  = _f("BS_BSS_T_SECOND_PRE",  0.52, 0.10, 0.99)
     bs_bss_sustain_first_pre_s  = _f("BS_BSS_SUSTAIN_FIRST_PRE_S", 4.0, 0.0, 60.0)
     bs_bss_sustain_second_pre_s = _f("BS_BSS_SUSTAIN_SECOND_PRE_S", 3.0, 0.0, 60.0)
