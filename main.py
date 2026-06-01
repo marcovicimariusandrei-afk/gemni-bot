@@ -1,8 +1,6 @@
 """
-main.py — polybot_skuld_v1 (unified paired both-sides strategy).
-Active strategy: paired entry (49–51¢ zone) + tiered paired sell-loser exit + keep-both fallback.
-Legacy BSS/orphan/sequential-leg code remains gated inactive.
-v6.5.6 base — unified strategy refactor applied.
+main.py — polybot_skuld_v1 (v6.5.6 "Skuld" — LIVE orphan-sell: real CLOB FAK orders for orphan-sell + take-profit rules).
+v6.5.1 — applied 2026-05-09.
 
 ═══════════════════════════════════════════════════════════════════════
 v6.5.1 "SKULD" — price_change ladder tracking + simulator no-liquidity
@@ -56,8 +54,8 @@ EXPECTED IMPACT:
     → eliminated on price_change-driven updates
 
 EVERYTHING ELSE FROM v6.5.0 CARRIED FORWARD UNCHANGED:
-  # LEGACY INACTIVE PATH: Per-leg placement architecture (no abort, ORPHAN_END at end_ts)
-  # LEGACY INACTIVE PATH: State machine: WATCH → WAITING_2ND → BOTH (or → ORPHAN_END)
+  - Per-leg placement architecture (no abort, ORPHAN_END at end_ts)
+  - State machine: WATCH → WAITING_2ND → BOTH (or → ORPHAN_END)
   - Position sizing $1/leg, 2% taker fee model
   - LIVE_BSS_ENABLED gate, BS_BOOK_WALK_ENABLED, all thresholds
   - Resolution cascade (chainlink → binance → cache → gamma)
@@ -70,22 +68,25 @@ Originally based on v5.8.1 (2026-04-29):
 NEW IN v5.8.1: late-stage stop-loss (LATE-SL).
 
 ═══════════════════════════════════════════════════════════════════════
-# LEGACY INACTIVE PATH: v6.5.0 "SKULD" rev 2 — per-leg placement, no abort, real DRY numbers
-# (Sequential first-leg/second-leg runtime. Inactive under unified paired strategy.)
+v6.5.0 "SKULD" rev 2 — per-leg placement, no abort, real DRY numbers
 ═══════════════════════════════════════════════════════════════════════
 
 v6.4.0 was broken at an architectural level: both legs committed at
-    # LEGACY INACTIVE PATH: second-leg-decision time using a fictional first-leg price from minutes
-    # LEGACY INACTIVE PATH: ago. The v6.4.0 "DRY realism simulator" then attempted to validate
+second-leg-decision time using a fictional first-leg price from minutes
+ago. The v6.4.0 "DRY realism simulator" then attempted to validate
 that fictional price against current book and FOK-failed itself ~5,400
 times in 5 hours (May 8 morning data). v6.5.0 fixes the architecture.
 
-CORE BEHAVIOR (changes from v6.4.0) — LEGACY INACTIVE PATH:
-  # LEGACY INACTIVE PATH: Per-leg placement: each leg placed at its OWN decision moment.
-  #   Leg 1 fires when first sustain completes. Leg 2 when second sustain completes.
-  # LEGACY INACTIVE PATH: Abort REMOVED. Single-leg positions held to resolution.
-  #   ORPHAN_END logged at window close for downstream analysis.
-  # Active strategy: paired entry only. No sequential legs. No orphan states.
+CORE BEHAVIOR (changes from v6.4.0):
+  - Per-leg placement: each leg is placed at its OWN decision moment.
+    Leg 1 fires when first sustain completes. Leg 2 fires when second
+    sustain completes. No deferred fictional fills.
+  - DRY simulation modeled on proven April 13 LIVE pattern: book-walk
+    if top-of-book size insufficient, taker fee applied. NO latency
+    sleep, NO fake FOK-fail-on-drift. FAK semantics (partial fills OK).
+  - Abort REMOVED entirely. There is no abort. Single-leg positions
+    held to resolution like every other position. New ORPHAN_END
+    event logged at window close for downstream analysis only.
 Originally based on v5.8.1 (2026-04-29):
 
 NEW IN v5.8.1: late-stage stop-loss (LATE-SL).
@@ -214,7 +215,6 @@ import sys
 import threading
 import time
 import traceback
-import urllib.parse
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -433,19 +433,23 @@ def _read_v610_env() -> Tuple[
         raw = os.environ.get(name, "").strip()
         return raw if raw else default
 
-    strategy_mode = _s("STRATEGY_MODE", "both_sides_btc",
+    strategy_mode = _s("STRATEGY_MODE", "lag_signal",
                        ("lag_signal", "both_sides_btc"))
 
-    # Lead-time window: default 1200-1800 = 20-30 min before resolution.
-    bs_lead_min = _f("BS_LEAD_TIME_MIN_S", 1200.0, 60.0, 3600.0)
-    bs_lead_max = _f("BS_LEAD_TIME_MAX_S", 1800.0, 60.0, 3600.0)
+    # Lead-time window: enter both legs when 5m market TTR is in
+    # [BS_LEAD_TIME_MIN_S, BS_LEAD_TIME_MAX_S]. Default 600-900 = 10-15 min
+    # before resolution. Same window used as "entry-window" TTR for 15m/60m
+    # logging (so the data we collect is what we'd have seen at entry time
+    # if we were also trading those durations).
+    bs_lead_min = _f("BS_LEAD_TIME_MIN_S", 600.0, 60.0, 3600.0)
+    bs_lead_max = _f("BS_LEAD_TIME_MAX_S", 900.0, 60.0, 3600.0)
     if bs_lead_min >= bs_lead_max:
         print(f"[boot][v6.1.0] warning: BS_LEAD_TIME_MIN_S ({bs_lead_min}) "
-              f">= BS_LEAD_TIME_MAX_S ({bs_lead_max}); resetting to 1200/1800",
+              f">= BS_LEAD_TIME_MAX_S ({bs_lead_max}); resetting to 600/900",
               flush=True)
-        bs_lead_min, bs_lead_max = 1200.0, 1800.0
+        bs_lead_min, bs_lead_max = 600.0, 900.0
 
-    bs_sum_ask_max = _f("BS_SUM_ASK_MAX", 1.02, 1.00, 1.20)
+    bs_sum_ask_max = _f("BS_SUM_ASK_MAX", 1.03, 1.00, 1.20)
     bs_sell_thresh = _f("BS_SELL_LOSER_THRESHOLD", 0.93, 0.50, 0.99)
     bs_sell_ttr_floor = _f("BS_SELL_LOSER_TTR_FLOOR_S", 120.0, 0.0, 300.0)
     bs_sell_persist = _f("BS_SELL_LOSER_PERSIST_S", 5.0, 0.0, 60.0)
@@ -484,21 +488,25 @@ def _read_v610_env() -> Tuple[
     #                          Designed for side-by-side A/B testing on a second
     #                          Railway service (DRY only, same markets, same entry).
     #   "bss_entry" (v6.3.0) — Both-Sides See-Saw entry. REPLACES the standard
-    # LEGACY INACTIVE PATH: "bss_entry" (v6.3.0) sequential first-leg/second-leg strategy.
-    #   Bot watched for first-leg sustain → buy first leg → wait for second-leg sustain →
-    #   buy second leg. Single-leg orphan if second never confirmed. NOT part of the
-    #   unified paired strategy. bss_entry is rejected at boot and _bs_bss_runtime_active()
-    #   always returns False.
+    #                          sum_ask<1.10 entry path AND replaces verification_late.
+    #                          Bot watches every 5m market and waits for ONE side
+    #                          to dip below BS_BSS_T_FIRST sustained for
+    #                          BS_BSS_SUSTAIN_FIRST_S seconds → buy first leg.
+    #                          Then waits for OTHER side to dip below
+    #                          BS_BSS_T_SECOND_STRICT (or relaxed threshold after
+    #                          BS_BSS_RELAX_AT_S) sustained for
+    #                          BS_BSS_SUSTAIN_SECOND_S seconds → buy second leg.
+    #                          Holds both to resolution. If second never confirms
+    #                          by BS_BSS_ABORT_AT_S, sells first leg at current bid.
+    #                          Mirror-of-verification_late structure: sustain →
+    #                          fire pattern, just inverted (buy low instead of
+    #                          confirm high). DRY-only.
     bs_strategy_raw = os.environ.get("BS_STRATEGY", "v621").strip().lower()
-    if bs_strategy_raw not in ("v621", "verification_late"):
+    if bs_strategy_raw not in ("v621", "verification_late", "bss_entry"):
         print(f"[boot][v6.2.2] warning: BS_STRATEGY={bs_strategy_raw!r} "
               f"not recognized; using default 'v621'", flush=True)
         bs_strategy_raw = "v621"
     bs_strategy = bs_strategy_raw
-
-    if bs_strategy == "verification_late":
-        print("[boot] verification_late selected but unified paired strategy required; using v621", flush=True)
-        bs_strategy = "v621"
 
     # v6.2.4: verification_late freeze logic (whipsaw detection).
     # vl_arm_thresh: at TTR ≤ 60s, if winner_ask ≥ this, ARM the verification.
@@ -509,8 +517,8 @@ def _read_v610_env() -> Tuple[
     bs_vl_arm_thresh = _f("BS_VL_ARM_THRESHOLD", 0.70, 0.50, 0.99)
     bs_vl_drop_tol = _f("BS_VL_DROP_TOLERANCE", 0.03, 0.0, 0.50)
 
-    # LEGACY INACTIVE PATH: BSS (Both-Sides See-Saw) sequential parameters.
-    # Inert. _bs_bss_runtime_active() always returns False under unified strategy.
+    # v6.3.0: BSS (Both-Sides See-Saw) parameters. Inert unless
+    # BS_STRATEGY == 'bss_entry'.
     bs_bss_t_first         = _f("BS_BSS_T_FIRST",          0.45, 0.10, 0.50)
     bs_bss_sustain_first_s = _f("BS_BSS_SUSTAIN_FIRST_S",  4.0,  0.0,  30.0)
     bs_bss_t_second_strict = _f("BS_BSS_T_SECOND_STRICT",  0.50, 0.30, 0.99)
@@ -518,21 +526,58 @@ def _read_v610_env() -> Tuple[
     bs_bss_sustain_2nd_s   = _f("BS_BSS_SUSTAIN_SECOND_S", 3.0,  0.0,  30.0)
     bs_bss_relax_at_s      = _f("BS_BSS_RELAX_AT_S",       240.0, 1.0, 280.0)
     bs_bss_abort_at_s      = _f("BS_BSS_ABORT_AT_S",       270.0, 5.0, 300.0)
-    # LEGACY INACTIVE PATH: v6.3.1: BTC-velocity first-leg filter (sequential BSS only).
+    # v6.3.1: BTC-velocity first-leg filter. At first-leg fire moment,
+    # compute BTC % change over last 30s. If BTC is moving WITH the
+    # buy side (= we'd be buying the temporary winner), skip the fire.
+    # On May 5-6 depth_log: 95 "with-BTC" fires (67% second-leg confirm)
+    # vs 32 "against-BTC" fires (88% confirm) vs 36 "neutral" (78%).
+    # Default 0.02 (= 2bps) blocks strong-with moves only. Set 0.0 to
+    # disable the filter entirely (= v6.3.0 behavior).
     bs_bss_btc_vel_filter = _f("BS_BSS_BTC_VEL_FILTER_PCT", 0.02, 0.0, 1.0)
     bs_bss_btc_vel_lookback_s = _f("BS_BSS_BTC_VEL_LOOKBACK_S", 30.0, 5.0, 120.0)
 
-    # LEGACY INACTIVE PATH: v6.3.7: PATIENT SECOND LEG (sequential BSS only).
+    # v6.3.7: PATIENT SECOND LEG. When the opposite side hits the strict
+    # threshold (0.50), don't fire immediately if the price is still
+    # actively falling — wait one more tick for a better fill. The bot
+    # checks the opposite-side ask velocity over the last
+    # OPP_VEL_LOOKBACK_S seconds. If price has dropped by at least
+    # OPP_VEL_PATIENT_DROP in that window, it's "still falling" and we
+    # wait. If the price is flat or rising, we fire (we caught the bottom).
+    #
+    # Floor backstop: if opposite side ever hits T_SECOND_FLOOR or below
+    # (default 0.40), fire IMMEDIATELY regardless of velocity. The dip is
+    # so deep that risking a bounce above 0.50 is worse than firing now.
+    #
+    # Set OPP_VEL_PATIENT_DROP=0 to disable patience (= v6.3.6 behavior).
     bs_bss_t_second_floor = _f("BS_BSS_T_SECOND_FLOOR", 0.40, 0.10, 0.50)
     bs_bss_opp_vel_lookback_s = _f("BS_BSS_OPP_VEL_LOOKBACK_S", 10.0, 2.0, 60.0)
     bs_bss_opp_vel_patient_drop = _f("BS_BSS_OPP_VEL_PATIENT_DROP", 0.005, 0.0, 0.5)
-    # LEGACY INACTIVE PATH: v6.5.8 leg1 patience (sequential BSS only).
+    # v6.5.8: patience drop threshold for LEG1 (same side as entry).
+    # If leg1 side is still falling faster than this per lookback window,
+    # hold one tick — we'll get a better fill. 0 = disabled.
     bs_bss_leg1_patient_drop = _f("BS_BSS_LEG1_PATIENT_DROP", 0.005, 0.0, 0.5)
-    # LEGACY INACTIVE PATH: v6.5.11 leg1 max bounce (sequential BSS only).
+    # v6.5.11: max allowed bounce above the running low seen during the
+    # leg1 sustain streak. If fire_price > streak_low + this → wait.
+    # Prevents buying at $0.33 when the streak low was $0.30.
+    # 0 = disabled (fire on any bounce, legacy behaviour).
     bs_bss_leg1_max_bounce = _f("BS_BSS_LEG1_MAX_BOUNCE", 0.02, 0.0, 0.5)
 
-    # LEGACY INACTIVE PATH: v6.3.2 PRE-MARKET BSS phase (sequential BSS only).
-    # WAITING_2ND and first-leg/second-leg mechanics below are inactive.
+    # v6.3.2: PRE-MARKET BSS phase. Polymarket creates 5m markets ~30 min
+    # before the window opens. Books form, prices wobble, sometimes one
+    # side drops below $0.49 in this period. We can buy then. To use this
+    # phase you also need to extend BS_LEAD_TIME_MAX_S to 1800 (or
+    # whatever pre-market window you want covered).
+    #
+    # Pre-market thresholds are LOOSER than live (0.49 vs 0.45 first leg)
+    # because pre-market dips tend to be shallower — books are thinner,
+    # market makers haven't tightened yet.
+    #
+    # No abort timer during pre-market (time is abundant). When the live
+    # window opens (T=0) and we're still WAITING_2ND, the bot switches to
+    # standard live thresholds (0.50/0.62) and starts the abort timer
+    # from T=0 (not from pre-market first-leg fill).
+    #
+    # If neither side ever dipped below T_FIRST_PRE during the entire
     # pre-market period, the bot enters the live window in WATCH state
     # and runs standard BSS logic.
     bs_bss_t_first_pre   = _f("BS_BSS_T_FIRST_PRE",   0.49, 0.10, 0.99)
@@ -609,49 +654,6 @@ def _read_v610_env() -> Tuple[
  ) = _read_v610_env()
 
 _BS_ACTIVE = (_STRATEGY_MODE == "both_sides_btc")
-
-# Active strategy invariant:
-# - paired entry only (49-51¢ zone, sum≤1.02)
-# - no orphan states in the active runtime
-# - one unitary exit strategy: paired sell-loser via the tiered ladder
-# - if paired sell-loser does not fire, keep both legs until settlement
-# Legacy bss/orphan code may remain in the file only as inactive compatibility code.
-
-
-def _bs_default_runtime_active() -> bool:
-    """Unified active runtime: paired both-sides entry plus paired sell-loser exit.
-    No orphan states are allowed in the active strategy.
-    If sell-loser does not fire, both legs are held until settlement.
-    """
-    return _BS_ACTIVE and _BS_STRATEGY != "bss_entry"
-
-
-def _bs_bss_runtime_active() -> bool:
-    """Legacy bss_entry runtime disabled under the unified paired strategy."""
-    return False
-
-
-if _bs_default_runtime_active():
-    print("[boot] unified paired both-sides runtime active; tiered sell-loser exit; keep-both fallback", flush=True)
-
-
-def _set_trading_paused(state: "BotState", paused: bool) -> None:
-    state.trading_paused = bool(paused)
-
-
-def _trading_pause_reason(state: "BotState") -> str:
-    return "paused_by_operator" if getattr(state, "trading_paused", False) else ""
-
-
-def _entry_blocked_by_pause(state: "BotState", tag: str = "entry") -> bool:
-    if not getattr(state, "trading_paused", False):
-        return False
-    now = time.time()
-    last = getattr(state, "_pause_log_last_ts", 0.0)
-    if now - last >= 15.0:
-        print(f"[pause] trading paused — skipping new entry ({tag})", flush=True)
-        state._pause_log_last_ts = now
-    return True
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -766,12 +768,9 @@ _BS_BSS_SHADOW_TICK_INTERVAL_S = float(
 
 
 # ═══════════════════════════════════════════════════════════════════
-# LEGACY INACTIVE PATH: v6.5.4 SKULD: orphan-sell rule (positive-exit)
-# Operates during WAITING_2ND (sequential-leg mode only).
-# WAITING_2ND is inactive in the unified paired strategy.
-# _bs_bss_runtime_active() always returns False; this block is unreachable.
+# v6.5.4 SKULD: orphan-sell rule (positive-exit)
 # ═══════════════════════════════════════════════════════════════════
-# When enabled (legacy), during the WAITING_2ND hold, the bot evaluates an exit
+# When enabled, during the WAITING_2ND hold, the bot evaluates an exit
 # rule on every shadow tick (default 3s cadence). If conditions hold for
 # a configurable number of consecutive ticks, leg-1 is sold at the
 # current bid, locking in a small profit and avoiding the orphan loss.
@@ -803,11 +802,9 @@ _BS_BSS_ORPHAN_SELL_PERSIST_TICKS = int(float(
 
 
 # ═══════════════════════════════════════════════════════════════════
-# LEGACY INACTIVE PATH: v6.5.5 SKULD: orphan take-profit (TP) rule
-# Operates during WAITING_2ND (sequential-leg mode only). Unreachable
-# in unified paired strategy. _bs_bss_runtime_active() always False.
+# v6.5.5 SKULD: orphan take-profit (TP) rule
 # ═══════════════════════════════════════════════════════════════════
-# (Legacy) Complementary to the orphan-sell defensive exit (which fires at
+# Complementary to the orphan-sell defensive exit (which fires at
 # break-even when BTC is adverse). The TP rule fires OPPORTUNISTICALLY
 # when leg-1 bid has recovered substantially above entry — locking in a
 # real profit before potential reversal.
@@ -879,12 +876,9 @@ _BS_BSS_ORPHAN_TP_GRACE_S = float(
 
 
 # ═══════════════════════════════════════════════════════════════════
-# LEGACY INACTIVE PATH: v6.5.7 SKULD: reverse-sniper cashout (Rule C)
-# Operates on orphan positions in WAITING_2ND (sequential-leg mode only).
-# WAITING_2ND is inactive in the unified paired strategy.
-# _bs_bss_runtime_active() always False; this block is unreachable.
+# v6.5.7 SKULD: reverse-sniper cashout (Rule C)
 # ═══════════════════════════════════════════════════════════════════
-# (Legacy) When the other side reaches conviction (winner_ask >= threshold),
+# When the other side reaches conviction (winner_ask >= threshold),
 # sell the losing orphan leg at cashout bid to recover partial value
 # rather than holding to a near-certain -$1 loss at resolution.
 #
@@ -1429,56 +1423,6 @@ def list_log_files(base_dir: Path) -> List[Dict[str, Any]]:
     return out
 
 
-def _safe_log_file_path(state: "BotState", name: str) -> Optional[Path]:
-    try:
-        raw = (name or "").strip()
-        if not raw or "/" in raw or "\\" in raw:
-            return None
-        if not raw.lower().endswith(".csv"):
-            return None
-        if not state.log_dir:
-            return None
-        allowed = {item.get("filename", "") for item in list_log_files(Path(state.log_dir))}
-        if raw not in allowed:
-            return None
-        p = (Path(state.log_dir) / raw).resolve()
-        base = Path(state.log_dir).resolve()
-        try:
-            p.relative_to(base)
-        except Exception:
-            return None
-        if not p.exists() or not p.is_file():
-            return None
-        return p
-    except Exception:
-        return None
-
-
-def _manual_purge_old_logs(state: "BotState") -> Dict[str, Any]:
-    if _LOG_RETENTION_DAYS <= 0 or not state.log_dir:
-        return {"ok": True, "files_deleted": 0, "bytes_freed": 0}
-    log_dir = Path(state.log_dir)
-    before: Dict[str, int] = {}
-    try:
-        for p in log_dir.glob("*.csv"):
-            try:
-                before[str(p)] = p.stat().st_size
-            except Exception:
-                pass
-    except Exception:
-        before = {}
-    _purge_old_logs(log_dir, _LOG_RETENTION_DAYS)
-    after_keys: set = set()
-    try:
-        for p in log_dir.glob("*.csv"):
-            after_keys.add(str(p))
-    except Exception:
-        pass
-    files_deleted = sum(1 for k in before if k not in after_keys)
-    bytes_freed = sum(sz for k, sz in before.items() if k not in after_keys)
-    return {"ok": True, "files_deleted": files_deleted, "bytes_freed": int(bytes_freed)}
-
-
 # ═══════════════════════════════════════════════════════════════════
 # v6.1.3: CLOB HTTP HEALTH MONITOR
 # ═══════════════════════════════════════════════════════════════════
@@ -1767,13 +1711,24 @@ class MultiDurationMarket:
     # ask for a re-subscribe.
     ws_subscribed: bool = False
 
-    # ─── LEGACY INACTIVE PATH: v6.3.0 BSS sequential per-market state ──
-    # Inert. _bs_bss_runtime_active() always returns False.
-    # Legacy lifecycle (unreachable):
-    #   bss_state='WATCH'       → looking for first-leg sustain
-    #   bss_state='WAITING_2ND' → first leg held; looking for second
-    #   bss_state='BOTH'        → both legs filled (BothSidesPosition created)
-    #   bss_state='ORPHAN_END'  → window closed with only leg 1 held
+    # ─── v6.3.0: BSS (Both-Sides See-Saw) per-market state ─────────────
+    # Inert unless _BS_STRATEGY == 'bss_entry'. Mirrors the pattern of
+    # BothSidesPosition.vl_* fields — sustain-and-fire state for entry,
+    # rather than for sell. Lifecycle:
+    #   bss_state='WATCH'        → looking for first-leg sustain
+    #   bss_state='WAITING_2ND'  → first leg "filled"; looking for second
+    #   bss_state='BOTH'         → both legs filled; held to resolution
+    #                              (a real BothSidesPosition has been
+    #                              created and lives in
+    #                              state.both_sides_positions)
+    #   bss_state='ABORT'        → second leg never confirmed; first leg
+    #                              "sold" at last bid; done
+    #   bss_state='RESOLVED'     → terminal (only used for ABORT path;
+    #                              BOTH path is resolved by the existing
+    #                              both_sides_positions resolution flow)
+    # v6.5.0: states are WATCH → WAITING_2ND (semantic: HALF, leg 1 actually
+    # held) → BOTH (PAIRED) → RESOLVED. ABORT is NEVER entered. Window-end
+    # transitions HALF directly to ORPHAN_END logging then RESOLVED.
     bss_state: str = "WATCH"
     bss_yes_below_first_start_ts: Optional[float] = None
     bss_no_below_first_start_ts: Optional[float] = None
@@ -1943,7 +1898,6 @@ class BotState:
     skips_by_reason: Dict[str, int] = field(default_factory=dict)
 
     kill_flag: bool = False
-    trading_paused: bool = False  # pauses new entries only; exits/management unaffected
 
     binance_logger: Optional[Any] = None
     signal_logger: Optional[Any] = None
@@ -2656,6 +2610,118 @@ def _force_poly_ws_resubscribe(state: BotState) -> None:
 # ═══════════════════════════════════════════════════════════════════
 
 POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+POLY_CLOB_BOOK_URL = "https://clob.polymarket.com/book"
+
+
+def _poly_rest_get_book(token_id: str, timeout_s: float = 4.0) -> Optional["PolyBook"]:
+    """Fetch a single token's order book from Polymarket CLOB REST.
+
+    Returns a PolyBook on success, None on any failure. Used as a fallback
+    when the WS subscription has not delivered (or has not re-delivered) a
+    book snapshot for an active-market token. Does not raise.
+    """
+    try:
+        import urllib.request
+        url = f"{POLY_CLOB_BOOK_URL}?token_id={token_id}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "polybot-simple-v1/0.3 (+https://polymarket.com)",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[rest_book] fetch failed token={token_id[:10]}… "
+              f"err={type(e).__name__}: {e}", flush=True)
+        return None
+
+    try:
+        bids = data.get("bids") or []
+        asks = data.get("asks") or []
+        best_bid = max((float(b["price"]) for b in bids if "price" in b),
+                       default=0.0)
+        best_ask = min((float(a["price"]) for a in asks if "price" in a),
+                       default=0.0)
+        bid_size = sum(float(b.get("size", 0)) for b in bids
+                       if "price" in b and float(b["price"]) == best_bid) if best_bid else 0.0
+        ask_size = sum(float(a.get("size", 0)) for a in asks
+                       if "price" in a and float(a["price"]) == best_ask) if best_ask else 0.0
+
+        bid_levels: List[Tuple[float, float]] = []
+        for b in bids:
+            try:
+                p = float(b.get("price", 0))
+                s = float(b.get("size", 0))
+            except (ValueError, TypeError):
+                continue
+            if p > 0 and s > 0:
+                bid_levels.append((p, s))
+        bid_levels.sort(key=lambda x: x[0], reverse=True)
+        bid_levels = bid_levels[:DEPTH_LEVELS]
+
+        ask_levels: List[Tuple[float, float]] = []
+        for a in asks:
+            try:
+                p = float(a.get("price", 0))
+                s = float(a.get("size", 0))
+            except (ValueError, TypeError):
+                continue
+            if p > 0 and s > 0:
+                ask_levels.append((p, s))
+        ask_levels.sort(key=lambda x: x[0])
+        ask_levels = ask_levels[:DEPTH_LEVELS]
+
+        now = time.time()
+        return PolyBook(
+            token_id=token_id,
+            bid=best_bid,
+            ask=best_ask,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            last_update_ts=now,
+            bid_levels=bid_levels,
+            ask_levels=ask_levels,
+            last_book_snapshot_ts=now,
+        )
+    except Exception as e:
+        print(f"[rest_book] parse failed token={token_id[:10]}… "
+              f"err={type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _poly_bootstrap_active_market_books(state: "BotState",
+                                         market: "MarketInfo",
+                                         now: float,
+                                         stale_after_s: float = 30.0) -> int:
+    """Ensure the active market's YES and NO books exist and are fresh.
+
+    For each of the two token_ids: if the book is missing or older than
+    `stale_after_s`, fetch a fresh snapshot from CLOB REST and store it in
+    state.poly_books keyed by token_id. Returns the number of legs (0, 1, or 2)
+    that are present and fresh after this call.
+
+    Idempotent and safe to call from the hot path; uses REST only when needed.
+    """
+    hydrated = 0
+    for tid in (market.yes_token_id, market.no_token_id):
+        if not tid:
+            continue
+        existing = state.poly_books.get(tid)
+        needs_fetch = (
+            existing is None
+            or (now - existing.last_update_ts) > stale_after_s
+        )
+        if needs_fetch:
+            book = _poly_rest_get_book(tid)
+            if book is not None:
+                state.poly_books[tid] = book
+                print(f"[rest_book] bootstrap hydrated active_books="
+                      f"{('yes' if tid == market.yes_token_id else 'no')} "
+                      f"token={tid[:10]}… bid={book.bid:.3f} ask={book.ask:.3f}",
+                      flush=True)
+                hydrated += 1
+        else:
+            hydrated += 1
+    return hydrated
 
 
 def poly_ws_thread(state: BotState) -> None:
@@ -2916,7 +2982,11 @@ def poly_ws_thread(state: BotState) -> None:
         finally:
             state.poly_ws_handle = None
             state.poly_ws_connected = False
-            state.poly_books.clear()
+            # NOTE: do NOT clear state.poly_books here. Polymarket WS only
+            # delivers full book snapshots on subscribe and is unreliable about
+            # re-sending them on reconnect. Wiping the dict on every disconnect
+            # leaves the bot with books=0 indefinitely. Bootstrap from REST in
+            # _bs_should_enter when an active-market book is missing or stale.
 
         if state.kill_flag:
             break
@@ -3103,7 +3173,7 @@ main{padding:20px;max-width:1100px;margin:0 auto;}
 .bs-leg-pnl.down{color:var(--red);font-weight:600;}
 .bs-leg-closed-tag{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.04em;}
 </style></head><body>
-<header class="skuld-hero"><h1 id="header-title">polybot simple v1</h1><span id="version-badge" class="badge badge-version">v—</span><span id="mode-badge" class="badge badge-dry">DRY</span><span id="strategy-badge" class="badge badge-bs" style="display:none">BOTH-SIDES</span><span id="variant-badge" class="badge badge-bs" style="display:none">v621</span><span id="tradingPausedBadge" style="background:#14532d;color:#fff;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:700;margin-left:6px;">TRADING ACTIVE</span><button id="pauseTradingBtn" style="margin-left:6px;padding:3px 10px;border-radius:5px;border:1px solid var(--muted);background:rgba(255,255,255,.07);color:var(--text);cursor:pointer;font-size:11px;font-weight:600;">Pause trading</button><button id="resumeTradingBtn" style="display:none;margin-left:6px;padding:3px 10px;border-radius:5px;border:1px solid #f8c849;background:rgba(248,200,73,.12);color:#f8c849;cursor:pointer;font-size:11px;font-weight:600;">Resume trading</button><button id="purgeOldLogsBtn" style="margin-left:6px;padding:3px 10px;border-radius:5px;border:1px solid var(--muted);background:rgba(255,255,255,.07);color:var(--muted);cursor:pointer;font-size:11px;">Purge old logs</button><span class="uptime" id="uptime">uptime —</span><span class="skuld-tagline">Toate Pânzele Sus</span></header>
+<header class="skuld-hero"><h1 id="header-title">polybot simple v1</h1><span id="version-badge" class="badge badge-version">v—</span><span id="mode-badge" class="badge badge-dry">DRY</span><span id="strategy-badge" class="badge badge-bs" style="display:none">BOTH-SIDES</span><span id="variant-badge" class="badge badge-bs" style="display:none">v621</span><span class="uptime" id="uptime">uptime —</span><span class="skuld-tagline">Toate Pânzele Sus</span></header>
 <main>
 <div id="clob-warning" class="clob-warning" style="display:none">⚠ Polymarket rate-limiting detected — <span id="clob-warning-detail"></span></div>
 <div class="grid">
@@ -3164,8 +3234,7 @@ return `<div class="log-row">`
 +`<span class="log-date">${f.date}</span>`
 +`<span class="log-size">${fmtBytes(f.size_bytes)}</span>`
 +`<span class="log-rows">${rows!=null?rows.toLocaleString()+' rows':'—'}</span>`
-+`<a class="log-dl" href="/api/logs/download?name=${encodeURIComponent(f.filename)}" target="_blank" rel="noopener noreferrer">download</a>`
-+`<button onclick="deleteLogFile(${JSON.stringify(f.filename)})" style="margin-left:6px;padding:2px 8px;border-radius:4px;border:1px solid #c0392b;background:rgba(192,57,43,.12);color:#e74c3c;cursor:pointer;font-size:10px;">delete</button>`
++`<a class="log-dl" href="/api/download/${f.filename}" download>download</a>`
 +`</div>`;
 }).join('');
 list.innerHTML=rowsHtml;
@@ -3203,15 +3272,6 @@ setTimeout(()=>{st.textContent='';},8000);
 tickDatasets();
 }
 async function tick(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw 0;const s=await r.json();render(s);}catch(e){$('uptime').textContent='connection lost';}}
-async function refreshStatus(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)return;render(await r.json());}catch(e){}}
-async function refreshLogs(){try{await tickDatasets();}catch(e){}}
-async function postJson(url){const r=await fetch(url,{method:'POST'});return await r.json();}
-async function deleteLogFile(name){if(!window.confirm('Delete '+name+'?'))return;await fetch('/api/logs/delete?name='+encodeURIComponent(name),{method:'POST'});await refreshLogs();}
-(function(){
-  const pb=document.getElementById('pauseTradingBtn');if(pb)pb.onclick=async()=>{await postJson('/api/pause_trading');await refreshStatus();};
-  const rb=document.getElementById('resumeTradingBtn');if(rb)rb.onclick=async()=>{await postJson('/api/resume_trading');await refreshStatus();};
-  const pg=document.getElementById('purgeOldLogsBtn');if(pg)pg.onclick=async()=>{const r=await postJson('/api/logs/purge_old');alert('Purged: '+(r.files_deleted||0)+' files, '+(r.bytes_freed||0)+' bytes');await refreshLogs();};
-})();
 function render(s){
 $('uptime').textContent='uptime '+fmtUptime(s.uptime_s);
 const badge=$('mode-badge');badge.textContent=(s.mode||'dry').toUpperCase();badge.className='badge '+(s.mode==='live'?'badge-live':'badge-dry');
@@ -3222,7 +3282,6 @@ $('poly-detail').textContent=s.polymarket_ws&&s.polymarket_ws.last_msg_age_s!=nu
 renderRecentTrades(s);
 renderBothSides(s);
 renderClobHealth(s);
-(function(){const paused=!!s.trading_paused;const badge=document.getElementById('tradingPausedBadge');const pb=document.getElementById('pauseTradingBtn');const rb=document.getElementById('resumeTradingBtn');if(badge){badge.textContent=paused?'TRADING PAUSED':'TRADING ACTIVE';badge.style.background=paused?'#7f1d1d':'#14532d';}if(pb)pb.style.display=paused?'none':'';if(rb)rb.style.display=paused?'':'none';})();
 }
 function renderClobHealth(s){
   // v6.1.3: CLOB rate-limit banner — visible only when alert_425 is true.
@@ -3248,9 +3307,9 @@ function fmtAgeShort(sec){if(sec==null||!isFinite(sec))return '';if(sec<60)retur
 function fmtPrice(p){if(p==null)return '—';return Number(p).toFixed(2);}
 function renderRecentTrades(s){
 const list=$('recent-trades-list');
-// LEGACY INACTIVE PATH: v6.5.5 last 15 trades — includes ORPHAN_SOLD positions
-// from legacy bss_entry orphan-sell and take-profit rules. These are unreachable
-// in the unified paired strategy but the rendering is kept for historical log display.
+// v6.5.5: last 15 trades (was 10). Now includes ORPHAN_SOLD positions
+// from the orphan-sell (positive-exit) and take-profit rules — these
+// are leg-1-only closes that didn't reach resolution.
 //   Schema per row (single line):
 //     [pill] [sold|resolved · winner_badge]   [sparkline 100x24]   [+$X.XX BTC]   [pnl]
 //   Color rule (sparkline + tinted bg):
@@ -3396,8 +3455,7 @@ const watching=st.bss_watching||[];
 const aborted=st.bss_aborted_today||[];
 const bssActive=!!st.bss_strategy_active;
 const list=$('bs-positions');
-// LEGACY INACTIVE PATH: BSS-aware rendering. bss_entry state cards (WATCH/WAITING_2ND)
-// are shown only if present in historical data. bss_entry is not the active strategy.
+// v6.3.1: BSS-aware rendering. When bss_entry strategy active, show
 // BSS state cards (WATCH / WAITING_2ND / ABORT) alongside BOTH-state
 // positions. Old-style sum_ask@entry hidden in bss mode.
 if(bssActive){
@@ -3791,11 +3849,12 @@ def _build_status_payload(state: BotState) -> dict:
     # Sort by TTR ascending (closest to resolution first — most actionable)
     bs_open_positions.sort(key=lambda x: x["ttr_s"])
 
-    # LEGACY INACTIVE PATH: BSS watching list — markets in WATCH/WAITING_2ND state.
-    # Populated only if _BS_STRATEGY=='bss_entry', which is never set under unified strategy.
+    # v6.3.1: BSS watching list — markets in WATCH/WAITING_2ND/ABORT state
+    # that don't yet have a BothSidesPosition. Surfaces what BSS is actually
+    # doing in real-time. Only populated when _BS_STRATEGY=='bss_entry'.
     bss_watching = []
     bss_aborted_today = []
-    if _BS_STRATEGY == "bss_entry":  # always False under unified strategy
+    if _BS_STRATEGY == "bss_entry":
         for cid, mdm in state.bs_5m_in_window.items():
             if mdm.duration_s != 300:
                 continue
@@ -3979,11 +4038,8 @@ def _build_status_payload(state: BotState) -> dict:
         # v6.1.0: strategy mode + both-sides config + state
         "strategy_mode": _STRATEGY_MODE,
         "bs_active": _BS_ACTIVE,
-        # v6.2.2: strategy variant
+        # v6.2.2: strategy variant (selects sell-loser logic)
         "bs_strategy": _BS_STRATEGY,
-        "trading_paused": bool(getattr(state, "trading_paused", False)),
-        "bot_name": _BOT_NAME,
-        "log_retention_days": _LOG_RETENTION_DAYS,
         # v6.1.3: CLOB HTTP health snapshot for the dashboard banner
         "clob_health": _compute_clob_health(60.0),
         "bs_config": {
@@ -4018,10 +4074,10 @@ def _build_status_payload(state: BotState) -> dict:
             "pnl_today_usdc": round(state.bs_pnl_today_usdc, 4),
             "discovery": dict(state.bs_discovery_diag),
             "open_positions": bs_open_positions,
-            # LEGACY INACTIVE PATH: BSS state surfaces — bss_entry not active under unified strategy
+            # v6.3.1: BSS state surfaces — only populated in bss_entry mode
             "bss_watching": bss_watching,
             "bss_aborted_today": bss_aborted_today[-20:],
-            "bss_strategy_active": False,  # bss_entry inactive; _bs_bss_runtime_active() always False
+            "bss_strategy_active": _BS_STRATEGY == "bss_entry",
             # v6.1.2: rolling history for "Last 5 trades" panel.
             "trade_history": state.bs_trade_history[-15:],
         },
@@ -4078,31 +4134,6 @@ def _build_status_payload(state: BotState) -> dict:
         "skips_by_reason": dict(state.skips_by_reason),
         "trade_history": state.trade_history[-15:],
     }
-
-
-CSV_EXPORT_FILES = [
-    ("planned_entries.csv", "planned_entries.csv"),
-    ("executed_trades.csv", "executed_trades.csv"),
-    ("open_positions.csv", "open_positions.csv"),
-    ("exits.csv", "exits.csv"),
-]
-
-def _ensure_validation_csvs(state):
-    try:
-        os.makedirs(state.log_dir, exist_ok=True)
-        headers = {
-            "planned_entries.csv": "ts,market_slug,question,yes_ask,no_ask,sum_ask,eligible,entry_window_s,polymarket_url\n",
-            "executed_trades.csv": "ts,market_slug,question,action,side,price,size,reason,polymarket_url\n",
-            "open_positions.csv": "ts,market_slug,question,yes_entry,no_entry,size_usdc,status,polymarket_url\n",
-            "exits.csv": "ts,market_slug,question,side_sold,exit_price,reason,realized_pnl,polymarket_url\n",
-        }
-        for fname, header in headers.items():
-            fpath = os.path.join(state.log_dir, fname)
-            if not os.path.exists(fpath):
-                with open(fpath, "w", encoding="utf-8") as f:
-                    f.write(header)
-    except Exception as e:
-        print(f"[csv] init failed: {type(e).__name__}: {e}", flush=True)
 
 
 def http_server_thread(state: BotState) -> None:
@@ -4271,75 +4302,10 @@ def http_server_thread(state: BotState) -> None:
                 self.wfile.write(b"ok\n")
                 return
 
-            if path == "/api/logs/download":
-                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                name = (qs.get("name") or [""])[0]
-                lp = _safe_log_file_path(state, name) if state.log_dir else None
-                if lp is None:
-                    body = json.dumps({"ok": False, "error": "file_not_found"}).encode("utf-8")
-                    self.send_response(404)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                    return
-                data = lp.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/csv; charset=utf-8")
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Content-Disposition", f'attachment; filename="{lp.name}"')
-                self.end_headers()
-                self.wfile.write(data)
-                return
-
             self.send_response(404)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"not found\n")
-
-        def _send_json(self, payload: dict, status: int = 200) -> None:
-            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_POST(self):
-            parsed_url = urllib.parse.urlparse(self.path)
-            qs = urllib.parse.parse_qs(parsed_url.query)
-            p = parsed_url.path
-            if p == "/api/pause_trading":
-                _set_trading_paused(state, True)
-                self._send_json({"ok": True, "trading_paused": True})
-                print("[dashboard] trading PAUSED", flush=True)
-                return
-            if p == "/api/resume_trading":
-                _set_trading_paused(state, False)
-                self._send_json({"ok": True, "trading_paused": False})
-                print("[dashboard] trading RESUMED", flush=True)
-                return
-            if p == "/api/logs/delete":
-                name = (qs.get("name") or [""])[0]
-                lp = _safe_log_file_path(state, name) if state.log_dir else None
-                if lp is None:
-                    self._send_json({"ok": False, "error": "file_not_found"}, status=404)
-                    return
-                try:
-                    lp.unlink()
-                    self._send_json({"ok": True, "deleted": lp.name})
-                except Exception as e:
-                    self._send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, status=500)
-                return
-            if p == "/api/logs/purge_old":
-                if not state.log_dir:
-                    self._send_json({"ok": False, "error": "log_dir not configured"}, status=400)
-                    return
-                self._send_json(_manual_purge_old_logs(state))
-                return
-            self.send_response(404)
-            self.end_headers()
 
         def log_message(self, fmt, *args):
             return
@@ -4484,8 +4450,6 @@ def signal_tick(state: BotState) -> None:
             state.last_decision_reason = decision.reason
 
             if decision.should_trade:
-                if _entry_blocked_by_pause(state, "lag_signal"):
-                    return
                 pos = place_entry(state, signal, decision)
                 if pos is not None:
                     state.open_position = pos
@@ -5289,8 +5253,6 @@ def _bs_should_enter(state: BotState, mdm: MultiDurationMarket,
     Returns: (should_enter, reason, yes_ask, no_ask, sum_ask)
     """
     market = mdm.market
-    if _entry_blocked_by_pause(state, "both_sides"):
-        return (False, _trading_pause_reason(state), 0.0, 0.0, 0.0)
     # 1) Re-entry block
     if market.condition_id in state.bs_entered_market_ids:
         return False, "already_entered", 0.0, 0.0, 0.0
@@ -5310,9 +5272,20 @@ def _bs_should_enter(state: BotState, mdm: MultiDurationMarket,
         return False, f"ttr_below_min:{ttr:.0f}s", 0.0, 0.0, 0.0
     if ttr > _BS_LEAD_MAX_S:
         return False, f"ttr_above_max:{ttr:.0f}s", 0.0, 0.0, 0.0
-    # 3) Both books must be present and fresh
+    # 3) Both books must be present and fresh. If either is missing or stale,
+    # try to hydrate from CLOB REST before failing (WS may have dropped or never
+    # delivered the initial snapshot for this token).
     yes_book = state.poly_books.get(market.yes_token_id)
     no_book = state.poly_books.get(market.no_token_id)
+    needs_bootstrap = (
+        yes_book is None or no_book is None
+        or (now - yes_book.last_update_ts) > 30.0
+        or (now - no_book.last_update_ts) > 30.0
+    )
+    if needs_bootstrap:
+        _poly_bootstrap_active_market_books(state, market, now)
+        yes_book = state.poly_books.get(market.yes_token_id)
+        no_book = state.poly_books.get(market.no_token_id)
     if yes_book is None or no_book is None:
         return False, "no_book", 0.0, 0.0, 0.0
     book_age_max = max(now - yes_book.last_update_ts,
@@ -5326,10 +5299,6 @@ def _bs_should_enter(state: BotState, mdm: MultiDurationMarket,
         return False, "zero_ask", yes_ask, no_ask, 0.0
     # 5) Sum-ask gate (the core both-sides risk control)
     sum_ask = yes_ask + no_ask
-    if yes_ask < 0.49 or yes_ask > 0.51:
-        return False, f"yes_ask_out_of_50_50_zone:{yes_ask:.3f}", yes_ask, no_ask, sum_ask
-    if no_ask < 0.49 or no_ask > 0.51:
-        return False, f"no_ask_out_of_50_50_zone:{no_ask:.3f}", yes_ask, no_ask, sum_ask
     if sum_ask > _BS_SUM_ASK_MAX:
         return False, f"sum_ask_too_high:{sum_ask:.4f}", yes_ask, no_ask, sum_ask
     # 6) Sanity: each side must individually be within a reasonable price
@@ -6326,15 +6295,18 @@ def _bs_evaluate_late_conviction(
 
 def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
                             now: float) -> None:
-    """LEGACY INACTIVE PATH: BSS sequential entry evaluator.
-    Only invoked from bss_fast_tick_thread, which is never spawned because
-    _bs_bss_runtime_active() always returns False under the unified strategy.
+    """Run one tick of the BSS state machine for one market. Mutates
+    mdm.bss_* directly. Mirrors the structural pattern of
+    _bs_evaluate_verification_late but for ENTRY rather than SELL.
+    Only invoked when _BS_STRATEGY == 'bss_entry'.
 
-    Legacy states (unreachable in active runtime):
-      WATCH       → looking for first-leg sustain trigger
-      WAITING_2ND → first leg held; looking for second-leg sustain
-      BOTH        → both legs filled (BothSidesPosition created); done
-      ORPHAN_END  → window closed with leg 1 still held (no leg 2)
+    States:
+      WATCH         → looking for first-leg sustain trigger
+      WAITING_2ND   → first leg "filled"; looking for second-leg sustain
+      BOTH          → both legs filled (BothSidesPosition created); done
+                       handing off to existing resolution flow
+      ABORT         → second never confirmed; first leg sold at bid; done
+      RESOLVED      → terminal (only used internally for ABORT path)
     """
     market = mdm.market
 
@@ -6611,8 +6583,6 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
             _bs_log_bss_first_leg_event(state, mdm, now,
                                          yes_ask, no_ask, yes_bid, no_bid,
                                          sus_s=sus_s_at_fire)
-            if _entry_blocked_by_pause(state, "bss_leg1"):
-                return
             _bss_place_leg1(state, mdm, now,
                              fire_side=fire_side,
                              decision_ask=fire_price,
@@ -7279,9 +7249,13 @@ def _bss_place_leg2(state: BotState, mdm: MultiDurationMarket, now: float,
 def _bss_handle_window_end_orphan(state: BotState, mdm: MultiDurationMarket,
                                     now: float, yes_ask: float, no_ask: float,
                                     yes_bid: float, no_bid: float) -> None:
-    """LEGACY INACTIVE PATH: v6.5.0 orphan handler.
-    Only reachable from _bs_evaluate_bss_entry → bss_fast_tick_thread.
-    That thread is never spawned (_bs_bss_runtime_active() always False).
+    """v6.5.0: when market end_ts is reached and we're still in WAITING_2ND
+    (semantic: HALF), the held leg becomes an orphan. Build a BothSidesPosition
+    with the held leg + a zero-size empty leg so the resolution flow handles
+    payout naturally. CTF will pay $1/share to whoever holds the winning side.
+    
+    No sell, no flatten, no fake P&L. Just record the orphan event for
+    downstream analysis and let resolution take over.
     """
     if mdm.bss_leg1_orphan_end_logged:
         return  # already handled
@@ -7923,8 +7897,7 @@ def _bs_log_bss_hold_shadow_event(state: "BotState", mdm: "MultiDurationMarket",
 
 
 # ═══════════════════════════════════════════════════════════════════
-# LEGACY INACTIVE PATH: v6.5.4 SKULD: orphan-sell rule (positive-exit) + v6.5.5 TP
-# Unreachable under unified strategy (_bs_bss_runtime_active() always False).
+# v6.5.4 SKULD: orphan-sell rule (positive-exit) + v6.5.5 TP
 # ═══════════════════════════════════════════════════════════════════
 
 def _bs_is_book_locked(yes_ask: Optional[float], no_ask: Optional[float],
@@ -7999,11 +7972,30 @@ def _bs_evaluate_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
                               now: float,
                               yes_ask: float, no_ask: float,
                               yes_bid: float, no_bid: float) -> None:
-    """LEGACY INACTIVE PATH: v6.5.4/v6.5.5 orphan exit evaluator.
-    Only callable during WAITING_2ND (sequential-leg mode).
-    Unreachable under unified strategy (_bs_bss_runtime_active() always False).
+    """v6.5.4/v6.5.5: evaluate orphan exit rules on this shadow tick.
+
+    Two independent triggers can fire (whichever first):
+
+    (A) POSITIVE-EXIT (v6.5.4 defensive — BTC adverse, breakeven):
+        sell_pnl_now            >= _BS_BSS_ORPHAN_SELL_MIN_PNL
+        hold_elapsed_s          >= _BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S
+        bin_adverse_since_leg1  >= _BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS
+        for N consecutive shadow ticks → sell leg-1, lock in profit.
+
+    (B) TAKE-PROFIT (v6.5.5 opportunistic — bid up ratio×):
+        leg1_bid_now / leg1_entry >= _BS_BSS_ORPHAN_TP_RATIO
+        for M consecutive shadow ticks → sell leg-1, lock in gain.
+
+    Both rules NO-OP when their respective ENABLED flags are false.
+
+    v6.5.5.1 CASHOUT FIX: sell pnl uses `leg1_top_bid` directly (the
+    cashout proxy) rather than walking the bid book. Matches the May 1
+    "cashout style" agreement: "cashout always works — no liquidity
+    concerns". Polymarket curved fee formula (rate × p × (1-p)) is
+    applied as before. The book-walk simulator (`_bss_simulate_dry_sell`)
+    remains in the codebase for future LIVE-realism work but no longer
+    gates firing decisions.
     """
-    market = mdm.market
     if mdm.bss_state != "WAITING_2ND":
         return
     if not (_BS_BSS_ORPHAN_SELL_ENABLED or _BS_BSS_ORPHAN_TP_ENABLED):
@@ -8242,9 +8234,33 @@ def _bs_fire_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
                           yes_ask: float, no_ask: float,
                           yes_bid: float, no_bid: float,
                           tp_ratio: Optional[float] = None) -> None:
-    """LEGACY INACTIVE PATH: v6.5.5/v6.5.6 orphan-sell executor.
-    Only callable from _bs_evaluate_orphan_sell during WAITING_2ND.
-    Unreachable under unified strategy (_bs_bss_runtime_active() always False).
+    """v6.5.5/v6.5.6: execute the orphan-sell action.
+
+    v6.5.6: In LIVE mode, this now submits a REAL FAK sell order to the
+    Polymarket CLOB via `_bss_place_live_sell`. Three branches:
+
+      - filled_live  → actual full fill. Use ACTUAL fill price (not the
+                       snapshot caller passed in) for P&L. Update state
+                       to ORPHAN_SOLD, book P&L, log event.
+      - partial_live → some shares matched, less than full. Book P&L for
+                       sold portion proportionally, reduce mdm.bss_leg1_*
+                       to reflect remaining shares, transition state to
+                       ORPHAN_SOLD_PARTIAL. Remaining shares hold to
+                       resolution (no further orphan-sell attempts).
+      - rejected/error/no_client → don't change state, don't update P&L
+                       counter. Log BSS_ORPHAN_SELL_LIVE_FAIL. Position
+                       stays in WAITING_2ND. Band-sustain timestamps
+                       remain valid; rule may fire again next tick.
+
+    v6.5.4/v6.5.5: in DRY mode, no real order. Logs BSS_ORPHAN_SELL_DRY
+    (positive-exit) or BSS_ORPHAN_TP_DRY (take-profit) event, updates
+    dashboard P&L counter, records to trade history for dashboard
+    last-15-trades display, transitions state to terminal.
+
+    Caller passes (sell_avg_p, qty_sold, sell_fee, sell_pnl_now)
+    computed from the cashout convention as the DESIRED sale. In LIVE
+    these are inputs to the order; the actual fill may differ. In DRY
+    these become the recorded values directly.
     """
     leg1_side = mdm.bss_first_side
     market = mdm.market
@@ -9372,15 +9388,24 @@ def _bs_settle_position(state: BotState, pos: BothSidesPosition,
 def both_sides_tick(state: BotState) -> None:
     """Called from main_loop. No-op when STRATEGY_MODE=lag_signal.
     Otherwise: (a) attempt to enter both-sides on every 5m market in
-    (b) evaluate tiered sell-loser on every open paired position.
-        If sell-loser does not fire, both legs are held until settlement.
-    No orphan states. No WAITING_2ND. No half-position fallback.
+    the lead-time window we haven't entered before, and (b) evaluate
+    sell-loser preconditions on every open both-sides position.
+
+    v6.3.0: When _BS_STRATEGY == 'bss_entry', the entry path is REPLACED
+    by the BSS state-machine evaluator (which lazily creates positions
+    only when both legs sustain), and the sell-loser pass is suppressed
+    (BSS holds both legs to resolution; existing resolution flow handles
+    the payout).
     """
     if not _BS_ACTIVE:
         return
-    if not _bs_default_runtime_active():
-        return
     now = time.time()
+
+    # v6.3.2: BSS_ENTRY MODE — evaluation now runs in dedicated fast
+    # thread (bss_fast_tick_thread, 20Hz). main_loop's 1Hz pass for
+    # BSS would just duplicate work. Suppress entry + VL passes here.
+    if _BS_STRATEGY == "bss_entry":
+        return  # BSS handled by fast thread; nothing else to do
 
     # ── ENTRY PASS ──
     # Iterate over a snapshot so the discovery thread can mutate the dict
@@ -9389,8 +9414,26 @@ def both_sides_tick(state: BotState) -> None:
             should_enter, reason, yes_ask, no_ask, sum_ask = \
                 _bs_should_enter(state, mdm, now)
             if not should_enter:
-                # Most reasons aren't worth logging every tick (would spam).
-                # Only log on first encounter of a new market_id.
+                # Rate-limited block-reason logging: one line per (market, reason)
+                # per 30s, so the operator can see exactly why entry was refused.
+                cid = mdm.market.condition_id
+                bucket = getattr(state, "_bs_block_log_ts", None)
+                if bucket is None:
+                    bucket = {}
+                    state._bs_block_log_ts = bucket
+                key = (cid, reason.split(":")[0])
+                last = bucket.get(key, 0.0)
+                if now - last >= 30.0:
+                    yb = state.poly_books.get(mdm.market.yes_token_id)
+                    nb = state.poly_books.get(mdm.market.no_token_id)
+                    yb_age = (now - yb.last_update_ts) if yb else -1.0
+                    nb_age = (now - nb.last_update_ts) if nb else -1.0
+                    ttr = mdm.market.end_ts - now
+                    print(f"[bs_entry] BLOCK market={cid[:10]}… reason={reason} "
+                          f"ttr={ttr:.0f}s yes_age={yb_age:.0f}s no_age={nb_age:.0f}s "
+                          f"yes_ask={yes_ask:.3f} no_ask={no_ask:.3f} sum={sum_ask:.3f}",
+                          flush=True)
+                    bucket[key] = now
                 continue
             _bs_place_entry(state, mdm, yes_ask, no_ask, sum_ask)
         except Exception as e:
@@ -10541,9 +10584,6 @@ def boot() -> BotState:
         print(f"[boot]   pre_market_books: DISABLED in v6.4.0 (no pre-market)",
               flush=True)
 
-    # state.log_dir set and all loggers initialized; safe to init validation CSVs.
-    _ensure_validation_csvs(state)
-
     # v6.4.0 SKULD: config_snapshot_<boot_ts>.json
     # Dump every effective config value the bot is running with, once at boot.
     # Filename includes boot ts so multiple runs in the same day don't overwrite.
@@ -10609,7 +10649,6 @@ def boot() -> BotState:
             },
         }
         snapshot_path = log_dir / f"config_snapshot_{boot_ts_ms}.json"
-        os.makedirs(log_dir, exist_ok=True)
         snapshot_path.write_text(json.dumps(snapshot, indent=2, default=str))
         print(f"[boot] config snapshot → {snapshot_path}", flush=True)
     except Exception as e:
@@ -10721,7 +10760,15 @@ def _print_banner(state: BotState) -> None:
         f"  v6.2.5 log_retention: " + (
             f"{_LOG_RETENTION_DAYS} days (purges daily; today + yesterday "
             f"protected)" if _LOG_RETENTION_DAYS > 0 else "off"),
-        f"  v6.3.0 bss_entry: LEGACY INACTIVE PATH — _bs_bss_runtime_active() always False.",
+        f"  v6.3.0 bss_entry: " + (
+            f"ACTIVE  T_first={_BS_BSS_T_FIRST:.2f} "
+            f"sustain={_BS_BSS_SUSTAIN_FIRST_S:.0f}s, "
+            f"T_2nd={_BS_BSS_T_SECOND_STRICT:.2f}/{_BS_BSS_T_SECOND_RELAXED:.2f} "
+            f"sustain={_BS_BSS_SUSTAIN_SECOND_S:.0f}s, "
+            f"relax@{_BS_BSS_RELAX_AT_S:.0f}s abort@{_BS_BSS_ABORT_AT_S:.0f}s  "
+            f"★ BOTH-SIDES SEE-SAW ★"
+            if _BS_STRATEGY == "bss_entry" else
+            "inert (only active when BS_STRATEGY=bss_entry)"),
         f"  v6.3.1 btc_vel_filter: " + (
             f"ON  threshold={_BS_BSS_BTC_VEL_FILTER_PCT:.4f}% "
             f"lookback={_BS_BSS_BTC_VEL_LOOKBACK_S:.0f}s "
@@ -10867,13 +10914,52 @@ def _print_banner(state: BotState) -> None:
                 if _BS_BSS_LEG1_PATIENT_DROP > 0
                 else "OFF (BS_BSS_LEG1_PATIENT_DROP=0)"
             )
-            print(f"  *** DRY MODE — unified paired both-sides strategy active. "
-                  f"Entry: paired YES+NO in 49–51¢ zone (sum≤1.02). "
-                  f"Exit: tiered sell-loser ladder (T0≥0.96, T1≥0.90, T2≥0.87, T3≥0.80). "
-                  f"Fallback: keep both legs until settlement. "
-                  f"No orphan states. No sequential-leg runtime. No WAITING_2ND. "
-                  f"Legacy BSS/orphan code is present but gated inactive "
-                  f"(_bs_bss_runtime_active() always False). ***",
+            print(f"  *** DRY MODE v6.5.8 — per-leg placement, no abort, "
+                  f"book-walk={walk_status} (taker_fee={fee_status}). "
+                  f"v6.5.2 entry filter: {ttr_status}. "
+                  f"v6.5.3 Tier-1 logging: ring buffer + extra_json + "
+                  f"BSS_CANDIDATE_DRY (pre-entry feats: leg2 microstructure, "
+                  f"depth-delta, leg1 bid trajectory, latency, regime). "
+                  f"v6.5.3.1 hold-shadow: BSS_HOLD_SHADOW_DRY at "
+                  f"{shadow_status} — raw state per tick. "
+                  f"v6.5.3.2 dashboard: Speranța hero header — Toate Pânzele Sus. "
+                  f"v6.5.4 orphan-sell (positive-exit): {orphan_sell_status}. "
+                  f"v6.5.4 dashboard P&L: fees in counter. "
+                  f"v6.5.4 cleanup: GET /api/cleanup?confirm=true. "
+                  f"v6.5.5 take-profit (TP): {tp_status}. "
+                  f"v6.5.5 fee formula: corrected to Polymarket curved. "
+                  f"v6.5.5.1 CASHOUT FIX: orphan-sell uses leg1_bid_now (cashout), "
+                  f"no longer gated on book-walk. "
+                  f"v6.5.5.2 LOCKED-SPREAD REJECT: skip ticks where "
+                  f"yes_ask==yes_bid or no_ask==no_bid (ghost snapshots). "
+                  f"v6.5.5.2 BAND-SUSTAIN: orphan-sell uses time-based "
+                  f"sustain ({_BS_BSS_ORPHAN_SELL_SUSTAIN_S:.0f}s with "
+                  f"{_BS_BSS_ORPHAN_SELL_GRACE_S:.0f}s wobble grace), "
+                  f"TP uses {_BS_BSS_ORPHAN_TP_SUSTAIN_S:.0f}s sustain / "
+                  f"{_BS_BSS_ORPHAN_TP_GRACE_S:.0f}s grace. "
+                  f"v6.5.5.2 phase visibility: floor/strict tagged in CSV. "
+                  f"v6.5.5.3 HOTFIX: resolution gate runs BEFORE locked-"
+                  f"spread reject (fixes v6.5.5.2 silent-drop of natural orphans). "
+                  f"v6.5.5.3 dashboard in-flight indicator: WAITING_2ND positions "
+                  f"show orphan-sell sustain progress + would-sell pnl. "
+                  f"v6.5.6 LIVE SELL: orphan-sell now submits real FAK orders "
+                  f"in LIVE mode via _bss_place_live_sell (no GTC fallback). "
+                  f"Partial fills → ORPHAN_SOLD_PARTIAL (proportional P&L, "
+                  f"remaining qty held to resolution). Rejected/error → "
+                  f"BSS_ORPHAN_SELL_LIVE_FAIL logged, state stays WAITING_2ND, "
+                  f"retry next tick. DRY behavior unchanged. "
+                  f"v6.5.6.1 HOTFIX: fixed PolyBook-as-price crash in dashboard. "
+                  f"v6.5.7 reverse-sniper cashout (Rule C): {rs_status}. "
+                  f"Fires when winner_ask>={_BS_BSS_ORPHAN_RS_WINNER_THRESHOLD:.2f} "
+                  f"AND ttr<={_BS_BSS_ORPHAN_RS_TTR_MAX_S:.0f}s; sells losing orphan "
+                  f"leg at cashout bid (~$0.27 avg recovery vs full -$1.02 loss). "
+                  f"reason=reverse_sniper in CSV. "
+                  f"v6.5.8 leg1-patience: {leg1_pat_status}. "
+                  f"Holds leg1 fire when same-side ask still falling fast — "
+                  f"yields deeper entry (avg 11c better in 43pct of paired trades), "
+                  f"more shares, better wins, smaller orphan RS losses. "
+                  f"FIRST_LEG_PATIENT logged when held. "
+                  f"v6.5.5 dashboard: last-15 trades with ORPHAN_SOLD render. ***",
                   flush=True)
         # Note v6.4.0 deleted env vars if user still has them set
         deleted_set = [v for v in (
@@ -10917,11 +11003,17 @@ def start_feed_threads(state: BotState) -> None:
     # when active to keep the thread list visibly minimal in lag_signal mode.
     if _BS_ACTIVE:
         threads.append(("bs_disc", both_sides_discovery_thread))
-    # BSS fast-tick and gamma threads: _bs_bss_runtime_active() always returns
-    # False under the unified strategy. These threads are never spawned.
-    if _bs_bss_runtime_active():
+    # v6.3.2: BSS fast-tick thread (20Hz default). Only spawned when
+    # bss_entry strategy is active.
+    if _BS_ACTIVE and _BS_STRATEGY == "bss_entry":
         threads.append(("bss_fast", bss_fast_tick_thread))
-    if _bs_bss_runtime_active():
+    # v6.3.11: Gamma REST polling thread. Replaces v6.3.10's ws_refresh hack.
+    # Polls Polymarket Gamma /markets endpoint every 2.5s for each BSS-watched
+    # market and updates state.poly_books with fresh prices. This is the
+    # proven pattern from scalper3 (April 2026) which went live successfully —
+    # Polymarket WS drops on Railway and silently degrades for non-active
+    # markets, so REST is the reliable path.
+    if _BS_ACTIVE and _BS_STRATEGY == "bss_entry":
         threads.append(("bss_gamma_poll", bss_gamma_poll_thread))
     # v6.2.5: log-retention purger thread (no-op when LOG_RETENTION_DAYS=0).
     # Always added — the thread itself early-exits if retention is disabled.
@@ -11002,7 +11094,44 @@ def _format_heartbeat(state: BotState) -> str:
     else:
         market = "market=NONE"
 
-    books = f"books={len(state.poly_books)}"
+    # Active-market book health: report YES/NO presence + freshness for the
+    # 5m market(s) currently in the lead-time window, not the entire cache.
+    # Under unified paired strategy this is what actually gates entry.
+    active_books_n = 0
+    active_books_total = 0
+    if _BS_ACTIVE:
+        for mdm in list(state.bs_5m_in_window.values()):
+            ttr = mdm.market.end_ts - now
+            if ttr < _BS_LEAD_MIN_S or ttr > _BS_LEAD_MAX_S:
+                continue
+            active_books_total += 2
+            yb = state.poly_books.get(mdm.market.yes_token_id)
+            nb = state.poly_books.get(mdm.market.no_token_id)
+            if yb is not None and (now - yb.last_update_ts) <= 30.0:
+                active_books_n += 1
+            if nb is not None and (now - nb.last_update_ts) <= 30.0:
+                active_books_n += 1
+        if active_books_total == 0:
+            # No market in window — fall back to legacy 5m market check.
+            if state.btc_5m_market is not None:
+                active_books_total = 2
+                yb = state.poly_books.get(state.btc_5m_market.yes_token_id)
+                nb = state.poly_books.get(state.btc_5m_market.no_token_id)
+                if yb is not None and (now - yb.last_update_ts) <= 30.0:
+                    active_books_n += 1
+                if nb is not None and (now - nb.last_update_ts) <= 30.0:
+                    active_books_n += 1
+        books = f"books={active_books_n}/{max(active_books_total, 2)}"
+    else:
+        active_books_total = 2 if state.btc_5m_market else 0
+        if state.btc_5m_market:
+            yb = state.poly_books.get(state.btc_5m_market.yes_token_id)
+            nb = state.poly_books.get(state.btc_5m_market.no_token_id)
+            if yb is not None and (now - yb.last_update_ts) <= 30.0:
+                active_books_n += 1
+            if nb is not None and (now - nb.last_update_ts) <= 30.0:
+                active_books_n += 1
+        books = f"books={active_books_n}/{max(active_books_total, 2)}"
     pos = "OPEN" if state.open_position else "NONE"
 
     if state.live_delta_pct is None:
