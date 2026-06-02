@@ -997,6 +997,21 @@ class BothSidesPosition:
     # logged in journal; data needed before refactoring sampling rate).
     vl_armed_ts: float = 0.0
     vl_peak_update_count: int = 0
+    # SPARKLINE: live (t_rel_s, yes_bid, no_bid) samples taken during the
+    # life of the position. Used by the dashboard to draw a live sparkline
+    # on each open position. Sampled approximately every 3s (rate-limited
+    # by last_live_sample_ts below), capped at 120 entries (~6min coverage,
+    # enough for a 5min market lifetime).
+    live_bid_history: List[Tuple[float, float, float]] = field(default_factory=list)
+    last_live_sample_ts: float = 0.0
+    # SOLD-LEG MARKER: stamped at the moment sell-loser fires, so the
+    # dashboard can draw a vertical line on the sparkline where the sell
+    # happened. All zero / empty means sell-loser hasn't fired yet.
+    sold_at_ts: float = 0.0
+    sold_side: str = ""              # '' | 'YES' | 'NO'
+    sold_price: float = 0.0
+    sold_ttr_s: float = 0.0          # TTR at the moment of sell
+    sold_reason: str = ""            # fire_source ('prod' / 'btc_late' / etc.)
 
 
 @dataclass
@@ -2588,6 +2603,45 @@ if(bssActive){
   return;
 }
 if(!positions.length){list.innerHTML='<div class="bs-empty">no open both-sides positions</div>';return;}
+// SPARKLINE: renders a 320x44 SVG of the YES (green) and NO (red) bid
+// trajectories. If sell-loser has fired, draws a vertical dashed marker
+// at sold_ttr_s elapsed seconds and a small dot at that y-value.
+function renderLiveSparkline(p){
+  const h=(p.live_bid_history||[]);
+  if(h.length<2){return '<div style="height:44px;"></div>';}
+  const W=320, H=44, padX=4, padY=4;
+  const ts=h.map(s=>s[0]);
+  const tMin=ts[0], tMax=ts[ts.length-1];
+  const tRange=Math.max(1,tMax-tMin);
+  const yMin=0, yMax=1;
+  const xOf=t=>padX+((t-tMin)/tRange)*(W-2*padX);
+  const yOf=v=>padY+(1-(v-yMin)/(yMax-yMin))*(H-2*padY);
+  const yesPath=h.map((s,i)=>`${i?'L':'M'}${xOf(s[0]).toFixed(1)},${yOf(s[1]).toFixed(1)}`).join('');
+  const noPath =h.map((s,i)=>`${i?'L':'M'}${xOf(s[0]).toFixed(1)},${yOf(s[2]).toFixed(1)}`).join('');
+  const ref50y=yOf(0.5).toFixed(1);
+  let marker='';
+  if(p.sold_at_ts&&p.sold_side){
+    // sold_ttr_s is TTR remaining at moment of sale; t_rel of sale = tMax - sold_ttr_s only approximate
+    // better: compute t_rel from sold_at_ts - entry_ts; since we don't have entry_ts as t_rel=0, use the last sample as proxy
+    // We have a tighter relation: sold_at_ts is wall-clock; but we kept t_rel relative to entry_ts in the buffer.
+    // tMax = (sold_at_ts - entry_ts) approximately, since last sample is near-current. So tSold ≈ tMax.
+    // For better accuracy when buffer continues past sell, compute tSold = (sold_at_ts - entry_ts).
+    // We have sold_at_ts but not entry_ts here. Use tMax as approximation.
+    const tSold=tMax;
+    const xSold=xOf(tSold).toFixed(1);
+    const sCol=p.sold_side==='YES'?'#d96666':'#5cbd5c';
+    const ySold=yOf(p.sold_price||0).toFixed(1);
+    marker=`<line x1="${xSold}" y1="${padY}" x2="${xSold}" y2="${H-padY}" stroke="#888" stroke-width="1" stroke-dasharray="2,2" opacity="0.7"/>`
+      +`<circle cx="${xSold}" cy="${ySold}" r="3" fill="${sCol}"/>`;
+  }
+  return `<div style="margin-top:8px;height:44px;">`
+    +`<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="display:block;">`
+    +`<line x1="${padX}" y1="${ref50y}" x2="${W-padX}" y2="${ref50y}" stroke="#444" stroke-width="0.5" stroke-dasharray="2,3"/>`
+    +`<path d="${yesPath}" fill="none" stroke="#5cbd5c" stroke-width="1.5"/>`
+    +`<path d="${noPath}"  fill="none" stroke="#d96666" stroke-width="1.5"/>`
+    +marker
+    +`</svg></div>`;
+}
 list.innerHTML=positions.map(p=>{
   const ttrStr=fmtCountdown(p.ttr_s);
   const yes=p.yes_leg||{};const no=p.no_leg||{};
@@ -2630,7 +2684,9 @@ list.innerHTML=positions.map(p=>{
     +`<div class="bs-leg-row"><span class="bs-leg-key">${no.closed?'close':'mark'}</span><span>${(no.closed?no.close_price:no.current_bid||0).toFixed(4)}</span></div>`
     +`<div class="bs-leg-row"><span class="bs-leg-key">P&L</span><span class="bs-leg-pnl ${nCls}">${nPnl>=0?'+$':'-$'}${Math.abs(nPnl||0).toFixed(4)}</span></div>`
     +`</div>`
-    +`</div></div>`;
+    +`</div>`
+    +renderLiveSparkline(p)
+    +`</div>`;
 }).join('');
 }
 tick();setInterval(tick,1000);
@@ -2770,6 +2826,14 @@ def _build_status_payload(state: BotState) -> dict:
             "pending_age_s": (round(now - pos.pending_since, 1)
                                 if pos.pending_since > 0 else 0.0),
             "pending_attempts": pos.pending_attempts,
+            # SPARKLINE: live (t_rel_s, yes_bid, no_bid) samples; capped 120
+            "live_bid_history": list(pos.live_bid_history),
+            # SOLD-LEG MARKER: empty until sell-loser fires; then non-zero
+            "sold_at_ts": pos.sold_at_ts,
+            "sold_side": pos.sold_side,
+            "sold_price": pos.sold_price,
+            "sold_ttr_s": pos.sold_ttr_s,
+            "sold_reason": pos.sold_reason,
         })
     # Sort by TTR ascending (closest to resolution first — most actionable)
     bs_open_positions.sort(key=lambda x: x["ttr_s"])
@@ -6096,6 +6160,16 @@ def both_sides_tick(state: BotState) -> None:
                     if not pos.no_leg.closed and no_bid_now > pos.no_leg.peak_bid:
                         pos.no_leg.peak_bid = no_bid_now
                         pos.no_leg.peak_bid_ts = now
+                    # SPARKLINE: take a (t_rel, yes_bid, no_bid) sample at
+                    # most once per ~3s. Capped at 120 entries (~6min of
+                    # coverage, more than enough for a 5min market).
+                    if (now - pos.last_live_sample_ts) >= 3.0:
+                        t_rel = now - pos.entry_ts
+                        pos.live_bid_history.append(
+                            (round(t_rel, 1), yes_bid_now, no_bid_now))
+                        if len(pos.live_bid_history) > 120:
+                            pos.live_bid_history.pop(0)
+                        pos.last_live_sample_ts = now
         try:
             # v6.2.2: BS_STRATEGY selects which sell-loser logic is active.
             # In "verification_late" mode, ALL v6.2.1 paths are bypassed and
@@ -6122,6 +6196,12 @@ def both_sides_tick(state: BotState) -> None:
                     _bs_close_leg(pos.yes_leg, loser_bid, now, "sell_loser")
                     state.bs_total_sold_loser += 1
                     state.bs_pnl_today_usdc += pos.yes_leg.pnl_usdc
+                    # SPARKLINE: stamp sold-side metadata for dashboard marker
+                    pos.sold_at_ts = now
+                    pos.sold_side = "YES"
+                    pos.sold_price = float(loser_bid)
+                    pos.sold_ttr_s = float(pos.end_ts - now)
+                    pos.sold_reason = fire_source
                     _bs_log_trade_event(state, "SELL_LOSER_DRY", pos, pos.yes_leg,
                         note=f"winner_ask={winner_ask:.3f},loser_bid={loser_bid:.3f},{diag}")
                     print(f"[bs_sell] market={pos.market_id[:10]}… loser=YES "
@@ -6131,6 +6211,12 @@ def both_sides_tick(state: BotState) -> None:
                     _bs_close_leg(pos.no_leg, loser_bid, now, "sell_loser")
                     state.bs_total_sold_loser += 1
                     state.bs_pnl_today_usdc += pos.no_leg.pnl_usdc
+                    # SPARKLINE: stamp sold-side metadata for dashboard marker
+                    pos.sold_at_ts = now
+                    pos.sold_side = "NO"
+                    pos.sold_price = float(loser_bid)
+                    pos.sold_ttr_s = float(pos.end_ts - now)
+                    pos.sold_reason = fire_source
                     _bs_log_trade_event(state, "SELL_LOSER_DRY", pos, pos.no_leg,
                         note=f"winner_ask={winner_ask:.3f},loser_bid={loser_bid:.3f},{diag}")
                     print(f"[bs_sell] market={pos.market_id[:10]}… loser=NO "
@@ -6201,6 +6287,12 @@ def both_sides_tick(state: BotState) -> None:
                 _bs_close_leg(pos.yes_leg, loser_bid, now, "sell_loser")
                 state.bs_total_sold_loser += 1
                 state.bs_pnl_today_usdc += pos.yes_leg.pnl_usdc
+                # SPARKLINE: stamp sold-side metadata for dashboard marker
+                pos.sold_at_ts = now
+                pos.sold_side = "YES"
+                pos.sold_price = float(loser_bid)
+                pos.sold_ttr_s = float(pos.end_ts - now)
+                pos.sold_reason = fire_source
                 _bs_log_trade_event(
                     state, "SELL_LOSER_DRY", pos, pos.yes_leg,
                     note=f"winner_ask={winner_ask:.3f},loser_bid={loser_bid:.3f},{diag}",
@@ -6215,6 +6307,12 @@ def both_sides_tick(state: BotState) -> None:
                 _bs_close_leg(pos.no_leg, loser_bid, now, "sell_loser")
                 state.bs_total_sold_loser += 1
                 state.bs_pnl_today_usdc += pos.no_leg.pnl_usdc
+                # SPARKLINE: stamp sold-side metadata for dashboard marker
+                pos.sold_at_ts = now
+                pos.sold_side = "NO"
+                pos.sold_price = float(loser_bid)
+                pos.sold_ttr_s = float(pos.end_ts - now)
+                pos.sold_reason = fire_source
                 _bs_log_trade_event(
                     state, "SELL_LOSER_DRY", pos, pos.no_leg,
                     note=f"winner_ask={winner_ask:.3f},loser_bid={loser_bid:.3f},{diag}",
