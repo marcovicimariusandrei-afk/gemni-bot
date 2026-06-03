@@ -153,7 +153,64 @@ _SIGNAL_INVERT = os.environ.get("SIGNAL_INVERT", "false").strip().lower() in ("1
 # v5.7.0: single source of truth for the bot's version string. Used in the
 # boot banner, /api/status payload, and dashboard header so all three stay
 # in sync. Bump this on every release.
-BOT_VERSION = "6.3.12"
+BOT_VERSION = "6.3.13-tier"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v6.5.11 TIERED EXIT LADDER — ported onto the v6.3.12 base.
+# Replaces the single-threshold sell-loser (winner≥0.93) with a four-tier
+# ladder gated on TTR + winner_ask + swing/dip/sustain guards. Backtested
+# on TPS signal_log (~221 markets) to ~5.9 catastrophes/100 (vs ~19/100
+# unguarded). When _BS_TIER_ENABLED is True (default), the tiered evaluator
+# runs and the BTC late-fallback + late-conviction paths are skipped (the
+# ladder's lower tiers handle held-both via pure numbers). Flip
+# BS_TIER_ENABLED=false to restore the v621 stack — no redeploy.
+# Self-contained parsing (the _f/_s/_b helpers aren't defined yet here).
+# ═══════════════════════════════════════════════════════════════════
+def _tier_env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _tier_env_float(name: str, default: float, lo: float, hi: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        print(f"[boot][v6.5.11] warning: {name}={raw!r} not parseable; "
+              f"using default {default}", flush=True)
+        return default
+    if v < lo or v > hi:
+        print(f"[boot][v6.5.11] warning: {name}={v} outside [{lo},{hi}]; "
+              f"clamping", flush=True)
+        v = max(lo, min(hi, v))
+    return v
+
+
+_BS_TIER_ENABLED           = _tier_env_bool("BS_TIER_ENABLED", True)
+_BS_TIER_T0_WINNER         = _tier_env_float("BS_TIER_T0_WINNER", 0.96, 0.50, 1.00)
+_BS_TIER_T1_TTR            = _tier_env_float("BS_TIER_T1_TTR", 120.0, 0.0, 300.0)
+_BS_TIER_T1_WINNER         = _tier_env_float("BS_TIER_T1_WINNER", 0.90, 0.50, 1.00)
+_BS_TIER_T2_TTR            = _tier_env_float("BS_TIER_T2_TTR", 60.0, 0.0, 300.0)
+_BS_TIER_T2_WINNER         = _tier_env_float("BS_TIER_T2_WINNER", 0.87, 0.50, 1.00)
+_BS_TIER_T3_TTR            = _tier_env_float("BS_TIER_T3_TTR", 30.0, 0.0, 300.0)
+_BS_TIER_T3_WINNER         = _tier_env_float("BS_TIER_T3_WINNER", 0.80, 0.50, 1.00)
+_BS_TIER_PERSIST_S         = _tier_env_float("BS_TIER_PERSIST_S", 5.0, 0.0, 60.0)
+_BS_TIER_T0_MAX_TTR        = _tier_env_float("BS_TIER_T0_MAX_TTR", 200.0, 0.0, 300.0)
+_BS_TIER_T0_SUSTAIN_THRESH = _tier_env_float("BS_TIER_T0_SUSTAIN_THRESH", 0.94, 0.50, 1.00)
+_BS_TIER_T0_SUSTAIN_S      = _tier_env_float("BS_TIER_T0_SUSTAIN_S", 30.0, 0.0, 120.0)
+_BS_TIER_SWING_WINDOW_S    = _tier_env_float("BS_TIER_SWING_WINDOW_S", 30.0, 0.0, 120.0)
+_BS_TIER_SWING_DRAWDOWN    = _tier_env_float("BS_TIER_SWING_DRAWDOWN", 0.05, 0.0, 0.50)
+_BS_TIER_SWING_BOUNCE      = _tier_env_float("BS_TIER_SWING_BOUNCE", 0.02, 0.0, 0.50)
+_BS_TIER_DIP_WINDOW_S      = _tier_env_float("BS_TIER_DIP_WINDOW_S", 60.0, 0.0, 120.0)
+_BS_TIER_DIP_FLOOR         = _tier_env_float("BS_TIER_DIP_FLOOR", 0.65, 0.0, 1.00)
+# Derived: how much ask-history to retain (covers the widest guard window).
+_BS_TIER_HISTORY_MAX_S = max(_BS_TIER_SWING_WINDOW_S, _BS_TIER_DIP_WINDOW_S,
+                             _BS_TIER_T0_SUSTAIN_S, _BS_TIER_PERSIST_S) + 5.0
 
 
 # v5.6.0: depth + flow observability constants. All used only by new
@@ -964,6 +1021,10 @@ class BothSidesPosition:
     # pending >= 600s as STUCK so the user can investigate.
     pending_since: float = 0.0          # 0 = not pending; else first-pending ts
     pending_attempts: int = 0           # diagnostic counter
+    # v6.5.11 tiered exit ladder state
+    tier_ask_history: List[Tuple[float, float, float]] = field(default_factory=list)
+    fire_tier: str = ""                 # set to T0/T1/T2/T3 when the ladder fires
+    tier_last_eval_status: str = "preconditions_pending"
     last_gamma_fetch_ts: float = 0.0    # throttle Gamma API to 30s/market
     last_pending_log_ts: float = 0.0    # throttle pending log lines
     # v6.1.7: tracks the first time winner_ask crossed _BS_SELL_THRESH for
@@ -3008,6 +3069,14 @@ def _build_status_payload(state: BotState) -> dict:
             "sell_ttr_floor_s": _BS_SELL_TTR_FLOOR_S,
             "sell_persist_s": _BS_SELL_PERSIST_S,
             "sell_min_loser_bid": _BS_SELL_MIN_BID,
+            "tier_enabled": _BS_TIER_ENABLED,
+            "tier_ladder": (
+                f"T0(any,≥{_BS_TIER_T0_WINNER:.2f},strict) "
+                f"T1(≤{_BS_TIER_T1_TTR:.0f}s,≥{_BS_TIER_T1_WINNER:.2f}) "
+                f"T2(≤{_BS_TIER_T2_TTR:.0f}s,≥{_BS_TIER_T2_WINNER:.2f}) "
+                f"T3(≤{_BS_TIER_T3_TTR:.0f}s,≥{_BS_TIER_T3_WINNER:.2f}) "
+                f"persist={_BS_TIER_PERSIST_S:.0f}s"
+            ) if _BS_TIER_ENABLED else "disabled (legacy v621 active)",
             "log_15m_prefix": _LOG_15M_PREFIX,
             "log_60m_prefix": _LOG_60M_PREFIX,
             "log_window_min_s": _LOG_WINDOW_MIN_S,
@@ -4577,7 +4646,172 @@ def _bs_compute_sell_loser_diagnostics(state: BotState, pos: BothSidesPosition,
     return ",".join(parts)
 
 
+# ───────────────────────────────────────────────────────────────────────
+# v6.5.11 — TIERED EXIT LADDER helpers (verbatim from test_tier_v6_5_11.py)
+# ───────────────────────────────────────────────────────────────────────
+def _bs_tier_match(ttr, winner_ask):
+    if ttr <= _BS_TIER_T3_TTR and winner_ask >= _BS_TIER_T3_WINNER:
+        return "T3", _BS_TIER_T3_WINNER
+    if ttr <= _BS_TIER_T2_TTR and winner_ask >= _BS_TIER_T2_WINNER:
+        return "T2", _BS_TIER_T2_WINNER
+    if ttr <= _BS_TIER_T1_TTR and winner_ask >= _BS_TIER_T1_WINNER:
+        return "T1", _BS_TIER_T1_WINNER
+    if winner_ask >= _BS_TIER_T0_WINNER:
+        return "T0", _BS_TIER_T0_WINNER
+    return None, None
+
+
+def _bs_tier_detect_swing(history, winner_side, now):
+    cutoff = now - _BS_TIER_SWING_WINDOW_S
+    window = [t for t in history if t[0] >= cutoff]
+    if len(window) < 3:
+        return False
+    asks = [w[1] if winner_side == "YES" else w[2] for w in window]
+    peak_idx = max(range(len(asks)), key=lambda i: asks[i])
+    if peak_idx >= len(asks) - 1:
+        return False
+    after_peak = asks[peak_idx:]
+    trough_off = min(range(len(after_peak)), key=lambda i: after_peak[i])
+    if trough_off >= len(after_peak) - 1:
+        return False
+    recovery = max(after_peak[trough_off:])
+    drawdown = asks[peak_idx] - after_peak[trough_off]
+    bounce = recovery - after_peak[trough_off]
+    return drawdown >= _BS_TIER_SWING_DRAWDOWN and bounce >= _BS_TIER_SWING_BOUNCE
+
+
+def _bs_tier_no_dip(history, winner_side, now):
+    cutoff = now - _BS_TIER_DIP_WINDOW_S
+    window = [t for t in history if t[0] >= cutoff]
+    if not window:
+        return True
+    asks = [w[1] if winner_side == "YES" else w[2] for w in window]
+    return min(asks) >= _BS_TIER_DIP_FLOOR
+
+
+def _bs_tier_sustained_above(history, winner_side, threshold, sustain_s, now):
+    if sustain_s <= 0:
+        return True
+    asks_ts = sorted(
+        ((t[0], t[1] if winner_side == "YES" else t[2]) for t in history),
+        key=lambda x: x[0],
+    )
+    if not asks_ts:
+        return False
+    for ts, ask in reversed(asks_ts):
+        if ask < threshold:
+            return (now - ts) >= sustain_s
+    return (now - asks_ts[0][0]) >= sustain_s
+
+
+def _bs_evaluate_sell_loser_tiered(
+        state: BotState, pos: BothSidesPosition,
+        now: float) -> Tuple[bool, str, str, float, float]:
+    """v6.5.11 tiered exit ladder. Same return contract as the legacy
+    evaluator: (should_sell, reason, loser_side, loser_bid, winner_ask).
+
+    Ladder (most-specific TTR window wins):
+      T0  any TTR, winner_ask≥0.96, TTR≤200s, sustained≥0.94 for 30s,
+          AND-guard (no_swing AND no_dip)
+      T1  TTR≤120s, winner_ask≥0.90, OR-guard (no_swing OR no_dip)
+      T2  TTR≤60s,  winner_ask≥0.87, OR-guard
+      T3  TTR≤30s,  winner_ask≥0.80, OR-guard
+    Cross-tier: winner_ask must hold ≥ tier_threshold for BS_TIER_PERSIST_S.
+    """
+    ttr = pos.end_ts - now
+    if ttr < 0.0:
+        pos.tier_last_eval_status = f"ttr_negative:{ttr:.0f}s"
+        return False, pos.tier_last_eval_status, "", 0.0, 0.0
+
+    yes_book = state.poly_books.get(pos.yes_leg.token_id)
+    no_book = state.poly_books.get(pos.no_leg.token_id)
+    if yes_book is None or no_book is None:
+        pos.tier_last_eval_status = "no_book"
+        return False, "no_book", "", 0.0, 0.0
+
+    book_age_max = max(now - yes_book.last_update_ts,
+                       now - no_book.last_update_ts)
+    if book_age_max > 30.0:
+        pos.tier_last_eval_status = f"book_stale:{book_age_max:.0f}s"
+        return False, pos.tier_last_eval_status, "", 0.0, 0.0
+
+    yes_ask = float(yes_book.ask)
+    no_ask = float(no_book.ask)
+    yes_bid = float(yes_book.bid)
+    no_bid = float(no_book.bid)
+
+    # Maintain winner-ask history for the guards; trim to the widest window.
+    pos.tier_ask_history.append((now, yes_ask, no_ask))
+    cutoff = now - _BS_TIER_HISTORY_MAX_S
+    if pos.tier_ask_history and pos.tier_ask_history[0][0] < cutoff:
+        pos.tier_ask_history = [t for t in pos.tier_ask_history if t[0] >= cutoff]
+
+    # Winner = side with HIGHER ask (same identification as legacy).
+    if yes_ask >= no_ask and yes_ask > 0:
+        winner_side = "YES"; winner_ask = yes_ask
+        loser_side = "NO";   loser_bid = no_bid
+    elif no_ask > 0:
+        winner_side = "NO";  winner_ask = no_ask
+        loser_side = "YES";  loser_bid = yes_bid
+    else:
+        pos.tier_last_eval_status = "both_asks_zero"
+        return False, "both_asks_zero", "", 0.0, 0.0
+
+    tier_label, tier_thresh = _bs_tier_match(ttr, winner_ask)
+    if tier_label is None:
+        pos.tier_last_eval_status = f"no_tier:ttr={ttr:.0f}s,wa={winner_ask:.3f}"
+        return False, pos.tier_last_eval_status, loser_side, loser_bid, winner_ask
+
+    # Need a real bid to sell into (don't dump at $0).
+    if loser_bid <= 0.0:
+        pos.tier_last_eval_status = f"loser_bid_zero:{loser_bid:.3f}"
+        return False, pos.tier_last_eval_status, loser_side, loser_bid, winner_ask
+
+    # Cross-tier persistence at the matched tier's threshold.
+    if not _bs_tier_sustained_above(pos.tier_ask_history, winner_side,
+                                    tier_thresh, _BS_TIER_PERSIST_S, now):
+        pos.tier_last_eval_status = f"{tier_label}_persist_pending"
+        return False, pos.tier_last_eval_status, loser_side, loser_bid, winner_ask
+
+    no_swing = not _bs_tier_detect_swing(pos.tier_ask_history, winner_side, now)
+    no_dip = _bs_tier_no_dip(pos.tier_ask_history, winner_side, now)
+
+    if tier_label == "T0":
+        if ttr > _BS_TIER_T0_MAX_TTR:
+            pos.tier_last_eval_status = f"T0_ttr_over_max:{ttr:.0f}s"
+            return False, pos.tier_last_eval_status, loser_side, loser_bid, winner_ask
+        if not _bs_tier_sustained_above(pos.tier_ask_history, winner_side,
+                                        _BS_TIER_T0_SUSTAIN_THRESH,
+                                        _BS_TIER_T0_SUSTAIN_S, now):
+            pos.tier_last_eval_status = "T0_sustain_pending"
+            return False, pos.tier_last_eval_status, loser_side, loser_bid, winner_ask
+        if not (no_swing and no_dip):  # T0 AND-guard
+            pos.tier_last_eval_status = (f"T0_guard_block:swing={not no_swing},"
+                                         f"dip={not no_dip}")
+            return False, pos.tier_last_eval_status, loser_side, loser_bid, winner_ask
+    else:
+        if not (no_swing or no_dip):  # T1/T2/T3 OR-guard
+            pos.tier_last_eval_status = (f"{tier_label}_guard_block:swing={not no_swing},"
+                                         f"dip={not no_dip}")
+            return False, pos.tier_last_eval_status, loser_side, loser_bid, winner_ask
+
+    pos.identified_loser_side = loser_side
+    pos.fire_tier = tier_label
+    reason = f"fire_{tier_label}_LADDER:wa={winner_ask:.3f},ttr={ttr:.0f}s"
+    pos.tier_last_eval_status = reason
+    return True, reason, loser_side, loser_bid, winner_ask
+
+
 def _bs_evaluate_sell_loser(state: BotState, pos: BothSidesPosition,
+                            now: float) -> Tuple[bool, str, str, float, float]:
+    """v6.5.11 dispatcher: tiered ladder (default) or legacy v6.2.x evaluator.
+    Routes on _BS_TIER_ENABLED so rollback is a single env flip, no redeploy."""
+    if _BS_TIER_ENABLED:
+        return _bs_evaluate_sell_loser_tiered(state, pos, now)
+    return _bs_evaluate_sell_loser_legacy(state, pos, now)
+
+
+def _bs_evaluate_sell_loser_legacy(state: BotState, pos: BothSidesPosition,
                               now: float) -> Tuple[bool, str, str, float, float]:
     """Check the four sell-loser preconditions. Returns:
         (should_sell, reason, loser_side, loser_bid, winner_ask)
@@ -6233,7 +6467,8 @@ def both_sides_tick(state: BotState) -> None:
             # is closed yet, check the BTC-fundamentals fallback. Catches
             # held-both markets with sharp final-minute BTC moves that the
             # book never reflected at the 0.93 threshold.
-            if (not should_sell
+            if (not _BS_TIER_ENABLED
+                    and not should_sell
                     and not pos.yes_leg.closed
                     and not pos.no_leg.closed):
                 btc_fire, btc_reason, btc_loser_side, btc_loser_bid, btc_winner_ask = \
@@ -6253,7 +6488,8 @@ def both_sides_tick(state: BotState) -> None:
             # bypasses the standard $30 BTC guard at very late TTR with
             # overwhelming book conviction. Captures held-both markets where
             # main guard is too conservative.
-            if (not should_sell
+            if (not _BS_TIER_ENABLED
+                    and not should_sell
                     and not pos.yes_leg.closed
                     and not pos.no_leg.closed):
                 lc_fire, lc_reason, lc_loser_side, lc_loser_bid, lc_winner_ask = \
@@ -7100,6 +7336,22 @@ def boot() -> BotState:
     print("[boot] Initializing CLOB client...", flush=True)
     clob = init_clob_client(cfg)
     print("[boot] CLOB client: OK", flush=True)
+
+    if _BS_TIER_ENABLED:
+        print(f"[boot][v6.5.11] *** TIER LADDER ACTIVE *** "
+              f"T0(any TTR,≥{_BS_TIER_T0_WINNER:.2f},strict) "
+              f"T1(≤{_BS_TIER_T1_TTR:.0f}s,≥{_BS_TIER_T1_WINNER:.2f}) "
+              f"T2(≤{_BS_TIER_T2_TTR:.0f}s,≥{_BS_TIER_T2_WINNER:.2f}) "
+              f"T3(≤{_BS_TIER_T3_TTR:.0f}s,≥{_BS_TIER_T3_WINNER:.2f}) "
+              f"persist={_BS_TIER_PERSIST_S:.0f}s "
+              f"swing[{_BS_TIER_SWING_WINDOW_S:.0f}s,"
+              f"Δ{_BS_TIER_SWING_DRAWDOWN:.2f}/↑{_BS_TIER_SWING_BOUNCE:.2f}] "
+              f"dip[{_BS_TIER_DIP_WINDOW_S:.0f}s,≥{_BS_TIER_DIP_FLOOR:.2f}] "
+              f"(BTC fallbacks gated OFF)", flush=True)
+    else:
+        print("[boot][v6.5.11] tier ladder DISABLED — legacy v621 stack active "
+              f"(sell≥{_BS_SELL_THRESH:.2f}, btc_late=${_BS_BTC_LATE_THRESHOLD_USD:.0f})",
+              flush=True)
 
     state = BotState(config=cfg, boot_ts=time.time(), clob_client=clob)
 
