@@ -153,7 +153,7 @@ _SIGNAL_INVERT = os.environ.get("SIGNAL_INVERT", "false").strip().lower() in ("1
 # v5.7.0: single source of truth for the bot's version string. Used in the
 # boot banner, /api/status payload, and dashboard header so all three stay
 # in sync. Bump this on every release.
-BOT_VERSION = "6.3.13-tier"
+BOT_VERSION = "6.3.14-ppmp"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -551,6 +551,39 @@ def _read_v610_env() -> Tuple[
  ) = _read_v610_env()
 
 _BS_ACTIVE = (_STRATEGY_MODE == "both_sides_btc")
+
+# ── v6.3.14 PPMP: managed-bail config ───────────────────────────────
+# Read directly from env (not threaded through the v610 config tuple) to
+# keep the change isolated and avoid mis-aligning that large unpack.
+def _ppmp_f_env(name: str, default: float, lo: float, hi: float) -> float:
+    try:
+        v = float(os.environ.get(name, "") or default)
+    except Exception:
+        v = default
+    return min(max(v, lo), hi)
+
+# Managed-bail window after the live window opens (the first N seconds in
+# which we try to sell-up an unpaired leg-1 before timing out to the bid).
+_BS_BSS_BAIL_WINDOW_S  = _ppmp_f_env("BS_BSS_BAIL_WINDOW_S", 30.0, 1.0, 300.0)
+# Hard cashout floor on leg-1's BID: drop below this → dump immediately.
+_BS_BSS_BAIL_HARD_STOP = _ppmp_f_env("BS_BSS_BAIL_HARD_STOP", 0.46, 0.0, 0.99)
+# Leg-2 "open grace": at the trade open we'll still complete the pair if
+# the other side is available up to this ask (your "top 0.51 at start").
+_BS_BSS_T_SECOND_OPEN  = _ppmp_f_env("BS_BSS_T_SECOND_OPEN", 0.51, 0.30, 0.99)
+# Fee fidelity for the bail ONLY (rest of the DRY P&L is fee-free in this
+# build). Polymarket crypto taker fee = rate * p * (1-p) per share; maker
+# fills (sold-up) pay 0. Controlled by the existing env vars.
+_PPMP_USE_FEE = (os.environ.get("BS_USE_POLYMARKET_FEE_FORMULA", "false")
+                 .strip().lower() in ("1", "true", "yes", "on"))
+_PPMP_TAKER_FEE_RATE = _ppmp_f_env("BS_POLYMARKET_TAKER_FEE_RATE", 0.07, 0.0, 1.0)
+
+def _ppmp_taker_fee(qty: float, price: float) -> float:
+    """USDC taker fee for a fill of `qty` shares at `price` (crypto curve).
+    Zero when the fee formula is disabled. Peaks at p=0.50."""
+    if not _PPMP_USE_FEE or qty <= 0 or price <= 0 or price >= 1:
+        return 0.0
+    return qty * _PPMP_TAKER_FEE_RATE * price * (1.0 - price)
+
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1121,6 +1154,13 @@ class MultiDurationMarket:
     bss_second_phase: Optional[str] = None     # 'strict' | 'relaxed' | 'pre'
     bss_abort_sold_at: Optional[float] = None
     bss_abort_ts: Optional[float] = None
+    # v6.3.14 PPMP: managed-bail state. bail_started_ts = first tick of the
+    # live-window bail; bail_sell_target = the resting sell-up offer price
+    # (leg-1 ask captured at bail start); abort_reason = sold_up|hard_stop|
+    # timeout|market_ended.
+    bss_bail_started_ts: Optional[float] = None
+    bss_bail_sell_target: Optional[float] = None
+    bss_abort_reason: Optional[str] = None
 
     # v6.3.2: pre-market streak tracking. Independent counters for the
     # looser pre-market threshold (T_FIRST_PRE, T_SECOND_PRE). When the
@@ -1553,7 +1593,18 @@ MARKET_INTERVAL_60M_S = 3600
 # How many future boundaries to scan per tick. 5m needs more (markets
 # resolve every 5 min so window covers ~3 markets concurrently); 15m
 # needs ~3 to cover the lead-time window; 60m needs 1-2.
-SLUG_LOOKAHEAD_5M = 4   # covers TTR up to 1200s + active 300s = window
+def _ppmp_int_env(name: str, default: int, lo: int, hi: int) -> int:
+    # v6.3.14: env-read int with clamp. Used to widen the 5m scan-ahead
+    # horizon for PPMP (12 boundaries = 60min of pre-market markets).
+    try:
+        v = int(float(os.environ.get(name, "") or default))
+    except Exception:
+        v = default
+    return min(max(v, lo), hi)
+# v6.3.14 PPMP: was hard-coded 4 (~20min). Env-configurable so PPMP can
+# widen to 12 (=60min) for the patient pre-market pair build. Default
+# unchanged at 4 so a deploy with no env var behaves exactly as before.
+SLUG_LOOKAHEAD_5M = _ppmp_int_env("SLUG_LOOKAHEAD_5M", 4, 1, 24)   # 4=~20min, 12=60min
 SLUG_LOOKAHEAD_15M = 3
 SLUG_LOOKAHEAD_60M = 2
 
@@ -2314,15 +2365,27 @@ main{padding:20px;max-width:1100px;margin:0 auto;}
 <div class="recent-trades-list" id="recent-trades-list"><div class="trades-empty">no closed trades yet</div></div>
 </div>
 <div class="logs-panel">
-<div class="logs-title"><span>CSV logs</span><span id="logs-meta" style="color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0"></span></div>
+<div class="logs-title"><span>CSV logs</span><span id="logs-meta" style="color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0"></span><button id="csv-del-btn" onclick="deleteOldCsv()" style="font-size:10px;margin-left:12px;padding:3px 9px;background:rgba(248,81,73,0.10);color:var(--red);border:1px solid rgba(248,81,73,0.30);border-radius:4px;cursor:pointer;">delete CSVs &gt;7d</button></div>
 <div class="logs-list" id="logs-list"><div class="trades-empty">loading…</div></div>
 </div>
+<div id="bss-watch-bottom" style="margin-top:6px;"></div>
 <div class="footer">Polling /api/status every 1s · <a href="/api/status" target="_blank" style="color:var(--blue)">view JSON</a> · <a href="/api/datasets" target="_blank" style="color:var(--blue)">view datasets JSON</a></div>
 </main>
 <script>
 const $ = id => document.getElementById(id);
 function fmtUptime(s){if(s==null)return '—';const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=Math.floor(s%60);if(h)return `${h}h ${m}m ${sec}s`;if(m)return `${m}m ${sec}s`;return `${sec}s`;}
 function fmtBytes(b){if(b==null)return '—';if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB';}
+async function deleteOldCsv(){
+  if(!confirm("Delete CSV log files older than 7 days? Today's files are kept. This cannot be undone."))return;
+  const btn=$('csv-del-btn'); if(btn){btn.disabled=true;btn.textContent='deleting…';}
+  try{
+    const r=await fetch('/api/delete_old_csv?days=7',{cache:'no-store'});
+    const d=await r.json();
+    alert('Deleted '+(d.deleted_count||0)+' file(s); kept '+(d.kept||0)+'.'+((d.errors&&d.errors.length)?('\nErrors: '+d.errors.join('; ')):''));
+  }catch(e){alert('delete failed: '+e);}
+  if(btn){btn.disabled=false;btn.innerHTML='delete CSVs &gt;7d';}
+  tickDatasets();
+}
 async function tickDatasets(){
 try{
 const r=await fetch('/api/datasets',{cache:'no-store'});
@@ -2610,28 +2673,15 @@ if(bssActive){
       <span style="margin-left:auto;color:var(--text);">${detail}</span>
     </div>`;
   }
-  // ACTIVE TRADE (Design 3 chart) — first item of watching
+  // v6.3.14 PPMP: watching/upcoming markets render in the QUIET bottom panel
+  // (#bss-watch-bottom), not the main list. With a 60-min scan there can be
+  // many; they stay visible-but-unobtrusive. Pre-market WATCH rows are now
+  // shown here too (previously hidden up top as clutter).
+  const watchCards=[];
   if(watching.length){
     const active=watching[0];
-    cards.push(active.chart_active?renderActiveChart(active):`<div class="bs-pos" style="border-left:3px solid var(--muted);padding:8px 12px;font-size:12px;color:var(--muted);">${escapeHtml((active.market_id||'').slice(0,12))}… · ${escapeHtml(active.bss_state)} (no chart data yet)</div>`);
-    // OTHER WATCHING — compact rows. v6.3.4: skip pre-market WATCH
-    // items (clutter, not actionable). Keep WAITING_2ND + live-WATCH.
-    // is_pre_market: ttr_s > 300 (window hasn't opened yet)
-    if(watching.length>1){
-      const others=watching.slice(1);
-      const visible=others.filter(p=>{
-        const isPreWatch = p.bss_state==='WATCH' && p.ttr_s>300;
-        return !isPreWatch;
-      });
-      const hiddenPre=others.length-visible.length;
-      const labelParts=[];
-      if(visible.length) labelParts.push(`${visible.length} other watching`);
-      if(hiddenPre) labelParts.push(`+${hiddenPre} pre-market hidden`);
-      if(labelParts.length){
-        cards.push(`<div style="font-size:10px;color:var(--muted);margin-top:8px;text-transform:uppercase;letter-spacing:0.5px;">${labelParts.join(' · ')}</div>`);
-      }
-      visible.forEach(p=>cards.push(renderCompact(p)));
-    }
+    watchCards.push(active.chart_active?renderActiveChart(active):renderCompact(active));
+    watching.slice(1).forEach(p=>watchCards.push(renderCompact(p)));
   }
   // BOTH state held (no chart, just summary)
   positions.forEach(p=>{
@@ -2659,10 +2709,15 @@ if(bssActive){
         +`</div>`);
     });
   }
+  const _wb=$('bss-watch-bottom');
+  if(_wb){_wb.innerHTML = watchCards.length
+    ? `<div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;margin:14px 0 6px;opacity:0.75;">upcoming · watching · ${watching.length}</div>`+watchCards.join('')
+    : '';}
   if(!cards.length){list.innerHTML='<div class="bs-empty">BSS active · no markets in window yet</div>';return;}
   list.innerHTML=cards.join('');
   return;
 }
+{const _wbc=$('bss-watch-bottom');if(_wbc)_wbc.innerHTML='';}
 if(!positions.length){list.innerHTML='<div class="bs-empty">no open both-sides positions</div>';return;}
 // SPARKLINE: renders a 320x44 SVG of the YES (green) and NO (red) bid
 // trajectories. If sell-loser has fired, draws a vertical dashed marker
@@ -3257,6 +3312,53 @@ def http_server_thread(state: BotState) -> None:
                                  f'attachment; filename="{download_name}"')
                 self.end_headers()
                 self.wfile.write(body)
+                return
+
+            if path == "/api/delete_old_csv" and state.log_dir:
+                # v6.3.14: delete CSV log files older than ?days=N (default 7).
+                # Only files matching dataset_YYYY-MM-DD.csv; never anything
+                # modified within the cutoff (today's active files are safe).
+                qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+                days = 7
+                for part in qs.split("&"):
+                    if part.startswith("days="):
+                        try:
+                            days = max(1, min(365, int(float(part[5:]))))
+                        except Exception:
+                            days = 7
+                cutoff = time.time() - days * 86400.0
+                base = Path(state.log_dir)
+                deleted: List[str] = []
+                kept = 0
+                errs: List[str] = []
+                try:
+                    for f in base.glob("*.csv"):
+                        try:
+                            if not re.match(r"^[a-z0-9_]+_\d{4}-\d{2}-\d{2}\.csv$",
+                                            f.name):
+                                kept += 1
+                                continue
+                            if f.stat().st_mtime < cutoff:
+                                f.unlink()
+                                deleted.append(f.name)
+                            else:
+                                kept += 1
+                        except Exception as e:
+                            errs.append(f"{f.name}: {type(e).__name__}")
+                except Exception as e:
+                    errs.append(str(e))
+                payload = {"deleted": deleted, "deleted_count": len(deleted),
+                           "kept": kept, "older_than_days": days,
+                           "errors": errs}
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+                print(f"[dashboard] delete_old_csv days={days} "
+                      f"deleted={len(deleted)} kept={kept}", flush=True)
                 return
 
             if path == "/health":
@@ -5144,6 +5246,61 @@ def _bs_evaluate_late_conviction(
 #
 # DRY-only by design (cfg.mode != 'dry' refused at fire site).
 
+def _ppmp_bail(state: BotState, mdm: MultiDurationMarket, now: float,
+               yes_ask: float, no_ask: float, yes_bid: float, no_bid: float,
+               sold_at: float, maker: bool, reason: str) -> None:
+    """v6.3.14 PPMP: managed bail of an unpaired leg-1. Sets ABORT state and
+    logs a FEE-ACCURATE BSS_ABORT_DRY row. maker=True → sold-up (0 taker fee,
+    rebate-eligible); maker=False → taker dump (crypto taker fee charged).
+
+    Fees are modeled here even though the rest of this build's DRY P&L is
+    fee-free, per the requirement that a bail is a real sell of a held leg
+    (taker fee on entry + on the taker exit). Controlled by
+    BS_USE_POLYMARKET_FEE_FORMULA / BS_POLYMARKET_TAKER_FEE_RATE.
+    """
+    mdm.bss_abort_sold_at = sold_at
+    mdm.bss_abort_ts = now
+    mdm.bss_abort_reason = reason
+    mdm.bss_state = "ABORT"
+    first_price = mdm.bss_first_price or 0.0
+    size = state.config.position_size_usdc
+    qty = size / first_price if first_price > 0 else 0.0
+    # leg-1 was bought as a taker (took the ask) → entry-side fee always applies
+    entry_fee = _ppmp_taker_fee(qty, first_price)
+    # exit: maker sell-up pays 0; taker dump (hard_stop / timeout) pays the fee
+    exit_fee = 0.0 if maker else _ppmp_taker_fee(qty, sold_at)
+    gross = (sold_at - first_price) * qty
+    net = gross - entry_fee - exit_fee
+    if state.bs_trades_logger is not None:
+        try:
+            market = mdm.market
+            note = (f"src=ppmp_bail,reason={reason},maker={int(maker)},"
+                    f"first_paid={first_price:.4f},sold_at={sold_at:.4f},"
+                    f"gross={gross:+.4f},entry_fee={entry_fee:.4f},"
+                    f"exit_fee={exit_fee:.4f},net_pnl={net:+.4f},"
+                    f"fee_model={'on' if _PPMP_USE_FEE else 'off'}")
+            row = [
+                int(time.time() * 1000), "BSS_ABORT_DRY",
+                market.condition_id, market.slug, market.market_url,
+                f"{market.end_ts:.0f}", mdm.bss_first_side or "",
+                (market.yes_token_id if mdm.bss_first_side == "YES"
+                 else market.no_token_id),
+                f"{first_price:.4f}",
+                f"{(yes_bid if mdm.bss_first_side == 'YES' else no_bid):.4f}",
+                f"{size:.4f}", f"{qty:.4f}", f"{sold_at:.4f}", f"{now:.0f}",
+                f"{net:+.4f}", f"{(entry_fee + exit_fee):.4f}",
+                state.config.mode, note,
+            ]
+            state.bs_trades_logger.log(row)
+        except Exception as e:
+            print(f"[ppmp_bail] log error slug={mdm.market.slug}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+    print(f"[bss_entry] PPMP_BAIL[{reason}] "
+          f"market={mdm.market.condition_id[:10]}… "
+          f"first={mdm.bss_first_side}@{first_price:.3f} sold@{sold_at:.3f} "
+          f"maker={maker} net={net:+.4f}", flush=True)
+
+
 def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
                             now: float) -> None:
     """Run one tick of the BSS state machine for one market. Mutates
@@ -5362,20 +5519,9 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
             timer_start_ts = mdm.bss_first_fill_ts or now
         elapsed_s = now - timer_start_ts
 
-        # Abort gate (only applies in live window — pre-market has no abort)
-        if not in_pre_market and elapsed_s > _BS_BSS_ABORT_AT_S:
-            sold = yes_bid if mdm.bss_first_side == "YES" else no_bid
-            mdm.bss_abort_sold_at = sold
-            mdm.bss_abort_ts = now
-            mdm.bss_state = "ABORT"
-            _bs_log_bss_abort_event(state, mdm, now,
-                                     yes_ask, no_ask, yes_bid, no_bid,
-                                     reason=f"timeout@{elapsed_s:.0f}s")
-            print(f"[bss_entry] ABORT market={market.condition_id[:10]}… "
-                  f"first={mdm.bss_first_side}@{mdm.bss_first_price:.3f} "
-                  f"sold@{sold:.3f} elapsed={elapsed_s:.0f}s",
-                  flush=True)
-            return
+        # v6.3.14 PPMP: the old abort-at-ABORT_AT_S (270s) gate is replaced by
+        # the managed bail in the live-window block below (first-30s sell-up +
+        # 0.46 bid hard-cashout). No timeout-abort here.
 
         # ── Pre-market second-leg detection ──
         # Pre-market uses a single threshold (T_SECOND_PRE), no relax tier,
@@ -5400,69 +5546,79 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
                                               elapsed_s)
             return
 
-        # ── Live-window second-leg detection (v6.3.7: patient + floor) ──
-        # Maintain sustain timers for both strict (0.50) and relaxed (0.62) tiers.
-        if other_ask < _BS_BSS_T_SECOND_STRICT:
-            if mdm.bss_other_below_strict_start_ts is None:
-                mdm.bss_other_below_strict_start_ts = now
-        else:
-            mdm.bss_other_below_strict_start_ts = None
-        if other_ask < _BS_BSS_T_SECOND_RELAXED:
-            if mdm.bss_other_below_relax_start_ts is None:
-                mdm.bss_other_below_relax_start_ts = now
-        else:
-            mdm.bss_other_below_relax_start_ts = None
+        # ── v6.3.14 PPMP: live-window — complete cheap, else managed bail ──
+        # Reached only when the live window is open and leg-2 hasn't filled.
+        # We try to complete the pair (floor / open-grace ≤0.51) AND, in
+        # parallel, run a managed bail of the unpaired leg-1: sell-up over the
+        # first BAIL_WINDOW_S, hard cashout if the bid drops below the floor,
+        # take the bid at timeout. Completion always wins if it fires first.
+        live_elapsed = now - window_open_ts
+        first_bid = yes_bid if mdm.bss_first_side == "YES" else no_bid
+        first_ask = yes_ask if mdm.bss_first_side == "YES" else no_ask
+        if mdm.bss_bail_started_ts is None:
+            # First live tick: arm the managed bail. "Post at the current ask"
+            # = our resting sell-up offer for leg 1.
+            mdm.bss_bail_started_ts = now
+            mdm.bss_bail_sell_target = first_ask
 
-        # v6.3.7: FLOOR BACKSTOP. If opposite side has crashed to FLOOR or
-        # below (default 0.40), fire IMMEDIATELY — don't risk a bounce above
-        # the strict threshold. This is the "ideal scenario": both legs cheap.
+        # PPMP priority: COMPLETE a cheap pair first (a held pair at sum<1.00
+        # always beats a losing bail); only if completion isn't available do we
+        # run the bail (hard-stop / sold-up / timeout). Matches the spec:
+        # "complete at 0.50/0.51 if you can, else sell."
+        # (1) COMPLETE THE PAIR if leg-2 is cheap. Floor (deep dip) fires
+        # immediately; otherwise accept up to the open-grace ask on a short
+        # sustain.
         if other_ask <= _BS_BSS_T_SECOND_FLOOR:
             mdm.bss_second_price = other_ask
             mdm.bss_second_fill_ts = now
             mdm.bss_second_phase = "floor"
             print(f"[bss_entry] SECOND_LEG_FLOOR market={market.condition_id[:10]}… "
-                  f"other_ask={other_ask:.3f} ≤ floor={_BS_BSS_T_SECOND_FLOOR:.2f} "
-                  f"(deep-dip; firing immediately)", flush=True)
-            _create_bss_position_and_log(state, mdm, now,
-                                          yes_ask, no_ask,
-                                          yes_bid, no_bid,
-                                          0.0, _BS_BSS_T_SECOND_FLOOR, elapsed_s)
+                  f"other_ask={other_ask:.3f} ≤ floor={_BS_BSS_T_SECOND_FLOOR:.2f}",
+                  flush=True)
+            _create_bss_position_and_log(state, mdm, now, yes_ask, no_ask,
+                                          yes_bid, no_bid, 0.0,
+                                          _BS_BSS_T_SECOND_FLOOR, elapsed_s)
+            return
+        if other_ask <= _BS_BSS_T_SECOND_OPEN:
+            if mdm.bss_other_below_strict_start_ts is None:
+                mdm.bss_other_below_strict_start_ts = now
+            open_sus = now - mdm.bss_other_below_strict_start_ts
+            if open_sus >= _BS_BSS_SUSTAIN_SECOND_S:
+                mdm.bss_second_price = other_ask
+                mdm.bss_second_fill_ts = now
+                mdm.bss_second_phase = "open"
+                print(f"[bss_entry] SECOND_LEG_OPEN market={market.condition_id[:10]}… "
+                      f"other_ask={other_ask:.3f} ≤ open={_BS_BSS_T_SECOND_OPEN:.2f} "
+                      f"sustain={open_sus:.1f}s", flush=True)
+                _create_bss_position_and_log(state, mdm, now, yes_ask, no_ask,
+                                              yes_bid, no_bid, open_sus,
+                                              _BS_BSS_T_SECOND_OPEN, elapsed_s)
+                return
+        else:
+            mdm.bss_other_below_strict_start_ts = None
+
+        # (2) HARD STOP — can't complete a pair this tick; if leg-1's bid has
+        # dropped below the cashout floor, dump it now (taker).
+        if first_bid < _BS_BSS_BAIL_HARD_STOP:
+            _ppmp_bail(state, mdm, now, yes_ask, no_ask, yes_bid, no_bid,
+                       sold_at=first_bid, maker=False, reason="hard_stop")
             return
 
-        in_strict = elapsed_s <= _BS_BSS_RELAX_AT_S
-        cur_thr = (_BS_BSS_T_SECOND_STRICT if in_strict
-                   else _BS_BSS_T_SECOND_RELAXED)
-        if in_strict:
-            sus_s = ((now - mdm.bss_other_below_strict_start_ts)
-                     if mdm.bss_other_below_strict_start_ts else 0.0)
-        else:
-            sus_s = ((now - mdm.bss_other_below_relax_start_ts)
-                     if mdm.bss_other_below_relax_start_ts else 0.0)
-        if sus_s >= _BS_BSS_SUSTAIN_SECOND_S and other_ask < cur_thr:
-            # v6.3.7: PATIENCE CHECK (strict tier only, not relaxed).
-            # If opposite is still actively falling, hold one tick — we'll
-            # likely get a better fill. If price is flat or rising, fire now.
-            # Patience is NOT applied in relaxed tier because by then we're
-            # past the 240s mark and need to lock the entry before abort@270s.
-            if (in_strict and _BS_BSS_OPP_VEL_PATIENT_DROP > 0):
-                opp_drop = _opposite_side_drop(mdm, mdm.bss_first_side, now,
-                                                _BS_BSS_OPP_VEL_LOOKBACK_S)
-                if (opp_drop is not None
-                    and opp_drop >= _BS_BSS_OPP_VEL_PATIENT_DROP):
-                    # Still falling fast — wait one more tick for a better fill.
-                    print(f"[bss_entry] SECOND_LEG_PATIENT "
-                          f"market={market.condition_id[:10]}… "
-                          f"other_ask={other_ask:.3f} "
-                          f"drop_{int(_BS_BSS_OPP_VEL_LOOKBACK_S)}s={opp_drop:+.4f} "
-                          f"(still falling; wait)", flush=True)
-                    return
-            mdm.bss_second_price = other_ask
-            mdm.bss_second_fill_ts = now
-            mdm.bss_second_phase = "strict" if in_strict else "relaxed"
-            _create_bss_position_and_log(state, mdm, now,
-                                          yes_ask, no_ask,
-                                          yes_bid, no_bid,
-                                          sus_s, cur_thr, elapsed_s)
+        # (3) SOLD-UP — resting sell offer lifted (bid rose to our ask). Maker
+        # fill at target (0 fee, rebate-eligible).
+        if (mdm.bss_bail_sell_target is not None
+                and first_bid >= mdm.bss_bail_sell_target):
+            _ppmp_bail(state, mdm, now, yes_ask, no_ask, yes_bid, no_bid,
+                       sold_at=mdm.bss_bail_sell_target, maker=True,
+                       reason="sold_up")
+            return
+
+        # (4) TIMEOUT — bail window elapsed without a pair or sell-up. Take the
+        # current bid (taker).
+        if live_elapsed >= _BS_BSS_BAIL_WINDOW_S:
+            _ppmp_bail(state, mdm, now, yes_ask, no_ask, yes_bid, no_bid,
+                       sold_at=first_bid, maker=False, reason="timeout")
+            return
         return
 
 
