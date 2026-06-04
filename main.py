@@ -153,7 +153,7 @@ _SIGNAL_INVERT = os.environ.get("SIGNAL_INVERT", "false").strip().lower() in ("1
 # v5.7.0: single source of truth for the bot's version string. Used in the
 # boot banner, /api/status payload, and dashboard header so all three stay
 # in sync. Bump this on every release.
-BOT_VERSION = "6.3.14-ppmp"
+BOT_VERSION = "6.3.16-ppmp"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -583,6 +583,15 @@ def _ppmp_taker_fee(qty: float, price: float) -> float:
     if not _PPMP_USE_FEE or qty <= 0 or price <= 0 or price >= 1:
         return 0.0
     return qty * _PPMP_TAKER_FEE_RATE * price * (1.0 - price)
+
+# v6.3.16 PPMP strategy guard: leg-1 is a PRE-MARKET entry only. Never open a
+# fresh first leg inside the live 5-min window (no time left to complete the
+# pair → it would just force an immediate bail). Default True = on-strategy;
+# set "false" only to restore the old behavior of also legging in live.
+_BS_BSS_LEG1_PREMARKET_ONLY = (
+    os.environ.get("BS_BSS_LEG1_PREMARKET_ONLY", "true").strip().lower()
+    in ("1", "true", "yes", "on"))
+
 
 
 
@@ -2974,6 +2983,13 @@ def _build_status_payload(state: BotState) -> dict:
                           if mdm.bss_yes_below_first_start_ts else 0.0)
             no_sus_s = (now - mdm.bss_no_below_first_start_ts
                          if mdm.bss_no_below_first_start_ts else 0.0)
+            # v6.3.15: show the threshold that actually applies right now —
+            # pre-market markets enter leg-1 at T_FIRST_PRE (0.49), not the
+            # live-window T_FIRST (0.45). The dashboard was always showing
+            # 0.45, which is unreachable pre-market and misleading.
+            _wopen_disp = mdm.market.end_ts - mdm.duration_s
+            _t_first_eff = (_BS_BSS_T_FIRST_PRE if now < _wopen_disp
+                            else _BS_BSS_T_FIRST)
             entry = {
                 "market_id": cid,
                 "market_question": mdm.market.question[:60],
@@ -2990,7 +3006,7 @@ def _build_status_payload(state: BotState) -> dict:
                                        if mdm.bss_first_fill_ts else None),
                 "yes_sustain_s": round(yes_sus_s, 1),
                 "no_sustain_s": round(no_sus_s, 1),
-                "t_first": _BS_BSS_T_FIRST,
+                "t_first": _t_first_eff,
                 "sustain_first_s": _BS_BSS_SUSTAIN_FIRST_S,
             }
             if mdm.bss_state == "WAITING_2ND":
@@ -5463,6 +5479,14 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
         elif no_sus_s >= sustain_first_s:
             fire_side = "NO"; fire_price = no_ask; sus_s_at_fire = no_sus_s
         if fire_side:
+            # v6.3.16 PPMP: leg-1 is a PRE-MARKET entry only. If the live
+            # window has opened and we somehow still tripped a first-leg
+            # trigger, do NOT open it — there's no time left to complete the
+            # pair, so it would just force an immediate bail. Reset the streak
+            # and skip. (Reversible via BS_BSS_LEG1_PREMARKET_ONLY=false.)
+            if _BS_BSS_LEG1_PREMARKET_ONLY and not in_pre_market:
+                setattr(mdm, yes_st_field if fire_side == "YES" else no_st_field, None)
+                return
             # v6.3.6: BTC-velocity filter — LIVE PHASE ONLY. Pre-market prices
             # are flat noise that don't react to BTC moves second-by-second,
             # so filtering on BTC velocity during pre-market is meaningless
