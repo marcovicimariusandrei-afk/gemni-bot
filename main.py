@@ -153,7 +153,7 @@ _SIGNAL_INVERT = os.environ.get("SIGNAL_INVERT", "false").strip().lower() in ("1
 # v5.7.0: single source of truth for the bot's version string. Used in the
 # boot banner, /api/status payload, and dashboard header so all three stay
 # in sync. Bump this on every release.
-BOT_VERSION = "6.3.18-ppmp"
+BOT_VERSION = "6.3.19-ppmp"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2727,7 +2727,12 @@ if(bssActive){
   const watchCards=[];
   if(watching.length){
     const active=watching[0];
-    watchCards.push(active.chart_active?renderActiveChart(active):renderCompact(active));
+    // v6.3.19 fix: the active trade (watching[0], with chart if applicable)
+    // belongs in the MAIN top list — it's the focal panel. Only the rest of
+    // the watching markets render in the quiet bottom panel. (Regression from
+    // 6.3.14 which sent the whole list to the bottom and made the active
+    // trade display look like it was missing.)
+    cards.push(active.chart_active?renderActiveChart(active):renderCompact(active));
     watching.slice(1).forEach(p=>watchCards.push(renderCompact(p)));
   }
   // BOTH state held (no chart, just summary)
