@@ -153,7 +153,7 @@ _SIGNAL_INVERT = os.environ.get("SIGNAL_INVERT", "false").strip().lower() in ("1
 # v5.7.0: single source of truth for the bot's version string. Used in the
 # boot banner, /api/status payload, and dashboard header so all three stay
 # in sync. Bump this on every release.
-BOT_VERSION = "6.3.16-ppmp"
+BOT_VERSION = "6.3.18-ppmp"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -591,6 +591,44 @@ def _ppmp_taker_fee(qty: float, price: float) -> float:
 _BS_BSS_LEG1_PREMARKET_ONLY = (
     os.environ.get("BS_BSS_LEG1_PREMARKET_ONLY", "true").strip().lower()
     in ("1", "true", "yes", "on"))
+
+# v6.3.18 real-dip filter: a 1¢ book always quotes one side at 0.495 and the
+# other at 0.505 — that's structure, not opportunity. To filter the structural
+# quote and only fire on actual price action, require the candidate side's
+# current ask to be at least REAL_DIP_DROP below its own max ask within the
+# last REAL_DIP_LOOKBACK_S seconds. A side sitting at 0.495 forever has
+# max==0.495 → drop==0 → no fire. A side that was at 0.505 and dropped to
+# 0.495 has drop==0.010 → fires. Set DROP=0 to disable.
+_BS_BSS_REAL_DIP_DROP = _ppmp_f_env("BS_BSS_REAL_DIP_DROP", 0.010, 0.0, 0.50)
+_BS_BSS_REAL_DIP_LOOKBACK_S = _ppmp_f_env("BS_BSS_REAL_DIP_LOOKBACK_S", 30.0, 1.0, 600.0)
+
+def _bss_recent_max_ask(samples, side_idx: int, now: float,
+                         lookback_s: float):
+    """Max ask for one side within the last lookback_s seconds. side_idx
+    1=YES, 2=NO. samples are (ts, yes_ask, no_ask) appended in order. Returns
+    None if no samples fall in the window."""
+    cutoff = now - lookback_s
+    m = None
+    for ts, ya, na in reversed(samples):
+        if ts < cutoff:
+            break
+        a = ya if side_idx == 1 else na
+        if m is None or a > m:
+            m = a
+    return m
+
+# v6.3.17 PPMP fallback: if a market never gave a cheap leg-1 (still WATCH)
+# by FALLBACK_LEAD_S seconds before the live window opens, take the pair at
+# market anyway — buy BOTH sides at the current ask (a flat ~1.00 pair, e.g.
+# 0.49+0.51 / 0.50+0.50 / 0.50+0.51) so we don't miss the market. The flat
+# pair is then held to expiry on the existing loser-cut exit stack. Guarded
+# by a max-sum so we never take a blown-out book.
+_BS_BSS_FALLBACK_BOTH_ENABLED = (
+    os.environ.get("BS_BSS_FALLBACK_BOTH_ENABLED", "true").strip().lower()
+    in ("1", "true", "yes", "on"))
+_BS_BSS_FALLBACK_LEAD_S = _ppmp_f_env("BS_BSS_FALLBACK_LEAD_S", 10.0, 1.0, 120.0)
+_BS_BSS_FALLBACK_MAX_SUM = _ppmp_f_env("BS_BSS_FALLBACK_MAX_SUM", 1.04, 1.0, 1.20)
+
 
 
 
@@ -5446,6 +5484,38 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
 
     # ── WATCH: first-leg sustain detection ──
     if mdm.bss_state == "WATCH":
+        # ── v6.3.17 PPMP fallback: no cheap leg-1, take the flat pair ──
+        # If we're within FALLBACK_LEAD_S of the live window opening and still
+        # have no leg-1 (the market never dipped to T_FIRST_PRE), buy BOTH
+        # sides at the current ask so we don't miss the market. Becomes a flat
+        # ~1.00 pair held to expiry on the existing exit stack.
+        if (_BS_BSS_FALLBACK_BOTH_ENABLED and in_pre_market
+                and (window_open_ts - now) <= _BS_BSS_FALLBACK_LEAD_S):
+            sum_ask = yes_ask + no_ask
+            if (yes_ask > 0.0 and no_ask > 0.0
+                    and sum_ask <= _BS_BSS_FALLBACK_MAX_SUM):
+                # leg-1 = the cheaper side (cosmetic), leg-2 = the other; both
+                # filled now at their current asks.
+                if yes_ask <= no_ask:
+                    mdm.bss_first_side = "YES"
+                    mdm.bss_first_price = yes_ask
+                    mdm.bss_second_price = no_ask
+                else:
+                    mdm.bss_first_side = "NO"
+                    mdm.bss_first_price = no_ask
+                    mdm.bss_second_price = yes_ask
+                mdm.bss_first_fill_ts = now
+                mdm.bss_second_fill_ts = now
+                mdm.bss_first_filled_in_pre = True
+                mdm.bss_second_phase = "fallback"
+                print(f"[bss_entry] FALLBACK_BOTH market={market.condition_id[:10]}… "
+                      f"yes={yes_ask:.3f} no={no_ask:.3f} sum={sum_ask:.4f} "
+                      f"({_BS_BSS_FALLBACK_LEAD_S:.0f}s pre-open, no cheap leg-1 "
+                      f"→ flat pair)", flush=True)
+                _create_bss_position_and_log(state, mdm, now, yes_ask, no_ask,
+                                              yes_bid, no_bid, 0.0, sum_ask, 0.0)
+                return
+            # book too wide / blown out — skip fallback, stay WATCH
         # v6.3.2: track separate pre-market and live-market streaks so
         # transitioning between phases doesn't carry over a stale streak
         if in_pre_market:
@@ -5479,6 +5549,21 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
         elif no_sus_s >= sustain_first_s:
             fire_side = "NO"; fire_price = no_ask; sus_s_at_fire = no_sus_s
         if fire_side:
+            # v6.3.18 PPMP: real-dip filter. A 1¢ pre-market book quotes one
+            # side at 0.495 forever — that's not a discount. Require the
+            # candidate side's current ask to be at least REAL_DIP_DROP below
+            # its own max within the last REAL_DIP_LOOKBACK_S seconds, so we
+            # only fire on actual price action, not the resting book.
+            if _BS_BSS_REAL_DIP_DROP > 0.0:
+                _side_idx = 1 if fire_side == "YES" else 2
+                _rmax = _bss_recent_max_ask(mdm.bss_price_samples, _side_idx,
+                                              now, _BS_BSS_REAL_DIP_LOOKBACK_S)
+                if _rmax is None or (_rmax - fire_price) < _BS_BSS_REAL_DIP_DROP:
+                    # Structural quote, not a real dip — reset streak and skip
+                    setattr(mdm,
+                            yes_st_field if fire_side == "YES" else no_st_field,
+                            None)
+                    return
             # v6.3.16 PPMP: leg-1 is a PRE-MARKET entry only. If the live
             # window has opened and we somehow still tripped a first-leg
             # trigger, do NOT open it — there's no time left to complete the
