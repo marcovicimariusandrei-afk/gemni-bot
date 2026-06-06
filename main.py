@@ -364,7 +364,7 @@ def _read_v610_env() -> Tuple[
 
     bs_sum_ask_max = _f("BS_SUM_ASK_MAX", 1.03, 1.00, 1.20)
     bs_sell_thresh = _f("BS_SELL_LOSER_THRESHOLD", 0.93, 0.50, 0.99)
-    bs_sell_ttr_floor = _f("BS_SELL_LOSER_TTR_FLOOR_S", 120.0, 0.0, 300.0)
+    bs_sell_ttr_floor = _f("BS_SELL_LOSER_TTR_FLOOR_S", 75.0, 0.0, 300.0)
     bs_sell_persist = _f("BS_SELL_LOSER_PERSIST_S", 5.0, 0.0, 60.0)
     bs_sell_min_bid = _f("BS_SELL_LOSER_MIN_LOSER_BID", 0.05, 0.0, 0.50)
     # v6.2.0: BTC-confirmation guard. PROD's existing book-based sell-loser fire
