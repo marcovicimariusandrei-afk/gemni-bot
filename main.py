@@ -1,5 +1,5 @@
 """
-main.py — Opportunistic BSS Bot (v5.8.9 Deadline Entries, Safe Expirations & Dark UI)
+main.py — Opportunistic BSS Bot (v5.8.9 Complete Batch)
 """
 import os
 import sys
@@ -402,7 +402,7 @@ def evaluate_market(mdm: MarketData, now: float):
     if ttr <= -5:
         mdm.state = MarketState.CLOSED
         
-        # TRUE COST FIX: Only subtract the exact money deployed, do not assume both legs were bought
+        # TRUE COST FIX: Only subtract the exact money deployed
         cost_basis = mdm.total_fees_paid
         if mdm.yes_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
         if mdm.no_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
@@ -437,7 +437,7 @@ def evaluate_market(mdm: MarketData, now: float):
             mdm.total_fees_paid += fee
             execute_trade(mdm, "NO", nb.ask, "LEG_1_ENTRY", mdm.no_shares, fee, ttr)
             
-        # FOMO Entry (Force Both Legs if cheap enough at the deadline)
+        # FOMO Entry
         elif ttr <= HEDGE_DEADLINE_TTR and 0 < yb.ask and 0 < nb.ask and (yb.ask + nb.ask) <= MAX_COMBINED_COST:
             mdm.state = MarketState.BOTH
             
@@ -473,13 +473,13 @@ def evaluate_market(mdm: MarketData, now: float):
             mdm.total_fees_paid += fee
             execute_trade(mdm, "YES", yb.ask, "LEG_2_DEADLINE" if ttr <= HEDGE_DEADLINE_TTR else "LEG_2_ENTRY", mdm.yes_shares, fee, ttr)
             
-    # ── Exit Logic (Tranches & Undecided Holding) ──
+    # ── Exit Logic ──
     elif mdm.state == MarketState.BOTH:
         
         if yb.bid > nb.bid: winner_bid, loser_side, loser_bid, loser_shares = yb.bid, "NO", nb.bid, mdm.no_shares
         else: winner_bid, loser_side, loser_bid, loser_shares = nb.bid, "YES", yb.bid, mdm.yes_shares
             
-        # Tier 1 (50% Exit)
+        # Tier 1
         if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and ttr <= SELL_LOSER_T1_TTR_MAX:
             mdm.t1_executed = True
             shares_to_sell = loser_shares * 0.50
@@ -491,7 +491,7 @@ def evaluate_market(mdm: MarketData, now: float):
             mdm.total_fees_paid += fee
             execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T1", shares_to_sell, fee, ttr)
             
-        # Tier 2 (Final Exit) 
+        # Tier 2
         elif winner_bid >= SELL_LOSER_T2_THRESH:
             mdm.state = MarketState.CLOSED
             
@@ -501,7 +501,6 @@ def evaluate_market(mdm: MarketData, now: float):
             mdm.total_fees_paid += fee
             execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T2", shares_to_sell, fee, ttr)
             
-            # Final P&L
             cost_basis = (BASE_CAPITAL_PER_LEG * 2) + mdm.total_fees_paid
             winner_shares = mdm.yes_shares if loser_side == "NO" else mdm.no_shares
             final_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
@@ -544,3 +543,61 @@ def discovery_thread():
         for ts in boundaries:
             slug = f"btc-updown-5m-{ts}"
             try:
+                res = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}", timeout=5)
+                if res.status_code == 200 and res.json():
+                    m_info = res.json()[0].get("markets", [])[0]
+                    cid = m_info["conditionId"]
+                    if cid not in GLOBAL_STATE.markets:
+                        tks = json.loads(m_info["clobTokenIds"])
+                        outcomes = json.loads(m_info["outcomes"])
+                        y_idx = 0 if outcomes[0].lower() in ["yes", "up"] else 1
+                        end_ts = datetime.fromisoformat(m_info["endDate"].replace("Z", "+00:00")).timestamp()
+                        GLOBAL_STATE.markets[cid] = MarketData(cid, slug, tks[y_idx], tks[1-y_idx], end_ts)
+                        print(f"[Discovery] Tracking: {slug}", flush=True)
+                        new_markets = True
+            except Exception: pass
+        if new_markets and GLOBAL_STATE.ws_handle: GLOBAL_STATE.ws_handle.close()
+        time.sleep(30)
+
+def polymarket_ws_thread():
+    def on_message(ws, msg):
+        try:
+            for event in (json.loads(msg) if isinstance(json.loads(msg), list) else [json.loads(msg)]):
+                if not isinstance(event, dict): continue
+                aid = event.get("asset_id") or event.get("market")
+                if not aid: continue
+                if event.get("event_type") == "book":
+                    book = GLOBAL_STATE.books.setdefault(aid, OrderBook())
+                    book.bid = max((float(b["price"]) for b in event.get("bids", [])), default=0.0)
+                    book.ask = min((float(a["price"]) for a in event.get("asks", [])), default=0.0)
+                elif event.get("event_type") == "price_change":
+                    book = GLOBAL_STATE.books.get(aid)
+                    if not book: continue
+                    for ch in event.get("changes", []):
+                        s, p = ch.get("side", ""), float(ch.get("price", 0))
+                        if s == "BUY" and p > book.bid: book.bid = p
+                        elif s == "SELL" and (book.ask == 0 or p < book.ask): book.ask = p
+        except Exception: pass
+
+    def on_open(ws):
+        GLOBAL_STATE.ws_connected = True
+        tks = [t for m in GLOBAL_STATE.markets.values() if m.state != MarketState.CLOSED for t in (m.yes_token, m.no_token)]
+        if tks: ws.send(json.dumps({"type": "Market", "assets_ids": tks}))
+
+    while GLOBAL_STATE.running:
+        try:
+            ws = websocket.WebSocketApp("wss://ws-subscriptions-clob.polymarket.com/ws/market", on_message=on_message, on_open=on_open)
+            GLOBAL_STATE.ws_handle = ws
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception: pass
+        GLOBAL_STATE.ws_handle, GLOBAL_STATE.ws_connected = None, False
+        time.sleep(2)
+
+if __name__ == "__main__":
+    init_csv()
+    threading.Thread(target=run_server, daemon=True).start()
+    threading.Thread(target=discovery_thread, daemon=True).start()
+    threading.Thread(target=polymarket_ws_thread, daemon=True).start()
+    threading.Thread(target=tick_loop, daemon=True).start()
+    threading.Thread(target=snapshot_loop, daemon=True).start()
+    while GLOBAL_STATE.running: time.sleep(1)
