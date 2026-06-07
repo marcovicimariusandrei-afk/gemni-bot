@@ -1,5 +1,5 @@
 """
-main.py — Opportunistic BSS Bot (v5.8.12 P&L Scoreboard Fix)
+main.py — Opportunistic BSS Bot (v5.8.13 Visual Exit Markers)
 """
 import os
 import sys
@@ -63,6 +63,12 @@ class MarketData:
         self.total_fees_paid = 0.0
         
         self.t1_executed = False
+        self.t1_side = ""
+        self.t1_price = 0.0
+        
+        self.t2_side = ""
+        self.t2_price = 0.0
+        
         self.salvage_revenue = 0.0
         self.realized_pnl = 0.0
         
@@ -126,6 +132,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         --val-green: #34D399;
         --val-red: #F87171;
         --val-yellow: #FCD34D;
+        --val-pink: #F472B6;
         --font-serif: Georgia, "Times New Roman", serif;
         --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
@@ -179,7 +186,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.12 
+    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.13 
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
@@ -213,7 +220,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <div class="queue-container" id="obs-queue">Scanning...</div>
 
 <script>
-function renderSparkline(history, color) {
+function renderSparkline(history, color, t1_price, t2_price) {
     if(!history || history.length < 2) return '';
     const min = Math.min(...history), max = Math.max(...history);
     const range = (max - min) || 0.01;
@@ -222,9 +229,21 @@ function renderSparkline(history, color) {
         const y = 100 - (((val - min) / range) * 100);
         return `${x},${y}`;
     }).join(' ');
-    return `<svg width="100%" height="100%" viewBox="0 -10 100 120" preserveAspectRatio="none">
-        <polyline fill="none" stroke="${color}" stroke-width="2.5" points="${pts}" />
-    </svg>`;
+    
+    let svg = `<polyline fill="none" stroke="${color}" stroke-width="2.5" points="${pts}" />`;
+    
+    // Draw dot for Tier 1 sell
+    if (t1_price > 0 && t1_price >= min && t1_price <= max) {
+        const yT1 = 100 - (((t1_price - min) / range) * 100);
+        svg += `<text x="80" y="${yT1}" fill="var(--val-yellow)" font-size="24" text-anchor="middle" dominant-baseline="central">●</text>`;
+    }
+    // Draw dot for Tier 2 sell
+    if (t2_price > 0 && t2_price >= min && t2_price <= max) {
+        const yT2 = 100 - (((t2_price - min) / range) * 100);
+        svg += `<text x="95" y="${yT2}" fill="var(--val-pink)" font-size="24" text-anchor="middle" dominant-baseline="central">●</text>`;
+    }
+    
+    return `<svg width="100%" height="100%" viewBox="0 -10 100 120" preserveAspectRatio="none">${svg}</svg>`;
 }
 
 function formatUptime(seconds) {
@@ -281,6 +300,11 @@ setInterval(async () => {
 
             let valYes = m.yes_shares * m.yes_ask;
             let valNo = m.no_shares * m.no_ask;
+            
+            let t1Yes = m.t1_side === 'YES' ? m.t1_price : 0;
+            let t2Yes = m.t2_side === 'YES' ? m.t2_price : 0;
+            let t1No = m.t1_side === 'NO' ? m.t1_price : 0;
+            let t2No = m.t2_side === 'NO' ? m.t2_price : 0;
 
             htmlCards += `<div class="card">
                 <div class="card-header">
@@ -296,7 +320,7 @@ setInterval(async () => {
                         <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;"><span>Live Ticker:</span> <b>$${m.yes_ask.toFixed(3)}</b></div>
                         <div class="data-row"><span>Current Delta:</span> <span class="${cYes}">${(dYes>0?'+':'')+dYes.toFixed(2)+'%'}</span></div>
                         <div class="data-row"><span>Live Value:</span> <b class="val-gold">$${valYes.toFixed(2)}</b></div>
-                        <div class="svg-container">${renderSparkline(m.history_yes, '#38BDF8')}</div>
+                        <div class="svg-container">${renderSparkline(m.history_yes, '#38BDF8', t1Yes, t2Yes)}</div>
                     </div>
                     <div class="leg-col">
                         <div class="leg-title">NO LEG MONITOR</div>
@@ -306,7 +330,7 @@ setInterval(async () => {
                         <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;"><span>Live Ticker:</span> <b>$${m.no_ask.toFixed(3)}</b></div>
                         <div class="data-row"><span>Current Delta:</span> <span class="${cNo}">${(dNo>0?'+':'')+dNo.toFixed(2)+'%'}</span></div>
                         <div class="data-row"><span>Live Value:</span> <b class="val-gold">$${valNo.toFixed(2)}</b></div>
-                        <div class="svg-container">${renderSparkline(m.history_no, '#94A3B8')}</div>
+                        <div class="svg-container">${renderSparkline(m.history_no, '#94A3B8', t1No, t2No)}</div>
                     </div>
                 </div>
             </div>`;
@@ -321,9 +345,14 @@ setInterval(async () => {
         let logHtml = '';
         s.history.reverse().forEach(h => {
             const pnlStr = h.pnl !== 0.0 ? (h.pnl > 0 ? `+${h.pnl.toFixed(2)}` : h.pnl.toFixed(2)) : '--';
+            
+            let badges = '';
+            if (h.t1_side) badges += `<span style="color:var(--val-yellow); font-size:14px; margin-left:6px; cursor:help;" title="Tier 1 Sell (${h.t1_side}) @ $${h.t1_price.toFixed(3)}">●</span>`;
+            if (h.t2_side) badges += `<span style="color:var(--val-pink); font-size:14px; margin-left:4px; cursor:help;" title="Tier 2 Sell (${h.t2_side}) @ $${h.t2_price.toFixed(3)}">●</span>`;
+            
             logHtml += `<tr>
                 <td style="color:var(--text-light); font-family:var(--font-sans); font-size: 13px;">${h.time}</td>
-                <td>${h.slug}</td>
+                <td>${h.slug}${badges}</td>
                 <td>${h.yes_entry > 0 ? '$'+h.yes_entry.toFixed(3) : '--'}</td>
                 <td>${h.no_entry > 0 ? '$'+h.no_entry.toFixed(3) : '--'}</td>
                 <td style="font-weight: 800; font-family:var(--font-sans); color: var(--text-light);">${h.reason}</td>
@@ -356,7 +385,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 if m.state == MarketState.CLOSED and m.close_time != "":
                     history_data.append({
                         "time": m.close_time, "slug": m.slug, "reason": m.close_reason,
-                        "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price, "pnl": m.realized_pnl
+                        "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price, "pnl": m.realized_pnl,
+                        "t1_side": m.t1_side, "t1_price": m.t1_price, "t2_side": m.t2_side, "t2_price": m.t2_price
                     })
                 else:
                     yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
@@ -365,7 +395,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price,
                         "yes_shares": m.yes_shares, "no_shares": m.no_shares,
                         "yes_ask": yb.ask if yb else 0.0, "no_ask": nb.ask if nb else 0.0,
-                        "history_yes": m.history_yes[-30:], "history_no": m.history_no[-30:]
+                        "history_yes": m.history_yes[-30:], "history_no": m.history_no[-30:],
+                        "t1_side": m.t1_side, "t1_price": m.t1_price, "t2_side": m.t2_side, "t2_price": m.t2_price
                     })
             
             payload = {
@@ -417,7 +448,6 @@ def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares:
         GLOBAL_STATE.sold_losers += 1
         mdm.salvage_revenue += (shares * price)
         
-    # FIX: Catch all variations of CLOSED
     if "CLOSED" in action or action == "EXPIRED":
         mdm.close_time = ts
         mdm.close_reason = action
@@ -507,6 +537,8 @@ def evaluate_market(mdm: MarketData, now: float):
             
         if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and ttr <= SELL_LOSER_T1_TTR_MAX:
             mdm.t1_executed = True
+            mdm.t1_side = loser_side
+            mdm.t1_price = loser_bid
             shares_to_sell = loser_shares * 0.50
             
             if loser_side == "YES": mdm.yes_shares -= shares_to_sell
@@ -518,6 +550,8 @@ def evaluate_market(mdm: MarketData, now: float):
             
         elif winner_bid >= SELL_LOSER_T2_THRESH:
             mdm.state = MarketState.CLOSED
+            mdm.t2_side = loser_side
+            mdm.t2_price = loser_bid
             
             shares_to_sell = loser_shares * 0.99 
             fee = (shares_to_sell * loser_bid) * 0.001 
