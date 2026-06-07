@@ -1,5 +1,5 @@
 """
-main.py — Opportunistic BSS Bot (v5.8.2 Command Center)
+main.py — Opportunistic BSS Bot (v5.8.2 Corporate Analytical UI)
 """
 import os
 import sys
@@ -43,7 +43,8 @@ class MarketData:
         self.state = MarketState.WATCH
         self.leg1_price = 0.0
         self.leg2_price = 0.0
-        self.history: List[float] = [] # For candle chart
+        self.history_yes: List[float] = []
+        self.history_no: List[float] = []
 
 class OrderBook:
     def __init__(self):
@@ -68,90 +69,112 @@ GLOBAL_STATE = BotState()
 def init_csv():
     if not os.path.exists("trades_full.csv"):
         with open("trades_full.csv", "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Timestamp", "Slug", "Action", "Side", "Price", "Realized_PnL", "Verify_Link"])
+            csv.writer(f).writerow(["Timestamp", "Slug", "Action", "Side", "Price", "Realized_PnL", "Verify_Link"])
     if not os.path.exists("snapshot_live.csv"):
         with open("snapshot_live.csv", "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Timestamp", "Slug", "State", "Yes_Ask", "Yes_Bid", "No_Ask", "No_Bid"])
+            csv.writer(f).writerow(["Timestamp", "Slug", "State", "Yes_Ask", "Yes_Bid", "No_Ask", "No_Bid"])
 
 def log_trade_csv(ts, slug, action, side, price, pnl):
     link = f"https://polymarket.com/event/{slug}"
     try:
         with open("trades_full.csv", "a", newline="") as f:
             csv.writer(f).writerow([ts, slug, action, side, f"{price:.3f}", f"{pnl:.3f}", link])
-    except Exception as e:
-        print(f"CSV Error: {e}")
+    except Exception: pass
 
-# ─── DASHBOARD HTML (v5.8.2) ───
+# ─── DASHBOARD HTML (v5.8.2 Corporate UI) ───
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>BSS Command Center v5.8.2</title>
+<title>BSS Analysis Dashboard</title>
 <style>
-    body { background: #0a0a0a; color: #e0e0e0; font-family: ui-monospace, Menlo, Consolas, monospace; padding: 20px; font-size: 13px; margin: 0; }
-    .top-bar { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #333; padding-bottom: 15px; margin-bottom: 20px; }
-    .brand { font-size: 18px; font-weight: 600; color: #fff; }
-    .vitals { display: flex; gap: 20px; }
-    .vital-box { background: #141414; border: 1px solid #262626; padding: 10px 15px; border-radius: 6px; text-align: center; min-width: 100px; }
-    .vital-label { color: #7a7a7a; font-size: 10px; text-transform: uppercase; margin-bottom: 4px; }
-    .vital-value { font-size: 18px; font-weight: bold; color: #fff; }
-    .vital-value.green { color: #5cbd5c; }
+    :root {
+        --bg-main: #e6edf2;
+        --bg-panel: #ffffff;
+        --header-bg: #aecad6;
+        --text-navy: #002060;
+        --text-light: #597387;
+        --border-color: #c4d7e0;
+        --font-serif: Georgia, "Times New Roman", serif;
+        --font-sans: Calibri, "Segoe UI", Arial, sans-serif;
+    }
+    body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
     
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 15px; margin-bottom: 30px; }
-    .card { background: #141414; border: 1px solid #262626; border-radius: 6px; padding: 15px; position: relative; }
-    .card-header { display: flex; justify-content: space-between; border-bottom: 1px solid #1f1f1f; padding-bottom: 8px; margin-bottom: 8px; }
-    .card-title { font-weight: bold; color: #fff; }
-    .card-ttr { color: #e0b340; font-size: 12px; }
-    .svg-container { height: 40px; margin: 10px 0; background: #0d0d0d; border-radius: 4px; border: 1px solid #1f1f1f; }
+    .header-panel { background: var(--header-bg); border: 1px solid var(--border-color); display: flex; flex-direction: column; text-align: center; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    .brand-title { font-family: var(--font-serif); font-size: 24px; font-weight: bold; color: var(--text-navy); padding: 10px 0; border-bottom: 1px solid var(--border-color); background: rgba(255,255,255,0.3); }
     
-    .table-container { background: #141414; border: 1px solid #262626; border-radius: 6px; padding: 15px; margin-bottom: 30px; }
-    .sec-title { font-weight: bold; font-size: 14px; color: #fff; margin-bottom: 15px; text-transform: uppercase; }
+    .vitals-row { display: flex; background: var(--header-bg); }
+    .vital-box { flex: 1; padding: 10px; border-right: 1px solid var(--border-color); text-align: center; }
+    .vital-box:last-child { border-right: none; }
+    .vital-label { font-family: var(--font-serif); font-size: 13px; font-weight: bold; margin-bottom: 5px; }
+    .vital-value { background: var(--bg-panel); color: var(--text-navy); font-size: 22px; font-weight: bold; padding: 5px; border-radius: 2px; }
+    .vital-value.green { color: #006600; }
+    
+    .sec-title { background: var(--header-bg); border: 1px solid var(--border-color); font-family: var(--font-serif); font-size: 16px; font-weight: bold; text-align: center; padding: 8px; margin-bottom: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    
+    .grid { display: grid; grid-template-columns: 1fr; gap: 15px; margin-bottom: 30px; }
+    .card { background: var(--bg-panel); border: 1px solid var(--border-color); box-shadow: 0 2px 4px rgba(0,0,0,0.05); display: flex; flex-direction: column; }
+    .card-header { background: #d9e6eb; padding: 8px 15px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; font-weight: bold; }
+    
+    .leg-container { display: flex; width: 100%; }
+    .leg-col { flex: 1; padding: 15px; border-right: 1px solid var(--border-color); }
+    .leg-col:last-child { border-right: none; }
+    .leg-title { font-family: var(--font-serif); font-size: 14px; font-weight: bold; text-align: center; margin-bottom: 10px; color: var(--text-navy); text-decoration: underline; }
+    
+    .data-row { display: flex; justify-content: space-between; margin-bottom: 5px; font-size: 13px; }
+    .val-green { color: #006600; font-weight: bold; }
+    .val-red { color: #cc0000; font-weight: bold; }
+    
+    .svg-container { height: 40px; margin-top: 10px; background: #f5f8fa; border: 1px solid #e0e8f0; }
+    
+    .table-container { background: var(--bg-panel); border: 1px solid var(--border-color); margin-bottom: 30px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
     table { width: 100%; border-collapse: collapse; text-align: left; }
-    th { color: #7a7a7a; font-size: 11px; text-transform: uppercase; padding: 8px; border-bottom: 1px solid #333; }
-    td { padding: 8px; border-bottom: 1px solid #1f1f1f; }
-    .btn-verify { background: rgba(88,166,255,0.1); border: 1px solid rgba(88,166,255,0.4); color: #58a6ff; padding: 3px 8px; border-radius: 4px; text-decoration: none; font-size: 10px; font-weight: bold; }
-    .btn-verify:hover { background: rgba(88,166,255,0.2); }
+    th { background: #d9e6eb; font-family: var(--font-serif); font-size: 13px; padding: 10px; border-bottom: 1px solid var(--border-color); border-right: 1px solid var(--border-color); text-align: center; }
+    td { padding: 8px 10px; border-bottom: 1px solid #e0e8f0; border-right: 1px solid #e0e8f0; text-align: center; font-size: 13px; }
     
-    .vault { display: flex; gap: 10px; background: #141414; padding: 15px; border-radius: 6px; border: 1px solid #262626; align-items: center;}
-    .btn-action { background: #262626; color: #fff; border: 1px solid #333; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-size: 12px; font-family: inherit; }
-    .btn-action:hover { background: #333; }
-    .btn-danger { background: rgba(248,81,73,0.1); color: #d96666; border: 1px solid rgba(217,102,102,0.4); margin-left: auto; }
-    .btn-danger:hover { background: rgba(248,81,73,0.2); }
+    .queue-container { background: var(--bg-panel); border: 1px solid var(--border-color); padding: 15px; font-family: monospace; font-size: 12px; color: var(--text-light); line-height: 1.6; }
+    
+    .vault { display: flex; gap: 10px; background: var(--header-bg); padding: 10px; border: 1px solid var(--border-color); align-items: center; justify-content: center; margin-bottom: 20px;}
+    .btn-action { background: #ffffff; color: var(--text-navy); border: 1px solid var(--border-color); padding: 5px 15px; cursor: pointer; font-family: var(--font-sans); font-weight: bold; box-shadow: 1px 1px 2px rgba(0,0,0,0.1); }
+    .btn-action:hover { background: #f0f0f0; }
+    .btn-verify { color: #0055aa; text-decoration: underline; font-weight: bold; font-size: 12px; }
 </style>
 </head>
 <body>
 
-<div class="top-bar">
-    <div class="brand">BSS Bot v5.8.2 <span id="ws-status" style="font-size: 10px; margin-left: 10px; color: #7a7a7a;">WS: Checking...</span></div>
-    <div class="vitals">
+<div class="header-panel">
+    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.2 <span id="ws-status" style="font-size: 12px; font-family: var(--font-sans); margin-left: 10px;">[WS: Checking...]</span></div>
+    <div class="vitals-row">
         <div class="vital-box"><div class="vital-label">Total P&L</div><div class="vital-value green" id="v-pnl">$0.00</div></div>
-        <div class="vital-box"><div class="vital-label">Total Trades</div><div class="vital-value" id="v-trades">0</div></div>
+        <div class="vital-box"><div class="vital-label">Total Trades Executed</div><div class="vital-value" id="v-trades">0</div></div>
         <div class="vital-box"><div class="vital-label">Sold Losers</div><div class="vital-value" id="v-losers">0</div></div>
         <div class="vital-box"><div class="vital-label">Active Slots</div><div class="vital-value" id="v-active">0</div></div>
     </div>
 </div>
 
-<div class="grid" id="active-cards"><div style="color: #7a7a7a;">Scanning order books...</div></div>
+<div class="sec-title">Active Market Dual-Leg Monitoring</div>
+<div class="grid" id="active-cards"><div style="text-align:center; padding:20px; color:var(--text-light);">Awaiting Entry Criteria...</div></div>
 
+<div class="sec-title">Consolidated Trade Lifecycle History</div>
 <div class="table-container">
-    <div class="sec-title">Execution History & Assessment</div>
     <table>
-        <thead><tr><th>Time</th><th>Market</th><th>Action</th><th>Side</th><th>Price</th><th>P&L</th><th>Audit</th></tr></thead>
-        <tbody id="log-body"><tr><td colspan="7" style="color: #7a7a7a;">No trades executed yet.</td></tr></tbody>
+        <thead><tr><th>Time</th><th>Market Slug</th><th>Action</th><th>Side</th><th>Price</th><th>Net P&L</th><th>Audit Link</th></tr></thead>
+        <tbody id="log-body"><tr><td colspan="7" style="color: var(--text-light);">No historical data available.</td></tr></tbody>
     </table>
 </div>
 
 <div class="vault">
-    <div class="sec-title" style="margin: 0; margin-right: 20px;">Data Vault</div>
-    <button class="btn-action" onclick="window.location.href='/api/dl_trades'">↓ Download Trades (.csv)</button>
-    <button class="btn-action" onclick="window.location.href='/api/dl_snaps'">↓ Download State Dumps (.csv)</button>
-    <button class="btn-action btn-danger" onclick="deleteFiles()">⚠ Delete Old Files</button>
+    <span style="font-family: var(--font-serif); font-weight: bold; margin-right: 15px;">Data Vault & Utilities:</span>
+    <button class="btn-action" onclick="window.location.href='/api/dl_trades'">Download Trades (.csv)</button>
+    <button class="btn-action" onclick="window.location.href='/api/dl_snaps'">Download Snapshots (.csv)</button>
+    <button class="btn-action" style="color: #cc0000; margin-left: 30px;" onclick="deleteFiles()">⚠ Delete Old Files</button>
 </div>
 
+<div class="sec-title">Observation Queue (Scouting)</div>
+<div class="queue-container" id="obs-queue">Scanning...</div>
+
 <script>
-function renderSparkline(history) {
+function renderSparkline(history, color) {
     if(!history || history.length < 2) return '';
     const min = Math.min(...history), max = Math.max(...history);
     const range = (max - min) || 0.01;
@@ -161,14 +184,14 @@ function renderSparkline(history) {
         return `${x},${y}`;
     }).join(' ');
     return `<svg width="100%" height="100%" viewBox="0 -10 100 120" preserveAspectRatio="none">
-        <polyline fill="none" stroke="#58a6ff" stroke-width="2" points="${pts}" />
+        <polyline fill="none" stroke="${color}" stroke-width="2" points="${pts}" />
     </svg>`;
 }
 
 async function deleteFiles() {
-    if(confirm("Delete all CSV logs? This cannot be undone.")) {
+    if(confirm("Confirm deletion of all server CSV logs?")) {
         await fetch('/api/delete_logs', {method: 'POST'});
-        alert("Logs deleted and reset.");
+        alert("Logs purged.");
     }
 }
 
@@ -177,46 +200,78 @@ setInterval(async () => {
         const r = await fetch('/api/status');
         const s = await r.json();
         
-        document.getElementById('ws-status').innerHTML = s.ws_connected ? '<span style="color:#5cbd5c">WS: LIVE</span>' : '<span style="color:#d96666">WS: DROP</span>';
+        document.getElementById('ws-status').textContent = s.ws_connected ? "[WS: CONNECTED]" : "[WS: DROPPED]";
+        document.getElementById('ws-status').style.color = s.ws_connected ? "#006600" : "#cc0000";
         document.getElementById('v-pnl').textContent = (s.pnl >= 0 ? '+' : '') + '$' + s.pnl.toFixed(2);
         document.getElementById('v-trades').textContent = s.trades;
         document.getElementById('v-losers').textContent = s.losers;
         
         let activeCount = 0;
-        let html = '';
+        let htmlCards = '';
+        let htmlQueue = '';
+        
         s.markets.forEach(m => {
-            if (m.state === 'WATCH' || m.state === 'CLOSED') return;
-            activeCount++;
-            const delta = m.state === 'BOTH' ? 0.0 : (((m.leg1_side === 'YES' ? m.yes_ask : m.no_ask) - m.leg1_price) / m.leg1_price * 100);
-            const deltaStr = delta > 0 ? `+${delta.toFixed(2)}%` : `${delta.toFixed(2)}%`;
-            const deltaCol = delta > 0 ? '#d96666' : '#5cbd5c'; // Red if price went up (bad for entry)
+            if (m.state === 'WATCH') {
+                htmlQueue += `[TTR: ${m.ttr_s}s] | ${m.slug} | YES Ask: $${m.yes_ask.toFixed(3)} | NO Ask: $${m.no_ask.toFixed(3)} | Status: Scouting<br>`;
+                return;
+            }
+            if (m.state === 'CLOSED') return;
             
-            html += `<div class="card">
+            activeCount++;
+            
+            // Calc Deltas
+            let dYes = 0, dNo = 0;
+            if(m.state === 'BOTH' || m.state === 'WAITING_NO') {
+                dYes = ((m.yes_ask - m.leg1_price) / m.leg1_price) * 100;
+            }
+            if(m.state === 'BOTH' || m.state === 'WAITING_YES') {
+                let eNo = m.state==='BOTH'? m.leg2_price : m.leg1_price;
+                dNo = ((m.no_ask - eNo) / eNo) * 100;
+            }
+            
+            let cYes = dYes >= 0 ? 'val-green' : 'val-red';
+            let cNo = dNo >= 0 ? 'val-green' : 'val-red';
+
+            htmlCards += `<div class="card">
                 <div class="card-header">
-                    <span class="card-title">${m.slug.replace('btc-updown-5m-','')}</span>
-                    <span class="card-ttr">${m.ttr_s}s</span>
+                    <span>${m.slug}</span>
+                    <span>TTR: ${m.ttr_s}s</span>
                 </div>
-                <div style="display:flex; justify-content: space-between; font-size: 11px; color: #7a7a7a;">
-                    <span>State: <b style="color:#fff">${m.state}</b></span>
-                    <span>Delta: <b style="color:${deltaCol}">${deltaStr}</b></span>
+                <div class="leg-container">
+                    <div class="leg-col">
+                        <div class="leg-title">YES LEG MONITOR</div>
+                        <div class="data-row"><span>Entry Price:</span> <b>$${m.state==='WAITING_NO'||m.state==='BOTH'?m.leg1_price.toFixed(3):'--'}</b></div>
+                        <div class="data-row"><span>Live Ticker:</span> <b>$${m.yes_ask.toFixed(3)}</b></div>
+                        <div class="data-row"><span>Current Delta:</span> <span class="${cYes}">${dYes>0?'+':''}${dYes.toFixed(2)}%</span></div>
+                        <div class="svg-container">${renderSparkline(m.history_yes, '#002060')}</div>
+                    </div>
+                    <div class="leg-col">
+                        <div class="leg-title">NO LEG MONITOR</div>
+                        <div class="data-row"><span>Entry Price:</span> <b>$${m.state==='WAITING_YES'||m.state==='BOTH'?(m.state==='BOTH'?m.leg2_price.toFixed(3):m.leg1_price.toFixed(3)):'--'}</b></div>
+                        <div class="data-row"><span>Live Ticker:</span> <b>$${m.no_ask.toFixed(3)}</b></div>
+                        <div class="data-row"><span>Current Delta:</span> <span class="${cNo}">${dNo>0?'+':''}${dNo.toFixed(2)}%</span></div>
+                        <div class="svg-container">${renderSparkline(m.history_no, '#597387')}</div>
+                    </div>
                 </div>
-                <div class="svg-container">${renderSparkline(m.history)}</div>
-                <div style="font-size: 12px;">Leg 1 Entry: $${m.leg1_price.toFixed(3)}</div>
             </div>`;
         });
+        
         document.getElementById('v-active').textContent = activeCount;
-        if(html) document.getElementById('active-cards').innerHTML = html;
+        if(htmlCards) document.getElementById('active-cards').innerHTML = htmlCards;
+        else document.getElementById('active-cards').innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-light);">Awaiting Entry Criteria...</div>';
+        
+        document.getElementById('obs-queue').innerHTML = htmlQueue || 'No upcoming markets in window.';
 
         let logHtml = '';
         [...s.trades].reverse().forEach(t => {
             const pnlStr = t.pnl !== 0.0 ? (t.pnl > 0 ? `+${t.pnl.toFixed(2)}` : t.pnl.toFixed(2)) : '--';
             logHtml += `<tr>
-                <td style="color:#7a7a7a">${t.ts}</td>
+                <td>${t.ts}</td>
                 <td>${t.slug}</td>
                 <td>${t.action}</td>
-                <td style="color:${t.side==='YES'?'#5cbd5c':'#d96666'}">${t.side}</td>
+                <td>${t.side}</td>
                 <td>$${t.price.toFixed(3)}</td>
-                <td style="color:${t.pnl>0?'#5cbd5c':(t.pnl<0?'#d96666':'#fff')}">${pnlStr}</td>
+                <td class="${t.pnl>0?'val-green':(t.pnl<0?'val-red':'')}">${pnlStr}</td>
                 <td><a href="${t.link}" target="_blank" class="btn-verify">VERIFY ↗</a></td>
             </tr>`;
         });
@@ -244,11 +299,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
                 m_data.append({
                     "slug": m.slug, "state": m.state, "ttr_s": max(0, int(m.end_ts - now)),
-                    "leg1_price": m.leg1_price, "leg1_side": "YES" if m.state == MarketState.WAITING_NO else ("NO" if m.state == MarketState.WAITING_YES else ""),
+                    "leg1_price": m.leg1_price, "leg2_price": m.leg2_price,
                     "yes_ask": yb.ask if yb else 0.0, "no_ask": nb.ask if nb else 0.0,
-                    "history": m.history[-20:]
+                    "history_yes": m.history_yes[-30:], "history_no": m.history_no[-30:]
                 })
-            
             payload = {
                 "ws_connected": GLOBAL_STATE.ws_connected, "pnl": GLOBAL_STATE.total_pnl,
                 "trades": GLOBAL_STATE.total_trades, "losers": GLOBAL_STATE.sold_losers,
@@ -285,25 +339,18 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format, *args): pass
 
 def run_server():
-    server = ThreadingHTTPServer(("", PORT), DashboardHandler)
-    print(f"[System] Command Center listening on port {PORT}", flush=True)
+    server = socketserver.ThreadingTCPServer(("", PORT), DashboardHandler)
+    print(f"[System] UI listening on port {PORT}", flush=True)
     server.serve_forever()
-
-class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    daemon_threads = True
 
 # ─── CORE STRATEGY ───
 def execute_trade(mdm: MarketData, side: str, price: float, action: str, pnl: float = 0.0):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     link = f"https://polymarket.com/event/{mdm.slug}"
-    print(f"[{ts}] [{action}] {mdm.slug} | {side} @ {price:.3f} | Mode: {MODE}", flush=True)
-    
+    print(f"[{ts}] [{action}] {mdm.slug} | {side} @ {price:.3f}", flush=True)
     GLOBAL_STATE.total_trades += 1
-    if "SELL" in action:
-        GLOBAL_STATE.total_pnl += pnl
-    if action == "SELL_LOSER":
-        GLOBAL_STATE.sold_losers += 1
-
+    if "SELL" in action: GLOBAL_STATE.total_pnl += pnl
+    if action == "SELL_LOSER": GLOBAL_STATE.sold_losers += 1
     GLOBAL_STATE.trades_log.append({"ts": ts, "slug": mdm.slug, "action": action, "side": side, "price": price, "pnl": pnl, "link": link})
     log_trade_csv(ts, mdm.slug, action, side, price, pnl)
 
@@ -311,12 +358,10 @@ def evaluate_market(mdm: MarketData, now: float):
     if mdm.state == MarketState.CLOSED: return
     yb, nb = GLOBAL_STATE.books.get(mdm.yes_token), GLOBAL_STATE.books.get(mdm.no_token)
     if not yb or not nb: return
-    
     ttr = mdm.end_ts - now
     if ttr <= 0:
         mdm.state = MarketState.CLOSED
         return
-        
     t2 = T_SECOND_LIVE if ttr <= 300 else T_SECOND_PRE
     
     if mdm.state == MarketState.WATCH:
@@ -360,7 +405,6 @@ def tick_loop():
 
 def snapshot_loop():
     while GLOBAL_STATE.running:
-        now = time.time()
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         try:
             with open("snapshot_live.csv", "a", newline="") as f:
@@ -371,64 +415,62 @@ def snapshot_loop():
                         ya, ybd = yb.ask if yb else 0, yb.bid if yb else 0
                         na, nbd = nb.ask if nb else 0, nb.bid if nb else 0
                         writer.writerow([ts, m.slug, m.state, f"{ya:.3f}", f"{ybd:.3f}", f"{na:.3f}", f"{nbd:.3f}"])
-                        # Append to SVG history
-                        active_price = ya if m.state == MarketState.WAITING_NO else na
-                        m.history.append(active_price)
-                        if len(m.history) > 60: m.history.pop(0)
+                        m.history_yes.append(ya)
+                        m.history_no.append(na)
+                        if len(m.history_yes) > 30: m.history_yes.pop(0)
+                        if len(m.history_no) > 30: m.history_no.pop(0)
         except Exception: pass
-        time.sleep(30) # Dump every 30s
+        time.sleep(30)
 
 # ─── DATA THREADS ───
 def discovery_thread():
     while GLOBAL_STATE.running:
         now = time.time()
-        current_b = int((now // 300) * 300)
-        boundaries = [current_b + (i * 300) for i in range(1, (LOOKAHEAD_MINUTES // 5) + 1)]
+        boundaries = [int((now // 300) * 300) + (i * 300) for i in range(1, (LOOKAHEAD_MINUTES // 5) + 1)]
         new_markets = False
         for ts in boundaries:
             slug = f"btc-updown-5m-{ts}"
             try:
                 res = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}", timeout=5)
                 if res.status_code == 200 and res.json():
-                    market_info = res.json()[0].get("markets", [])[0]
-                    cid = market_info["conditionId"]
+                    m_info = res.json()[0].get("markets", [])[0]
+                    cid = m_info["conditionId"]
                     if cid not in GLOBAL_STATE.markets:
-                        tokens = json.loads(market_info["clobTokenIds"])
-                        outcomes = json.loads(market_info["outcomes"])
+                        tks = json.loads(m_info["clobTokenIds"])
+                        outcomes = json.loads(m_info["outcomes"])
                         y_idx = 0 if outcomes[0].lower() in ["yes", "up"] else 1
-                        end_ts = datetime.fromisoformat(market_info["endDate"].replace("Z", "+00:00")).timestamp()
-                        GLOBAL_STATE.markets[cid] = MarketData(cid, slug, tokens[y_idx], tokens[1-y_idx], end_ts)
+                        end_ts = datetime.fromisoformat(m_info["endDate"].replace("Z", "+00:00")).timestamp()
+                        GLOBAL_STATE.markets[cid] = MarketData(cid, slug, tks[y_idx], tks[1-y_idx], end_ts)
                         print(f"[Discovery] Tracking: {slug}", flush=True)
                         new_markets = True
             except Exception: pass
-        if new_markets and GLOBAL_STATE.ws_handle: GLOBAL_STATE.ws_handle.close() # Force WS reconnect
+        if new_markets and GLOBAL_STATE.ws_handle: GLOBAL_STATE.ws_handle.close()
         time.sleep(30)
 
 def polymarket_ws_thread():
     def on_message(ws, msg):
         try:
-            data = json.loads(msg)
-            for event in (data if isinstance(data, list) else [data]):
+            for event in (json.loads(msg) if isinstance(json.loads(msg), list) else [json.loads(msg)]):
                 if not isinstance(event, dict): continue
-                asset_id = event.get("asset_id") or event.get("market")
-                if not asset_id: continue
+                aid = event.get("asset_id") or event.get("market")
+                if not aid: continue
                 if event.get("event_type") == "book":
-                    book = GLOBAL_STATE.books.setdefault(asset_id, OrderBook())
+                    book = GLOBAL_STATE.books.setdefault(aid, OrderBook())
                     book.bid = max((float(b["price"]) for b in event.get("bids", [])), default=0.0)
                     book.ask = min((float(a["price"]) for a in event.get("asks", [])), default=0.0)
                 elif event.get("event_type") == "price_change":
-                    book = GLOBAL_STATE.books.get(asset_id)
+                    book = GLOBAL_STATE.books.get(aid)
                     if not book: continue
                     for ch in event.get("changes", []):
-                        side, price = ch.get("side", ""), float(ch.get("price", 0))
-                        if side == "BUY" and price > book.bid: book.bid = price
-                        elif side == "SELL" and (book.ask == 0 or price < book.ask): book.ask = price
+                        s, p = ch.get("side", ""), float(ch.get("price", 0))
+                        if s == "BUY" and p > book.bid: book.bid = p
+                        elif s == "SELL" and (book.ask == 0 or p < book.ask): book.ask = p
         except Exception: pass
 
     def on_open(ws):
         GLOBAL_STATE.ws_connected = True
-        tokens = [t for m in GLOBAL_STATE.markets.values() if m.state != MarketState.CLOSED for t in (m.yes_token, m.no_token)]
-        if tokens: ws.send(json.dumps({"type": "Market", "assets_ids": tokens}))
+        tks = [t for m in GLOBAL_STATE.markets.values() if m.state != MarketState.CLOSED for t in (m.yes_token, m.no_token)]
+        if tks: ws.send(json.dumps({"type": "Market", "assets_ids": tks}))
 
     while GLOBAL_STATE.running:
         try:
@@ -437,7 +479,7 @@ def polymarket_ws_thread():
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception: pass
         GLOBAL_STATE.ws_handle, GLOBAL_STATE.ws_connected = None, False
-        time.sleep(2) # Auto-reconnect
+        time.sleep(2)
 
 if __name__ == "__main__":
     init_csv()
@@ -446,5 +488,4 @@ if __name__ == "__main__":
     threading.Thread(target=polymarket_ws_thread, daemon=True).start()
     threading.Thread(target=tick_loop, daemon=True).start()
     threading.Thread(target=snapshot_loop, daemon=True).start()
-
     while GLOBAL_STATE.running: time.sleep(1)
