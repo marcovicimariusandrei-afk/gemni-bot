@@ -198,12 +198,12 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, format, *args):
-        pass # Suppress console spam
+        pass
 
 def run_server():
     port = int(os.getenv("PORT", "8080"))
     server = ThreadingHTTPServer(("", port), DashboardHandler)
-    print(f"[System] Legacy v5.8.1 UI listening on port {port}", flush=True)
+    print(f"[System] Live UI Dashboard web server listening on port {port}", flush=True)
     server.serve_forever()
 
 # ─── CORE STRATEGY ───
@@ -215,127 +215,8 @@ def execute_trade(mdm: MarketData, side: str, price: float, action: str):
     })
 
 def evaluate_market(mdm: MarketData, now: float):
-    if mdm.state == MarketState.CLOSED: return
-    yb = GLOBAL_STATE.books.get(mdm.yes_token)
-    nb = GLOBAL_STATE.books.get(mdm.no_token)
-    if not yb or not nb: return
-    
-    ttr = mdm.end_ts - now
-    if ttr <= 0:
-        mdm.state = MarketState.CLOSED
+    if mdm.state == MarketState.CLOSED:
         return
-        
-    t2 = T_SECOND_LIVE if ttr <= 300 else T_SECOND_PRE
-    
-    if mdm.state == MarketState.WATCH:
-        if 0 < yb.ask <= T_FIRST:
-            mdm.leg1_price = yb.ask
-            mdm.state = MarketState.WAITING_NO
-            execute_trade(mdm, "YES", yb.ask, "LEG_1_ENTRY")
-        elif 0 < nb.ask <= T_FIRST:
-            mdm.leg1_price = nb.ask
-            mdm.state = MarketState.WAITING_YES
-            execute_trade(mdm, "NO", nb.ask, "LEG_1_ENTRY")
-            
-    elif mdm.state == MarketState.WAITING_NO:
-        if 0 < nb.ask <= t2:
-            mdm.leg2_price = nb.ask
-            mdm.state = MarketState.BOTH
-            execute_trade(mdm, "NO", nb.ask, "LEG_2_ENTRY")
-            
-    elif mdm.state == MarketState.WAITING_YES:
-        if 0 < yb.ask <= t2:
-            mdm.leg2_price = yb.ask
-            mdm.state = MarketState.BOTH
-            execute_trade(mdm, "YES", yb.ask, "LEG_2_ENTRY")
-            
-    elif mdm.state == MarketState.BOTH:
-        if ttr <= SELL_LOSER_FLOOR_S:
-            if yb.bid >= SELL_LOSER_THRESH:
-                mdm.state = MarketState.CLOSED
-                execute_trade(mdm, "NO", nb.bid, "SELL_LOSER")
-            elif nb.bid >= SELL_LOSER_THRESH:
-                mdm.state = MarketState.CLOSED
-                execute_trade(mdm, "YES", yb.bid, "SELL_LOSER")
-
-def tick_loop():
-    while GLOBAL_STATE.running:
-        now = time.time()
-        for m in list(GLOBAL_STATE.markets.values()):
-            try:
-                evaluate_market(m, now)
-            except Exception:
-                pass
-        time.sleep(0.05)
-
-# ─── DATA THREADS (Gamma API + WebSocket) ───
-def discovery_thread():
-    while GLOBAL_STATE.running:
-        now = time.time()
-        current_b = int((now // 300) * 300)
-        lookahead_count = LOOKAHEAD_MINUTES // 5
-        boundaries = [current_b + (i * 300) for i in range(1, lookahead_count + 1)]
-
-        new_markets = False
-        for ts in boundaries:
-            slug = f"btc-updown-5m-{ts}"
-            try:
-                res = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}", timeout=5)
-                if res.status_code == 200 and res.json():
-                    market_info = res.json()[0].get("markets", [])[0]
-                    cid = market_info["conditionId"]
-                    if cid not in GLOBAL_STATE.markets:
-                        tokens = json.loads(market_info["clobTokenIds"])
-                        outcomes = json.loads(market_info["outcomes"])
-                        y_idx = 0 if outcomes[0].lower() in ["yes", "up"] else 1
-                        n_idx = 1 if y_idx == 0 else 0
-                        end_ts = datetime.fromisoformat(market_info["endDate"].replace("Z", "+00:00")).timestamp()
-                        
-                        GLOBAL_STATE.markets[cid] = MarketData(cid, slug, tokens[y_idx], tokens[n_idx], end_ts)
-                        print(f"[Discovery] Tracking: {slug}", flush=True)
-                        new_markets = True
-            except Exception:
-                pass
-        
-        if new_markets and GLOBAL_STATE.ws_handle:
-            GLOBAL_STATE.ws_handle.close()
-            
-        time.sleep(30)
-
-def polymarket_ws_thread():
-    def on_message(ws, msg):
-        try:
-            data = json.loads(msg)
-            for event in (data if isinstance(data, list) else [data]):
-                if not isinstance(event, dict): continue
-                asset_id = event.get("asset_id") or event.get("market")
-                if not asset_id: continue
-
-                if event.get("event_type") == "book":
-                    book = GLOBAL_STATE.books.setdefault(asset_id, OrderBook())
-                    bids, asks = event.get("bids", []), event.get("asks", [])
-                    book.bid = max((float(b["price"]) for b in bids), default=0.0)
-                    book.ask = min((float(a["price"]) for a in asks), default=0.0)
-
-                elif event.get("event_type") == "price_change":
-                    book = GLOBAL_STATE.books.get(asset_id)
-                    if not book: continue
-                    for ch in event.get("changes", []):
-                        side, price = ch.get("side", ""), float(ch.get("price", 0))
-                        if side == "BUY" and price > book.bid: book.bid = price
-                        elif side == "SELL" and (book.ask == 0 or price < book.ask): book.ask = price
-        except Exception:
-            pass
-
-    def on_open(ws):
-        GLOBAL_STATE.ws_connected = True
-        tokens = []
-        for m in GLOBAL_STATE.markets.values():
-            if m.state != MarketState.CLOSED:
-                tokens.extend([m.yes_token, m.no_token])
-        if tokens:
-            ws.send(json.dumps({"type": "Market", "assets_ids": tokens}))
-            print(f"[WS] Subscribed to {len(tokens)} active tokens.", flush=True)
-
-    while GLOBAL_STATE.running:
-        try
+    yb = GLOBAL_STATE.books.get(m.yes_token)
+    nb = GLOBAL_STATE.books.get(m.no_token)
+    if not yb or not nb:
