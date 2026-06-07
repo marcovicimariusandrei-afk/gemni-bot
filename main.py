@@ -335,3 +335,39 @@ def polymarket_ws_thread():
                 tokens.extend([m.yes_token, m.no_token])
         if tokens:
             ws.send(json.dumps({"type": "Market", "assets_ids": tokens}))
+
+    while GLOBAL_STATE.running:
+        try:
+            ws = websocket.WebSocketApp(
+                "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+                on_message=on_message,
+                on_open=on_open
+            )
+            GLOBAL_STATE.ws_handle = ws
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception:
+            pass
+        GLOBAL_STATE.ws_handle = None
+        GLOBAL_STATE.ws_connected = False
+        time.sleep(2)
+
+# ─── MAIN BOOT SEQUENCE ───
+if __name__ == "__main__":
+    print("=== Booting BSS Bot with Legacy UI Dashboard ===", flush=True)
+
+    def shutdown(sig, frame):
+        GLOBAL_STATE.running = False
+        if GLOBAL_STATE.ws_handle:
+            GLOBAL_STATE.ws_handle.close()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    threading.Thread(target=run_server, daemon=True).start()
+    threading.Thread(target=discovery_thread, daemon=True).start()
+    threading.Thread(target=polymarket_ws_thread, daemon=True).start()
+    threading.Thread(target=tick_loop, daemon=True).start()
+
+    while GLOBAL_STATE.running:
+        time.sleep(1)
