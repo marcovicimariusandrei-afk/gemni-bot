@@ -1,5 +1,5 @@
 """
-main.py — Opportunistic BSS Bot (v5.8.13 Visual Exit Markers)
+main.py — Opportunistic BSS Bot (v5.8.15 Stability & UI Fix)
 """
 import os
 import sys
@@ -154,7 +154,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     
     .grid { display: grid; grid-template-columns: 1fr; gap: 20px; margin-bottom: 35px; }
     .card { background: var(--bg-panel); border: 1px solid var(--border-color); box-shadow: 0 4px 6px rgba(0,0,0,0.3); display: flex; flex-direction: column; border-radius: 6px; overflow: hidden;}
-    .card-header { background: var(--sub-header-bg); padding: 12px 20px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; font-weight: 800; color: var(--text-navy); font-size: 15px;}
+    .card-header { background: var(--sub-header-bg); padding: 12px 20px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; font-weight: 800; color: var(--text-navy); font-size: 15px; align-items: center;}
     
     .leg-container { display: flex; width: 100%; }
     .leg-col { flex: 1; padding: 20px; border-right: 1px solid var(--border-color); }
@@ -186,7 +186,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.13 
+    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.15 
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
@@ -232,15 +232,15 @@ function renderSparkline(history, color, t1_price, t2_price) {
     
     let svg = `<polyline fill="none" stroke="${color}" stroke-width="2.5" points="${pts}" />`;
     
-    // Draw dot for Tier 1 sell
-    if (t1_price > 0 && t1_price >= min && t1_price <= max) {
-        const yT1 = 100 - (((t1_price - min) / range) * 100);
-        svg += `<text x="80" y="${yT1}" fill="var(--val-yellow)" font-size="24" text-anchor="middle" dominant-baseline="central">●</text>`;
+    if (t1_price > 0) {
+        let yT1 = 100 - (((t1_price - min) / range) * 100);
+        yT1 = Math.max(5, Math.min(95, yT1)); 
+        svg += `<circle cx="80" cy="${yT1}" r="4" fill="var(--val-yellow)" stroke="#0B1120" stroke-width="1.5" />`;
     }
-    // Draw dot for Tier 2 sell
-    if (t2_price > 0 && t2_price >= min && t2_price <= max) {
-        const yT2 = 100 - (((t2_price - min) / range) * 100);
-        svg += `<text x="95" y="${yT2}" fill="var(--val-pink)" font-size="24" text-anchor="middle" dominant-baseline="central">●</text>`;
+    if (t2_price > 0) {
+        let yT2 = 100 - (((t2_price - min) / range) * 100);
+        yT2 = Math.max(5, Math.min(95, yT2)); 
+        svg += `<circle cx="92" cy="${yT2}" r="4" fill="var(--val-pink)" stroke="#0B1120" stroke-width="1.5" />`;
     }
     
     return `<svg width="100%" height="100%" viewBox="0 -10 100 120" preserveAspectRatio="none">${svg}</svg>`;
@@ -286,9 +286,12 @@ setInterval(async () => {
                 htmlQueue += `[TTR: ${m.ttr_s}s] | ${m.slug} | YES Ask: $${m.yes_ask.toFixed(3)} | NO Ask: $${m.no_ask.toFixed(3)} | Status: ${currentStatus}<br>`;
                 return;
             }
-            if (m.state === 'CLOSED') return;
+            if (m.state === 'CLOSED' && m.ttr_s <= -5) return;
             
             activeCount++;
+            
+            let isClosed = m.state === 'CLOSED';
+            let closedBadge = isClosed ? `<span style="background:var(--val-red); color:#fff; padding:3px 8px; border-radius:4px; font-size:11px; margin-left:10px; font-family:var(--font-sans);">SOLD - TICKER ONLY</span>` : '';
             
             let dYes = m.yes_entry > 0 ? ((m.yes_ask - m.yes_entry) / m.yes_entry) * 100 : 0;
             let dNo = m.no_entry > 0 ? ((m.no_ask - m.no_entry) / m.no_entry) * 100 : 0;
@@ -308,13 +311,13 @@ setInterval(async () => {
 
             htmlCards += `<div class="card">
                 <div class="card-header">
-                    <span>${m.slug}</span>
+                    <span>${m.slug} ${closedBadge}</span>
                     <span style="color:var(--text-light);">TTR: <span style="color:var(--text-navy);">${m.ttr_s}s</span></span>
                 </div>
                 <div class="leg-container">
                     <div class="leg-col">
                         <div class="leg-title">YES LEG MONITOR</div>
-                        <div class="data-row"><span>Raw Ticker Entry:</span> <b>$${m.yes_entry.toFixed(3)}</b></div>
+                        <div class="data-row"><span>Raw Entry:</span> <b>$${m.yes_entry.toFixed(3)}</b></div>
                         <div class="data-row"><span>Effective Entry (w/ fees):</span> <b>$${effYes.toFixed(3)}</b></div>
                         <div class="data-row"><span>Shares Acquired:</span> <b>${m.yes_shares.toFixed(2)}</b></div>
                         <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;"><span>Live Ticker:</span> <b>$${m.yes_ask.toFixed(3)}</b></div>
@@ -324,7 +327,7 @@ setInterval(async () => {
                     </div>
                     <div class="leg-col">
                         <div class="leg-title">NO LEG MONITOR</div>
-                        <div class="data-row"><span>Raw Ticker Entry:</span> <b>$${m.no_entry.toFixed(3)}</b></div>
+                        <div class="data-row"><span>Raw Entry:</span> <b>$${m.no_entry.toFixed(3)}</b></div>
                         <div class="data-row"><span>Effective Entry (w/ fees):</span> <b>$${effNo.toFixed(3)}</b></div>
                         <div class="data-row"><span>Shares Acquired:</span> <b>${m.no_shares.toFixed(2)}</b></div>
                         <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;"><span>Live Ticker:</span> <b>$${m.no_ask.toFixed(3)}</b></div>
@@ -347,8 +350,9 @@ setInterval(async () => {
             const pnlStr = h.pnl !== 0.0 ? (h.pnl > 0 ? `+${h.pnl.toFixed(2)}` : h.pnl.toFixed(2)) : '--';
             
             let badges = '';
-            if (h.t1_side) badges += `<span style="color:var(--val-yellow); font-size:14px; margin-left:6px; cursor:help;" title="Tier 1 Sell (${h.t1_side}) @ $${h.t1_price.toFixed(3)}">●</span>`;
-            if (h.t2_side) badges += `<span style="color:var(--val-pink); font-size:14px; margin-left:4px; cursor:help;" title="Tier 2 Sell (${h.t2_side}) @ $${h.t2_price.toFixed(3)}">●</span>`;
+            // Safe checking for badge data
+            if (h.t1_side && h.t1_side !== '') badges += `<span style="color:var(--val-yellow); font-size:14px; margin-left:6px; cursor:help;" title="Tier 1 Sell (${h.t1_side}) @ $${h.t1_price ? h.t1_price.toFixed(3) : '0.000'}">●</span>`;
+            if (h.t2_side && h.t2_side !== '') badges += `<span style="color:var(--val-pink); font-size:14px; margin-left:4px; cursor:help;" title="Tier 2 Sell (${h.t2_side}) @ $${h.t2_price ? h.t2_price.toFixed(3) : '0.000'}">●</span>`;
             
             logHtml += `<tr>
                 <td style="color:var(--text-light); font-family:var(--font-sans); font-size: 13px;">${h.time}</td>
@@ -444,9 +448,17 @@ def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares:
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[{ts}] [{action}] {mdm.slug} | {side} @ {price:.3f} | Shares: {shares:.2f}", flush=True)
     
-    if action == "SELL_LOSER_T1" or action == "SELL_LOSER_T2":
+    if action == "SELL_LOSER_T1":
         GLOBAL_STATE.sold_losers += 1
         mdm.salvage_revenue += (shares * price)
+        mdm.t1_side = side
+        mdm.t1_price = price
+    
+    if action == "SELL_LOSER_T2":
+        GLOBAL_STATE.sold_losers += 1
+        mdm.salvage_revenue += (shares * price)
+        mdm.t2_side = side
+        mdm.t2_price = price
         
     if "CLOSED" in action or action == "EXPIRED":
         mdm.close_time = ts
@@ -458,12 +470,13 @@ def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares:
     threading.Thread(target=log_trade_csv_worker, args=(ts, mdm.slug, action, side, price, shares, fees, ttr, pnl), daemon=True).start()
 
 def evaluate_market(mdm: MarketData, now: float):
-    if mdm.state == MarketState.CLOSED: return
+    if mdm.state == MarketState.CLOSED and (mdm.end_ts - now) <= -5: return
+        
     yb, nb = GLOBAL_STATE.books.get(mdm.yes_token), GLOBAL_STATE.books.get(mdm.no_token)
     if not yb or not nb: return
     ttr = int(mdm.end_ts - now)
     
-    if ttr <= -5:
+    if ttr <= -5 and mdm.state != MarketState.CLOSED:
         mdm.state = MarketState.CLOSED
         
         cost_basis = mdm.total_fees_paid
@@ -476,7 +489,7 @@ def evaluate_market(mdm: MarketData, now: float):
         execute_trade(mdm, "EXPIRED", 0.00, "EXPIRED", 0.0, 0.0, ttr, calc_pnl)
         return
         
-    if ttr <= 0: return
+    if ttr <= 0 or mdm.state == MarketState.CLOSED: return
         
     t2 = T_SECOND_LIVE if ttr <= 300 else T_SECOND_PRE
     
@@ -537,10 +550,8 @@ def evaluate_market(mdm: MarketData, now: float):
             
         if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and ttr <= SELL_LOSER_T1_TTR_MAX:
             mdm.t1_executed = True
-            mdm.t1_side = loser_side
-            mdm.t1_price = loser_bid
-            shares_to_sell = loser_shares * 0.50
             
+            shares_to_sell = loser_shares * 0.50
             if loser_side == "YES": mdm.yes_shares -= shares_to_sell
             else: mdm.no_shares -= shares_to_sell
             
@@ -550,8 +561,6 @@ def evaluate_market(mdm: MarketData, now: float):
             
         elif winner_bid >= SELL_LOSER_T2_THRESH:
             mdm.state = MarketState.CLOSED
-            mdm.t2_side = loser_side
-            mdm.t2_price = loser_bid
             
             shares_to_sell = loser_shares * 0.99 
             fee = (shares_to_sell * loser_bid) * 0.001 
@@ -581,7 +590,7 @@ def snapshot_loop():
             with open("snapshot_live.csv", "a", newline="") as f:
                 writer = csv.writer(f)
                 for m in GLOBAL_STATE.markets.values():
-                    if m.state != MarketState.CLOSED:
+                    if m.end_ts >= time.time() - 5:
                         yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
                         ya, ybd = yb.ask if yb else 0, yb.bid if yb else 0
                         na, nbd = nb.ask if nb else 0, nb.bid if nb else 0
@@ -594,7 +603,6 @@ def snapshot_loop():
             pass
         time.sleep(30)
 
-# ─── DATA THREADS ───
 def discovery_thread():
     while GLOBAL_STATE.running:
         now = time.time()
@@ -618,10 +626,8 @@ def discovery_thread():
             except Exception:
                 pass
         if new_markets and GLOBAL_STATE.ws_handle:
-            try:
-                GLOBAL_STATE.ws_handle.close()
-            except Exception:
-                pass
+            try: GLOBAL_STATE.ws_handle.close()
+            except Exception: pass
         time.sleep(30)
 
 def polymarket_ws_thread():
@@ -630,44 +636,35 @@ def polymarket_ws_thread():
             parsed_msg = json.loads(msg)
             event_list = parsed_msg if isinstance(parsed_msg, list) else [parsed_msg]
             for event in event_list:
-                if not isinstance(event, dict):
-                    continue
+                if not isinstance(event, dict): continue
                 aid = event.get("asset_id") or event.get("market")
-                if not aid:
-                    continue
+                if not aid: continue
                 if event.get("event_type") == "book":
                     book = GLOBAL_STATE.books.setdefault(aid, OrderBook())
                     book.bid = max((float(b["price"]) for b in event.get("bids", [])), default=0.0)
                     book.ask = min((float(a["price"]) for a in event.get("asks", [])), default=0.0)
                 elif event.get("event_type") == "price_change":
                     book = GLOBAL_STATE.books.get(aid)
-                    if not book:
-                        continue
+                    if not book: continue
                     for ch in event.get("changes", []):
                         s, p = ch.get("side", ""), float(ch.get("price", 0))
-                        if s == "BUY" and p > book.bid:
-                            book.bid = p
-                        elif s == "SELL" and (book.ask == 0 or p < book.ask):
-                            book.ask = p
-        except Exception:
-            pass
+                        if s == "BUY" and p > book.bid: book.bid = p
+                        elif s == "SELL" and (book.ask == 0 or p < book.ask): book.ask = p
+        except Exception: pass
 
     def on_open(ws):
         GLOBAL_STATE.ws_connected = True
-        tks = [t for m in GLOBAL_STATE.markets.values() if m.state != MarketState.CLOSED for t in (m.yes_token, m.no_token)]
+        tks = [t for m in GLOBAL_STATE.markets.values() if m.end_ts >= time.time() - 5 for t in (m.yes_token, m.no_token)]
         if tks:
-            try:
-                ws.send(json.dumps({"type": "Market", "assets_ids": tks}))
-            except Exception:
-                pass
+            try: ws.send(json.dumps({"type": "Market", "assets_ids": tks}))
+            except Exception: pass
 
     while GLOBAL_STATE.running:
         try:
             ws = websocket.WebSocketApp("wss://ws-subscriptions-clob.polymarket.com/ws/market", on_message=on_message, on_open=on_open)
             GLOBAL_STATE.ws_handle = ws
             ws.run_forever(ping_interval=20, ping_timeout=10)
-        except Exception:
-            pass
+        except Exception: pass
         GLOBAL_STATE.ws_handle = None
         GLOBAL_STATE.ws_connected = False
         time.sleep(2)
