@@ -206,17 +206,4 @@ def run_server():
     print(f"[System] Live UI Dashboard web server listening on port {port}", flush=True)
     server.serve_forever()
 
-# ─── CORE STRATEGY ───
-def execute_trade(mdm: MarketData, side: str, price: float, action: str):
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"[{ts}] [{action}] {mdm.slug} | {side} @ {price:.3f} | Mode: {MODE}", flush=True)
-    GLOBAL_STATE.trades_log.append({
-        "ts": ts, "slug": mdm.slug, "action": action, "side": side, "price": price
-    })
-
-def evaluate_market(mdm: MarketData, now: float):
-    if mdm.state == MarketState.CLOSED:
-        return
-    yb = GLOBAL_STATE.books.get(m.yes_token)
-    nb = GLOBAL_STATE.books.get(m.no_token)
-    if not yb or not nb:
+# ──
