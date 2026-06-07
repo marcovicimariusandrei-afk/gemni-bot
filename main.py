@@ -1,5 +1,5 @@
 """
-main.py — Opportunistic BSS Bot (v5.8.8 Tranche Strategy & API Workarounds)
+main.py — Opportunistic BSS Bot (v5.8.9 Deadline Entries, Safe Expirations & Dark UI)
 """
 import os
 import sys
@@ -21,11 +21,14 @@ T_FIRST = float(os.getenv("BS_BSS_T_FIRST", "0.49"))
 T_SECOND_PRE = float(os.getenv("BS_BSS_T_SECOND_PRE", "0.50"))
 T_SECOND_LIVE = float(os.getenv("BS_BSS_T_SECOND_LIVE", "0.51"))
 
-# HARD CONSTRAINT: 5.1 USDC to clear 5-share API minimums on 50% partial exits
 BASE_CAPITAL_PER_LEG = 5.1  
 TAKER_FEE_RATE = 0.018 
 
-# Hybrid Tranche Thresholds
+# Deadline Strategy Config
+HEDGE_DEADLINE_TTR = 320
+MAX_COMBINED_COST = 1.02
+
+# Hybrid Tranche Exit Config
 SELL_LOSER_T1_THRESH = 0.86
 SELL_LOSER_T1_TTR_MAX = 60
 SELL_LOSER_T2_THRESH = 0.95
@@ -84,7 +87,7 @@ class BotState:
 
 GLOBAL_STATE = BotState()
 
-# ─── ASYNC CSV LOGGING SYSTEM (10-Column) ───
+# ─── ASYNC CSV LOGGING SYSTEM ───
 def init_csv():
     if not os.path.exists("trades_full.csv"):
         with open("trades_full.csv", "w", newline="") as f:
@@ -100,7 +103,7 @@ def log_trade_csv_worker(ts, slug, action, side, price, shares, fees, ttr, pnl):
             csv.writer(f).writerow([ts, slug, action, side, f"{price:.3f}", f"{shares:.2f}", f"{fees:.3f}", ttr, f"{pnl:.3f}", link])
     except Exception: pass
 
-# ─── DASHBOARD HTML (v5.8.8 High-Contrast UI) ───
+# ─── DASHBOARD HTML (v5.8.9 Dark Mode) ───
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -108,36 +111,36 @@ DASHBOARD_HTML = r"""<!doctype html>
 <title>BSS Analysis Dashboard</title>
 <style>
     :root {
-        --bg-main: #f0f2f5;
-        --bg-panel: #ffffff;
-        --header-bg: #0f172a;
-        --header-text: #ffffff;
-        --sub-header-bg: #f8fafc;
-        --text-navy: #0f172a;
-        --text-light: #475569;
-        --border-color: #cbd5e1;
-        --val-green: #10b981;
-        --val-red: #ef4444;
+        --bg-main: #0B1120;
+        --bg-panel: #1E293B;
+        --header-bg: #0F172A;
+        --header-text: #F8FAFC;
+        --sub-header-bg: #0F172A;
+        --text-navy: #F8FAFC;
+        --text-light: #94A3B8;
+        --border-color: #334155;
+        --val-green: #34D399;
+        --val-red: #F87171;
         --font-serif: Georgia, "Times New Roman", serif;
         --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
     body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
     
-    .header-panel { background: var(--header-bg); border: 1px solid var(--header-bg); display: flex; flex-direction: column; text-align: center; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-radius: 6px; overflow: hidden; }
-    .brand-title { font-family: var(--font-serif); font-size: 22px; font-weight: bold; color: var(--header-text); padding: 14px 0; border-bottom: 1px solid #1e293b; }
+    .header-panel { background: var(--header-bg); border: 1px solid var(--border-color); display: flex; flex-direction: column; text-align: center; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border-radius: 6px; overflow: hidden; }
+    .brand-title { font-family: var(--font-serif); font-size: 22px; font-weight: bold; color: var(--header-text); padding: 14px 0; border-bottom: 1px solid var(--border-color); }
     
     .vitals-row { display: flex; background: var(--sub-header-bg); }
     .vital-box { flex: 1; padding: 15px; border-right: 1px solid var(--border-color); text-align: center; }
     .vital-box:last-child { border-right: none; }
     .vital-label { font-size: 12px; font-weight: 700; text-transform: uppercase; margin-bottom: 8px; color: var(--text-light); letter-spacing: 0.5px; }
-    .vital-value { background: var(--bg-panel); color: var(--text-navy); font-size: 24px; font-weight: 800; padding: 8px; border-radius: 4px; border: 1px solid #e2e8f0; font-family: monospace; }
-    .vital-value.green { color: var(--val-green); border-color: #a7f3d0; background: #ecfdf5;}
-    .vital-value.red { color: var(--val-red); border-color: #fecaca; background: #fef2f2;}
+    .vital-value { background: var(--bg-panel); color: var(--text-navy); font-size: 24px; font-weight: 800; padding: 8px; border-radius: 4px; border: 1px solid var(--border-color); font-family: monospace; }
+    .vital-value.green { color: var(--val-green); border-color: #064E3B; background: #065F46;}
+    .vital-value.red { color: var(--val-red); border-color: #7F1D1D; background: #991B1B;}
     
-    .sec-title { background: var(--header-bg); color: var(--header-text); font-family: var(--font-serif); font-size: 15px; font-weight: bold; text-align: center; padding: 12px; margin-bottom: 15px; border-radius: 6px; letter-spacing: 0.5px;}
+    .sec-title { background: var(--header-bg); color: var(--header-text); font-family: var(--font-serif); font-size: 15px; font-weight: bold; text-align: center; padding: 12px; margin-bottom: 15px; border-radius: 6px; letter-spacing: 0.5px; border: 1px solid var(--border-color);}
     
     .grid { display: grid; grid-template-columns: 1fr; gap: 20px; margin-bottom: 35px; }
-    .card { background: var(--bg-panel); border: 1px solid var(--border-color); box-shadow: 0 4px 6px rgba(0,0,0,0.05); display: flex; flex-direction: column; border-radius: 6px; overflow: hidden;}
+    .card { background: var(--bg-panel); border: 1px solid var(--border-color); box-shadow: 0 4px 6px rgba(0,0,0,0.3); display: flex; flex-direction: column; border-radius: 6px; overflow: hidden;}
     .card-header { background: var(--sub-header-bg); padding: 12px 20px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; font-weight: 800; color: var(--text-navy); font-size: 15px;}
     
     .leg-container { display: flex; width: 100%; }
@@ -150,26 +153,26 @@ DASHBOARD_HTML = r"""<!doctype html>
     .val-green { color: var(--val-green); font-weight: 800; font-family: monospace; font-size: 15px;}
     .val-red { color: var(--val-red); font-weight: 800; font-family: monospace; font-size: 15px;}
     
-    .svg-container { height: 50px; margin-top: 15px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px;}
+    .svg-container { height: 50px; margin-top: 15px; background: #0F172A; border: 1px solid var(--border-color); border-radius: 4px;}
     
-    .table-container { background: var(--bg-panel); border: 1px solid var(--border-color); margin-bottom: 35px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); border-radius: 6px; overflow: hidden; }
+    .table-container { background: var(--bg-panel); border: 1px solid var(--border-color); margin-bottom: 35px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border-radius: 6px; overflow: hidden; }
     table { width: 100%; border-collapse: collapse; text-align: left; }
     th { background: var(--sub-header-bg); color: var(--text-light); font-size: 12px; font-weight: 800; text-transform: uppercase; padding: 12px; border-bottom: 1px solid var(--border-color); text-align: center; letter-spacing: 0.5px;}
-    td { padding: 12px 10px; border-bottom: 1px solid #e2e8f0; text-align: center; font-size: 14px; font-family: monospace; color: var(--text-navy);}
+    td { padding: 12px 10px; border-bottom: 1px solid var(--border-color); text-align: center; font-size: 14px; font-family: monospace; color: var(--text-navy);}
     
     .queue-container { background: var(--bg-panel); border: 1px solid var(--border-color); padding: 20px; font-family: monospace; font-size: 13px; color: var(--text-light); line-height: 1.8; border-radius: 6px; }
     
     .vault { display: flex; gap: 15px; background: var(--sub-header-bg); padding: 15px; border: 1px solid var(--border-color); align-items: center; justify-content: center; margin-bottom: 25px; border-radius: 6px;}
-    .btn-action { background: #ffffff; color: var(--text-navy); border: 1px solid var(--border-color); padding: 8px 18px; cursor: pointer; font-weight: 700; box-shadow: 0 1px 2px rgba(0,0,0,0.05); border-radius: 4px; transition: all 0.2s;}
-    .btn-action:hover { background: #f1f5f9; border-color: #94a3b8;}
-    .btn-verify { color: #3b82f6; text-decoration: none; font-weight: 800; font-size: 12px; font-family: var(--font-sans);}
+    .btn-action { background: #1E293B; color: var(--text-navy); border: 1px solid var(--border-color); padding: 8px 18px; cursor: pointer; font-weight: 700; box-shadow: 0 1px 2px rgba(0,0,0,0.2); border-radius: 4px; transition: all 0.2s;}
+    .btn-action:hover { background: #334155; border-color: #475569;}
+    .btn-verify { color: #60A5FA; text-decoration: none; font-weight: 800; font-size: 12px; font-family: var(--font-sans);}
     .btn-verify:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.8 <span id="ws-status" style="font-size: 12px; font-family: var(--font-sans); font-weight: normal; margin-left: 10px;">[WS: Checking...]</span></div>
+    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.9 <span id="ws-status" style="font-size: 12px; font-family: var(--font-sans); font-weight: normal; margin-left: 10px;">[WS: Checking...]</span></div>
     <div class="vitals-row">
         <div class="vital-box"><div class="vital-label">Total Realized P&L</div><div class="vital-value" id="v-pnl">$0.00</div></div>
         <div class="vital-box"><div class="vital-label">Completed Dual-Leg Trades</div><div class="vital-value" id="v-trades">0</div></div>
@@ -193,7 +196,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <span style="font-weight: 800; margin-right: 15px; color: var(--text-navy); text-transform: uppercase; letter-spacing: 0.5px;">Data Vault & Utilities:</span>
     <button class="btn-action" onclick="window.location.href='/api/dl_trades'">Download Trades (.csv)</button>
     <button class="btn-action" onclick="window.location.href='/api/dl_snaps'">Download Snapshots (.csv)</button>
-    <button class="btn-action" style="color: #dc2626; margin-left: auto; border-color: #fca5a5; background: #fef2f2;" onclick="deleteFiles()">⚠ Delete Old Files</button>
+    <button class="btn-action" style="color: #FCA5A5; margin-left: auto; border-color: #7F1D1D; background: #450A0A;" onclick="deleteFiles()">⚠ Delete Old Files</button>
 </div>
 
 <div class="sec-title">Observation Queue (Scouting)</div>
@@ -257,7 +260,7 @@ setInterval(async () => {
             htmlCards += `<div class="card">
                 <div class="card-header">
                     <span>${m.slug}</span>
-                    <span>TTR: ${m.ttr_s}s</span>
+                    <span style="color:var(--text-light);">TTR: <span style="color:var(--text-navy);">${m.ttr_s}s</span></span>
                 </div>
                 <div class="leg-container">
                     <div class="leg-col">
@@ -266,7 +269,7 @@ setInterval(async () => {
                         <div class="data-row"><span>Shares Acquired:</span> <b>${m.yes_shares.toFixed(2)}</b></div>
                         <div class="data-row"><span>Live Ticker:</span> <b>$${m.yes_ask.toFixed(3)}</b></div>
                         <div class="data-row"><span>Current Delta:</span> <span class="${cYes}">${(dYes>0?'+':'')+dYes.toFixed(2)+'%'}</span></div>
-                        <div class="svg-container">${renderSparkline(m.history_yes, '#0f172a')}</div>
+                        <div class="svg-container">${renderSparkline(m.history_yes, '#38BDF8')}</div>
                     </div>
                     <div class="leg-col">
                         <div class="leg-title">NO LEG MONITOR</div>
@@ -274,7 +277,7 @@ setInterval(async () => {
                         <div class="data-row"><span>Shares Acquired:</span> <b>${m.no_shares.toFixed(2)}</b></div>
                         <div class="data-row"><span>Live Ticker:</span> <b>$${m.no_ask.toFixed(3)}</b></div>
                         <div class="data-row"><span>Current Delta:</span> <span class="${cNo}">${(dNo>0?'+':'')+dNo.toFixed(2)+'%'}</span></div>
-                        <div class="svg-container">${renderSparkline(m.history_no, '#64748b')}</div>
+                        <div class="svg-container">${renderSparkline(m.history_no, '#94A3B8')}</div>
                     </div>
                 </div>
             </div>`;
@@ -294,7 +297,7 @@ setInterval(async () => {
                 <td>${h.slug}</td>
                 <td>${h.yes_entry > 0 ? '$'+h.yes_entry.toFixed(3) : '--'}</td>
                 <td>${h.no_entry > 0 ? '$'+h.no_entry.toFixed(3) : '--'}</td>
-                <td style="font-weight: 800; font-family:var(--font-sans); color: var(--header-bg);">${h.reason}</td>
+                <td style="font-weight: 800; font-family:var(--font-sans); color: var(--text-light);">${h.reason}</td>
                 <td class="${h.pnl>0?'val-green':(h.pnl<0?'val-red':'')}">${pnlStr}</td>
                 <td><a href="https://polymarket.com/event/${h.slug}" target="_blank" class="btn-verify">VERIFY ↗</a></td>
             </tr>`;
@@ -329,7 +332,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 else:
                     yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
                     m_data.append({
-                        "slug": m.slug, "state": m.state, "ttr_s": max(0, int(m.end_ts - now)),
+                        "slug": m.slug, "state": m.state, "ttr_s": int(m.end_ts - now),
                         "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price,
                         "yes_shares": m.yes_shares, "no_shares": m.no_shares,
                         "yes_ask": yb.ask if yb else 0.0, "no_ask": nb.ask if nb else 0.0,
@@ -395,18 +398,28 @@ def evaluate_market(mdm: MarketData, now: float):
     if not yb or not nb: return
     ttr = int(mdm.end_ts - now)
     
-    # ── Expiration Handler ──
-    if ttr <= 0:
+    # ── Safe Expiration Handler (Wait 5s after Buzzer) ──
+    if ttr <= -5:
         mdm.state = MarketState.CLOSED
-        cost_basis = (BASE_CAPITAL_PER_LEG * 2) + mdm.total_fees_paid
+        
+        # TRUE COST FIX: Only subtract the exact money deployed, do not assume both legs were bought
+        cost_basis = mdm.total_fees_paid
+        if mdm.yes_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
+        if mdm.no_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
+        
+        # Declare winner based on post-buzzer settled bids
         winner_shares = mdm.yes_shares if yb.bid > nb.bid else mdm.no_shares 
         calc_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
+        
         execute_trade(mdm, "EXPIRED", 0.00, "EXPIRED", 0.0, 0.0, ttr, calc_pnl)
         return
         
+    # Do not evaluate entries or exits if we are in the buzzer-beating 5-second wait window
+    if ttr <= 0: return
+        
     t2 = T_SECOND_LIVE if ttr <= 300 else T_SECOND_PRE
     
-    # ── Entry Logic (With Dynamic Shares & Fees) ──
+    # ── Entry Logic (With Deadline & FOMO) ──
     if mdm.state == MarketState.WATCH:
         if 0 < yb.ask <= T_FIRST:
             mdm.state = MarketState.WAITING_NO
@@ -424,56 +437,71 @@ def evaluate_market(mdm: MarketData, now: float):
             mdm.total_fees_paid += fee
             execute_trade(mdm, "NO", nb.ask, "LEG_1_ENTRY", mdm.no_shares, fee, ttr)
             
+        # FOMO Entry (Force Both Legs if cheap enough at the deadline)
+        elif ttr <= HEDGE_DEADLINE_TTR and 0 < yb.ask and 0 < nb.ask and (yb.ask + nb.ask) <= MAX_COMBINED_COST:
+            mdm.state = MarketState.BOTH
+            
+            mdm.yes_entry_price = yb.ask
+            mdm.yes_shares = BASE_CAPITAL_PER_LEG / yb.ask
+            fee_yes = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+            mdm.total_fees_paid += fee_yes
+            execute_trade(mdm, "YES", yb.ask, "LEG_1_FOMO", mdm.yes_shares, fee_yes, ttr)
+            
+            mdm.no_entry_price = nb.ask
+            mdm.no_shares = BASE_CAPITAL_PER_LEG / nb.ask
+            fee_no = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+            mdm.total_fees_paid += fee_no
+            execute_trade(mdm, "NO", nb.ask, "LEG_2_FOMO", mdm.no_shares, fee_no, ttr)
+
     elif mdm.state == MarketState.WAITING_NO:
-        if 0 < nb.ask <= t2:
+        # Standard logic OR Deadline Force-Hedge
+        if (0 < nb.ask <= t2) or (ttr <= HEDGE_DEADLINE_TTR and nb.ask > 0):
             mdm.state = MarketState.BOTH
             mdm.no_entry_price = nb.ask
             mdm.no_shares = BASE_CAPITAL_PER_LEG / nb.ask
             fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
             mdm.total_fees_paid += fee
-            execute_trade(mdm, "NO", nb.ask, "LEG_2_ENTRY", mdm.no_shares, fee, ttr)
+            execute_trade(mdm, "NO", nb.ask, "LEG_2_DEADLINE" if ttr <= HEDGE_DEADLINE_TTR else "LEG_2_ENTRY", mdm.no_shares, fee, ttr)
             
     elif mdm.state == MarketState.WAITING_YES:
-        if 0 < yb.ask <= t2:
+        # Standard logic OR Deadline Force-Hedge
+        if (0 < yb.ask <= t2) or (ttr <= HEDGE_DEADLINE_TTR and yb.ask > 0):
             mdm.state = MarketState.BOTH
             mdm.yes_entry_price = yb.ask
             mdm.yes_shares = BASE_CAPITAL_PER_LEG / yb.ask
             fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
             mdm.total_fees_paid += fee
-            execute_trade(mdm, "YES", yb.ask, "LEG_2_ENTRY", mdm.yes_shares, fee, ttr)
+            execute_trade(mdm, "YES", yb.ask, "LEG_2_DEADLINE" if ttr <= HEDGE_DEADLINE_TTR else "LEG_2_ENTRY", mdm.yes_shares, fee, ttr)
             
-    # ── Exit Logic (The Tranche System with 99% API Bug Workaround) ──
+    # ── Exit Logic (Tranches & Undecided Holding) ──
     elif mdm.state == MarketState.BOTH:
         
-        # Determine current Winner/Loser
         if yb.bid > nb.bid: winner_bid, loser_side, loser_bid, loser_shares = yb.bid, "NO", nb.bid, mdm.no_shares
         else: winner_bid, loser_side, loser_bid, loser_shares = nb.bid, "YES", yb.bid, mdm.yes_shares
             
-        # Tier 1 (50% Exit) -> Triggered if Winner >= 0.86 AND TTR <= 60s
+        # Tier 1 (50% Exit)
         if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and ttr <= SELL_LOSER_T1_TTR_MAX:
             mdm.t1_executed = True
             shares_to_sell = loser_shares * 0.50
             
-            # Update local state
             if loser_side == "YES": mdm.yes_shares -= shares_to_sell
             else: mdm.no_shares -= shares_to_sell
             
-            fee = (shares_to_sell * loser_bid) * 0.001 # Minimal taker fees on deep discount exits
+            fee = (shares_to_sell * loser_bid) * 0.001 
             mdm.total_fees_paid += fee
             execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T1", shares_to_sell, fee, ttr)
             
-        # Tier 2 (Final Exit) -> Triggered if Winner >= 0.95 (Disregard TTR)
+        # Tier 2 (Final Exit) 
         elif winner_bid >= SELL_LOSER_T2_THRESH:
             mdm.state = MarketState.CLOSED
             
-            # WORKAROUND: Sell exactly 99% to bypass Polymarket 'not enough balance' cache bug
+            # API Bug Workaround: Sell 99%
             shares_to_sell = loser_shares * 0.99 
-            
             fee = (shares_to_sell * loser_bid) * 0.001 
             mdm.total_fees_paid += fee
             execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T2", shares_to_sell, fee, ttr)
             
-            # Calculate and log final P&L round trip (including 1.00 winner payout and remaining dust math)
+            # Final P&L
             cost_basis = (BASE_CAPITAL_PER_LEG * 2) + mdm.total_fees_paid
             winner_shares = mdm.yes_shares if loser_side == "NO" else mdm.no_shares
             final_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
@@ -516,61 +544,3 @@ def discovery_thread():
         for ts in boundaries:
             slug = f"btc-updown-5m-{ts}"
             try:
-                res = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}", timeout=5)
-                if res.status_code == 200 and res.json():
-                    m_info = res.json()[0].get("markets", [])[0]
-                    cid = m_info["conditionId"]
-                    if cid not in GLOBAL_STATE.markets:
-                        tks = json.loads(m_info["clobTokenIds"])
-                        outcomes = json.loads(m_info["outcomes"])
-                        y_idx = 0 if outcomes[0].lower() in ["yes", "up"] else 1
-                        end_ts = datetime.fromisoformat(m_info["endDate"].replace("Z", "+00:00")).timestamp()
-                        GLOBAL_STATE.markets[cid] = MarketData(cid, slug, tks[y_idx], tks[1-y_idx], end_ts)
-                        print(f"[Discovery] Tracking: {slug}", flush=True)
-                        new_markets = True
-            except Exception: pass
-        if new_markets and GLOBAL_STATE.ws_handle: GLOBAL_STATE.ws_handle.close()
-        time.sleep(30)
-
-def polymarket_ws_thread():
-    def on_message(ws, msg):
-        try:
-            for event in (json.loads(msg) if isinstance(json.loads(msg), list) else [json.loads(msg)]):
-                if not isinstance(event, dict): continue
-                aid = event.get("asset_id") or event.get("market")
-                if not aid: continue
-                if event.get("event_type") == "book":
-                    book = GLOBAL_STATE.books.setdefault(aid, OrderBook())
-                    book.bid = max((float(b["price"]) for b in event.get("bids", [])), default=0.0)
-                    book.ask = min((float(a["price"]) for a in event.get("asks", [])), default=0.0)
-                elif event.get("event_type") == "price_change":
-                    book = GLOBAL_STATE.books.get(aid)
-                    if not book: continue
-                    for ch in event.get("changes", []):
-                        s, p = ch.get("side", ""), float(ch.get("price", 0))
-                        if s == "BUY" and p > book.bid: book.bid = p
-                        elif s == "SELL" and (book.ask == 0 or p < book.ask): book.ask = p
-        except Exception: pass
-
-    def on_open(ws):
-        GLOBAL_STATE.ws_connected = True
-        tks = [t for m in GLOBAL_STATE.markets.values() if m.state != MarketState.CLOSED for t in (m.yes_token, m.no_token)]
-        if tks: ws.send(json.dumps({"type": "Market", "assets_ids": tks}))
-
-    while GLOBAL_STATE.running:
-        try:
-            ws = websocket.WebSocketApp("wss://ws-subscriptions-clob.polymarket.com/ws/market", on_message=on_message, on_open=on_open)
-            GLOBAL_STATE.ws_handle = ws
-            ws.run_forever(ping_interval=20, ping_timeout=10)
-        except Exception: pass
-        GLOBAL_STATE.ws_handle, GLOBAL_STATE.ws_connected = None, False
-        time.sleep(2)
-
-if __name__ == "__main__":
-    init_csv()
-    threading.Thread(target=run_server, daemon=True).start()
-    threading.Thread(target=discovery_thread, daemon=True).start()
-    threading.Thread(target=polymarket_ws_thread, daemon=True).start()
-    threading.Thread(target=tick_loop, daemon=True).start()
-    threading.Thread(target=snapshot_loop, daemon=True).start()
-    while GLOBAL_STATE.running: time.sleep(1)
