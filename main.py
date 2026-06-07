@@ -334,4 +334,4 @@ def polymarket_ws_thread():
             if m.state != MarketState.CLOSED:
                 tokens.extend([m.yes_token, m.no_token])
         if tokens:
-ws.send(json.dumps({"type": "Market", "assets_ids": tokens}))
+         ws.send(json.dumps({"type": "Market", "assets_ids": tokens}))
