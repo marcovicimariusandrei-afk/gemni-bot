@@ -1,5 +1,5 @@
 """
-main.py — Opportunistic BSS Bot (v5.8.15 Stability & UI Fix)
+main.py — Opportunistic BSS Bot (v5.8.16 Catastrophes & Conviction UI)
 """
 import os
 import sys
@@ -65,9 +65,11 @@ class MarketData:
         self.t1_executed = False
         self.t1_side = ""
         self.t1_price = 0.0
+        self.t1_time = ""
         
         self.t2_side = ""
         self.t2_price = 0.0
+        self.t2_time = ""
         
         self.salvage_revenue = 0.0
         self.realized_pnl = 0.0
@@ -93,6 +95,7 @@ class BotState:
         self.total_pnl = 0.0
         self.total_trades = 0 
         self.sold_losers = 0
+        self.catastrophes = 0
 
 GLOBAL_STATE = BotState()
 
@@ -161,18 +164,26 @@ DASHBOARD_HTML = r"""<!doctype html>
     .leg-col:last-child { border-right: none; }
     .leg-title { font-size: 13px; font-weight: 800; text-align: center; margin-bottom: 15px; color: var(--text-light); text-transform: uppercase; letter-spacing: 1px; }
     
-    .data-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; color: var(--text-light); }
+    .data-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; color: var(--text-light); align-items: center;}
     .data-row b { color: var(--text-navy); font-family: monospace; font-size: 15px;}
     .val-green { color: var(--val-green); font-weight: 800; font-family: monospace; font-size: 15px;}
     .val-red { color: var(--val-red); font-weight: 800; font-family: monospace; font-size: 15px;}
     .val-gold { color: var(--val-yellow); font-weight: 800; font-family: monospace; font-size: 15px;}
+    .val-pink { color: var(--val-pink); font-weight: 800; font-family: monospace; font-size: 15px;}
     
-    .svg-container { height: 50px; margin-top: 15px; background: #0F172A; border: 1px solid var(--border-color); border-radius: 4px;}
+    .conviction-bar { height: 6px; background: #0F172A; border: 1px solid #334155; border-radius: 4px; position: relative; margin-top: 6px; margin-bottom: 15px; width: 100%; }
+    .conviction-fill { height: 100%; border-radius: 3px; transition: width 0.3s ease; }
+    .conviction-fill.yes { background: #38BDF8; }
+    .conviction-fill.no { background: #94A3B8; }
+    .marker { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--val-yellow); z-index: 5; }
+    .marker.t2 { background: var(--val-pink); }
+    
+    .svg-container { height: 50px; margin-top: 10px; background: #0F172A; border: 1px solid var(--border-color); border-radius: 4px;}
     
     .table-container { background: var(--bg-panel); border: 1px solid var(--border-color); margin-bottom: 35px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border-radius: 6px; overflow: hidden; }
     table { width: 100%; border-collapse: collapse; text-align: left; }
-    th { background: var(--sub-header-bg); color: var(--text-light); font-size: 12px; font-weight: 800; text-transform: uppercase; padding: 12px; border-bottom: 1px solid var(--border-color); text-align: center; letter-spacing: 0.5px;}
-    td { padding: 12px 10px; border-bottom: 1px solid var(--border-color); text-align: center; font-size: 14px; font-family: monospace; color: var(--text-navy);}
+    th { background: var(--sub-header-bg); color: var(--text-light); font-size: 11px; font-weight: 800; text-transform: uppercase; padding: 12px; border-bottom: 1px solid var(--border-color); text-align: center; letter-spacing: 0.5px;}
+    td { padding: 12px 10px; border-bottom: 1px solid var(--border-color); text-align: center; font-size: 13px; font-family: monospace; color: var(--text-navy);}
     
     .queue-container { background: var(--bg-panel); border: 1px solid var(--border-color); padding: 20px; font-family: monospace; font-size: 13px; color: var(--text-light); line-height: 1.8; border-radius: 6px; }
     
@@ -186,14 +197,15 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.15 
+    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.16 
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
     <div class="vitals-row">
         <div class="vital-box"><div class="vital-label">Total Realized P&L</div><div class="vital-value" id="v-pnl">$0.00</div></div>
-        <div class="vital-box"><div class="vital-label">Completed Dual-Leg Trades</div><div class="vital-value" id="v-trades">0</div></div>
+        <div class="vital-box"><div class="vital-label">Completed Trades</div><div class="vital-value" id="v-trades">0</div></div>
         <div class="vital-box"><div class="vital-label">Sold Losers</div><div class="vital-value" id="v-losers">0</div></div>
+        <div class="vital-box"><div class="vital-label">Catastrophes</div><div class="vital-value red" id="v-catastrophes">0</div></div>
         <div class="vital-box"><div class="vital-label">Active Slots</div><div class="vital-value" id="v-active">0</div></div>
     </div>
 </div>
@@ -204,8 +216,8 @@ DASHBOARD_HTML = r"""<!doctype html>
 <div class="sec-title">Consolidated Trade Lifecycle History</div>
 <div class="table-container">
     <table>
-        <thead><tr><th>Time Closed</th><th>Market Slug</th><th>YES Entry</th><th>NO Entry</th><th>Close Reason</th><th>Net P&L</th><th>Audit Link</th></tr></thead>
-        <tbody id="log-body"><tr><td colspan="7" style="color: var(--text-light); padding: 20px;">No historical data available.</td></tr></tbody>
+        <thead><tr><th>Time Closed</th><th>Market Slug</th><th>YES Entry</th><th>NO Entry</th><th>T1 Exit</th><th>T2 Exit</th><th>Net P&L</th><th>Audit Link</th></tr></thead>
+        <tbody id="log-body"><tr><td colspan="8" style="color: var(--text-light); padding: 20px;">No historical data available.</td></tr></tbody>
     </table>
 </div>
 
@@ -246,6 +258,19 @@ function renderSparkline(history, color, t1_price, t2_price) {
     return `<svg width="100%" height="100%" viewBox="0 -10 100 120" preserveAspectRatio="none">${svg}</svg>`;
 }
 
+function getConvictionHtml(ask) {
+    let fillPct = Math.min(100, Math.max(0, ask * 100));
+    let distT1 = Math.round((ask - 0.86) * 100);
+    let distT2 = Math.round((ask - 0.95) * 100);
+    
+    let trackerText = "";
+    if (ask >= 0.95) trackerText = `<span class="val-pink">T2 REACHED (+${distT2}¢)</span>`;
+    else if (ask >= 0.86) trackerText = `<span class="val-gold">T1 REACHED (+${distT1}¢)</span> | <span style="color:var(--text-light)">${distT2}¢ to T2</span>`;
+    else trackerText = `<span style="color:var(--text-light)">${distT1}¢ to T1 | ${distT2}¢ to T2</span>`;
+    
+    return { pct: fillPct, text: trackerText };
+}
+
 function formatUptime(seconds) {
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
@@ -275,6 +300,7 @@ setInterval(async () => {
         
         document.getElementById('v-trades').textContent = s.total_trades_count;
         document.getElementById('v-losers').textContent = s.losers;
+        document.getElementById('v-catastrophes').textContent = s.catastrophes;
         
         let activeCount = 0;
         let htmlCards = '';
@@ -298,16 +324,11 @@ setInterval(async () => {
             let cYes = dYes >= 0 ? 'val-green' : 'val-red';
             let cNo = dNo >= 0 ? 'val-green' : 'val-red';
 
-            let effYes = m.yes_entry > 0 ? m.yes_entry * 1.018 : 0;
-            let effNo = m.no_entry > 0 ? m.no_entry * 1.018 : 0;
-
             let valYes = m.yes_shares * m.yes_ask;
             let valNo = m.no_shares * m.no_ask;
             
-            let t1Yes = m.t1_side === 'YES' ? m.t1_price : 0;
-            let t2Yes = m.t2_side === 'YES' ? m.t2_price : 0;
-            let t1No = m.t1_side === 'NO' ? m.t1_price : 0;
-            let t2No = m.t2_side === 'NO' ? m.t2_price : 0;
+            let cYesData = getConvictionHtml(m.yes_ask);
+            let cNoData = getConvictionHtml(m.no_ask);
 
             htmlCards += `<div class="card">
                 <div class="card-header">
@@ -317,23 +338,37 @@ setInterval(async () => {
                 <div class="leg-container">
                     <div class="leg-col">
                         <div class="leg-title">YES LEG MONITOR</div>
-                        <div class="data-row"><span>Raw Entry:</span> <b>$${m.yes_entry.toFixed(3)}</b></div>
-                        <div class="data-row"><span>Effective Entry (w/ fees):</span> <b>$${effYes.toFixed(3)}</b></div>
                         <div class="data-row"><span>Shares Acquired:</span> <b>${m.yes_shares.toFixed(2)}</b></div>
+                        <div class="data-row"><span>Effective Entry (w/ fees):</span> <b>$${m.yes_entry > 0 ? (m.yes_entry*1.018).toFixed(3) : '0.000'}</b></div>
                         <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;"><span>Live Ticker:</span> <b>$${m.yes_ask.toFixed(3)}</b></div>
                         <div class="data-row"><span>Current Delta:</span> <span class="${cYes}">${(dYes>0?'+':'')+dYes.toFixed(2)+'%'}</span></div>
                         <div class="data-row"><span>Live Value:</span> <b class="val-gold">$${valYes.toFixed(2)}</b></div>
-                        <div class="svg-container">${renderSparkline(m.history_yes, '#38BDF8', t1Yes, t2Yes)}</div>
+                        
+                        <div class="data-row" style="margin-top:12px; font-size:12px;"><span>Conviction Proximity:</span> <b>${cYesData.text}</b></div>
+                        <div class="conviction-bar">
+                            <div class="conviction-fill yes" style="width: ${cYesData.pct}%"></div>
+                            <div class="marker" style="left: 86%" title="Tier 1 (0.86)"></div>
+                            <div class="marker t2" style="left: 95%" title="Tier 2 (0.95)"></div>
+                        </div>
+                        
+                        <div class="svg-container">${renderSparkline(m.history_yes, '#38BDF8', (m.t1_side==='YES'?m.t1_price:0), (m.t2_side==='YES'?m.t2_price:0))}</div>
                     </div>
                     <div class="leg-col">
                         <div class="leg-title">NO LEG MONITOR</div>
-                        <div class="data-row"><span>Raw Entry:</span> <b>$${m.no_entry.toFixed(3)}</b></div>
-                        <div class="data-row"><span>Effective Entry (w/ fees):</span> <b>$${effNo.toFixed(3)}</b></div>
                         <div class="data-row"><span>Shares Acquired:</span> <b>${m.no_shares.toFixed(2)}</b></div>
+                        <div class="data-row"><span>Effective Entry (w/ fees):</span> <b>$${m.no_entry > 0 ? (m.no_entry*1.018).toFixed(3) : '0.000'}</b></div>
                         <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;"><span>Live Ticker:</span> <b>$${m.no_ask.toFixed(3)}</b></div>
                         <div class="data-row"><span>Current Delta:</span> <span class="${cNo}">${(dNo>0?'+':'')+dNo.toFixed(2)+'%'}</span></div>
                         <div class="data-row"><span>Live Value:</span> <b class="val-gold">$${valNo.toFixed(2)}</b></div>
-                        <div class="svg-container">${renderSparkline(m.history_no, '#94A3B8', t1No, t2No)}</div>
+                        
+                        <div class="data-row" style="margin-top:12px; font-size:12px;"><span>Conviction Proximity:</span> <b>${cNoData.text}</b></div>
+                        <div class="conviction-bar">
+                            <div class="conviction-fill no" style="width: ${cNoData.pct}%"></div>
+                            <div class="marker" style="left: 86%" title="Tier 1 (0.86)"></div>
+                            <div class="marker t2" style="left: 95%" title="Tier 2 (0.95)"></div>
+                        </div>
+                        
+                        <div class="svg-container">${renderSparkline(m.history_no, '#94A3B8', (m.t1_side==='NO'?m.t1_price:0), (m.t2_side==='NO'?m.t2_price:0))}</div>
                     </div>
                 </div>
             </div>`;
@@ -349,17 +384,16 @@ setInterval(async () => {
         s.history.reverse().forEach(h => {
             const pnlStr = h.pnl !== 0.0 ? (h.pnl > 0 ? `+${h.pnl.toFixed(2)}` : h.pnl.toFixed(2)) : '--';
             
-            let badges = '';
-            // Safe checking for badge data
-            if (h.t1_side && h.t1_side !== '') badges += `<span style="color:var(--val-yellow); font-size:14px; margin-left:6px; cursor:help;" title="Tier 1 Sell (${h.t1_side}) @ $${h.t1_price ? h.t1_price.toFixed(3) : '0.000'}">●</span>`;
-            if (h.t2_side && h.t2_side !== '') badges += `<span style="color:var(--val-pink); font-size:14px; margin-left:4px; cursor:help;" title="Tier 2 Sell (${h.t2_side}) @ $${h.t2_price ? h.t2_price.toFixed(3) : '0.000'}">●</span>`;
+            let t1Str = h.t1_side && h.t1_side !== "" ? `<span class="val-gold">${h.t1_side}</span> @ $${h.t1_price.toFixed(3)}<br><span style="font-size:10px;color:var(--text-light);">${h.t1_time}</span>` : '--';
+            let t2Str = h.t2_side && h.t2_side !== "" ? `<span class="val-pink">${h.t2_side}</span> @ $${h.t2_price.toFixed(3)}<br><span style="font-size:10px;color:var(--text-light);">${h.t2_time}</span>` : '--';
             
             logHtml += `<tr>
                 <td style="color:var(--text-light); font-family:var(--font-sans); font-size: 13px;">${h.time}</td>
-                <td>${h.slug}${badges}</td>
+                <td>${h.slug}</td>
                 <td>${h.yes_entry > 0 ? '$'+h.yes_entry.toFixed(3) : '--'}</td>
                 <td>${h.no_entry > 0 ? '$'+h.no_entry.toFixed(3) : '--'}</td>
-                <td style="font-weight: 800; font-family:var(--font-sans); color: var(--text-light);">${h.reason}</td>
+                <td style="line-height:1.4;">${t1Str}</td>
+                <td style="line-height:1.4;">${t2Str}</td>
                 <td class="${h.pnl>0?'val-green':(h.pnl<0?'val-red':'')}">${pnlStr}</td>
                 <td><a href="https://polymarket.com/event/${h.slug}" target="_blank" class="btn-verify">VERIFY ↗</a></td>
             </tr>`;
@@ -390,7 +424,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     history_data.append({
                         "time": m.close_time, "slug": m.slug, "reason": m.close_reason,
                         "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price, "pnl": m.realized_pnl,
-                        "t1_side": m.t1_side, "t1_price": m.t1_price, "t2_side": m.t2_side, "t2_price": m.t2_price
+                        "t1_side": m.t1_side, "t1_price": m.t1_price, "t1_time": m.t1_time,
+                        "t2_side": m.t2_side, "t2_price": m.t2_price, "t2_time": m.t2_time
                     })
                 else:
                     yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
@@ -400,13 +435,15 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         "yes_shares": m.yes_shares, "no_shares": m.no_shares,
                         "yes_ask": yb.ask if yb else 0.0, "no_ask": nb.ask if nb else 0.0,
                         "history_yes": m.history_yes[-30:], "history_no": m.history_no[-30:],
-                        "t1_side": m.t1_side, "t1_price": m.t1_price, "t2_side": m.t2_side, "t2_price": m.t2_price
+                        "t1_side": m.t1_side, "t1_price": m.t1_price, 
+                        "t2_side": m.t2_side, "t2_price": m.t2_price
                     })
             
             payload = {
                 "uptime_s": int(time.time() - SYSTEM_BOOT_TIME),
                 "ws_connected": GLOBAL_STATE.ws_connected, "pnl": GLOBAL_STATE.total_pnl,
                 "total_trades_count": GLOBAL_STATE.total_trades, "losers": GLOBAL_STATE.sold_losers,
+                "catastrophes": GLOBAL_STATE.catastrophes,
                 "markets": m_data, "history": history_data[-15:]
             }
             self.send_response(200)
@@ -453,12 +490,14 @@ def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares:
         mdm.salvage_revenue += (shares * price)
         mdm.t1_side = side
         mdm.t1_price = price
+        mdm.t1_time = ts
     
     if action == "SELL_LOSER_T2":
         GLOBAL_STATE.sold_losers += 1
         mdm.salvage_revenue += (shares * price)
         mdm.t2_side = side
         mdm.t2_price = price
+        mdm.t2_time = ts
         
     if "CLOSED" in action or action == "EXPIRED":
         mdm.close_time = ts
@@ -470,12 +509,14 @@ def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares:
     threading.Thread(target=log_trade_csv_worker, args=(ts, mdm.slug, action, side, price, shares, fees, ttr, pnl), daemon=True).start()
 
 def evaluate_market(mdm: MarketData, now: float):
+    # Persist the UI window strictly until clock runs out and post-check finishes
     if mdm.state == MarketState.CLOSED and (mdm.end_ts - now) <= -5: return
         
     yb, nb = GLOBAL_STATE.books.get(mdm.yes_token), GLOBAL_STATE.books.get(mdm.no_token)
     if not yb or not nb: return
     ttr = int(mdm.end_ts - now)
     
+    # ── Expiration / Closure Check (-5s) ──
     if ttr <= -5 and mdm.state != MarketState.CLOSED:
         mdm.state = MarketState.CLOSED
         
@@ -483,9 +524,14 @@ def evaluate_market(mdm: MarketData, now: float):
         if mdm.yes_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
         if mdm.no_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
         
-        winner_shares = mdm.yes_shares if yb.bid > nb.bid else mdm.no_shares 
+        winner_side = "YES" if yb.bid > nb.bid else "NO"
+        winner_shares = mdm.yes_shares if winner_side == "YES" else mdm.no_shares 
         calc_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
         
+        # Check for Catastrophes (We sold a token assuming it was losing, but it ended up winning)
+        if (mdm.t1_side == winner_side) or (mdm.t2_side == winner_side):
+            GLOBAL_STATE.catastrophes += 1
+            
         execute_trade(mdm, "EXPIRED", 0.00, "EXPIRED", 0.0, 0.0, ttr, calc_pnl)
         return
         
