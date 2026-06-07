@@ -1,5 +1,5 @@
 """
-main.py — Opportunistic BSS Bot (v5.8.9 Complete Batch)
+main.py — Opportunistic BSS Bot (v5.8.10 Stability & UI Fix)
 """
 import os
 import sys
@@ -101,9 +101,10 @@ def log_trade_csv_worker(ts, slug, action, side, price, shares, fees, ttr, pnl):
     try:
         with open("trades_full.csv", "a", newline="") as f:
             csv.writer(f).writerow([ts, slug, action, side, f"{price:.3f}", f"{shares:.2f}", f"{fees:.3f}", ttr, f"{pnl:.3f}", link])
-    except Exception: pass
+    except Exception:
+        pass
 
-# ─── DASHBOARD HTML (v5.8.9 Dark Mode) ───
+# ─── DASHBOARD HTML (v5.8.10 Dark Mode) ───
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -172,7 +173,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.9 <span id="ws-status" style="font-size: 12px; font-family: var(--font-sans); font-weight: normal; margin-left: 10px;">[WS: Checking...]</span></div>
+    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.10 <span id="ws-status" style="font-size: 12px; font-family: var(--font-sans); font-weight: normal; margin-left: 10px;">[WS: Checking...]</span></div>
     <div class="vitals-row">
         <div class="vital-box"><div class="vital-label">Total Realized P&L</div><div class="vital-value" id="v-pnl">$0.00</div></div>
         <div class="vital-box"><div class="vital-label">Completed Dual-Leg Trades</div><div class="vital-value" id="v-trades">0</div></div>
@@ -252,8 +253,11 @@ setInterval(async () => {
             if (m.state === 'CLOSED') return;
             
             activeCount++;
-            let dYes = ((m.yes_ask - m.yes_entry) / m.yes_entry) * 100;
-            let dNo = ((m.no_ask - m.no_entry) / m.no_entry) * 100;
+            
+            // FIX: Prevent divide by zero JS crash
+            let dYes = m.yes_entry > 0 ? ((m.yes_ask - m.yes_entry) / m.yes_entry) * 100 : 0;
+            let dNo = m.no_entry > 0 ? ((m.no_ask - m.no_entry) / m.no_entry) * 100 : 0;
+            
             let cYes = dYes >= 0 ? 'val-green' : 'val-red';
             let cNo = dNo >= 0 ? 'val-green' : 'val-red';
 
@@ -354,7 +358,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
             self.send_header('Content-Type', 'text/csv')
             self.end_headers()
-            with open(filename, "rb") as f: self.wfile.write(f.read())
+            try:
+                with open(filename, "rb") as f:
+                    self.wfile.write(f.read())
+            except Exception:
+                pass
         else:
             self.send_response(404)
             self.end_headers()
@@ -511,8 +519,10 @@ def tick_loop():
     while GLOBAL_STATE.running:
         now = time.time()
         for m in list(GLOBAL_STATE.markets.values()):
-            try: evaluate_market(m, now)
-            except Exception: pass
+            try:
+                evaluate_market(m, now)
+            except Exception:
+                pass
         time.sleep(0.05)
 
 def snapshot_loop():
@@ -531,7 +541,8 @@ def snapshot_loop():
                         m.history_no.append(na)
                         if len(m.history_yes) > 30: m.history_yes.pop(0)
                         if len(m.history_no) > 30: m.history_no.pop(0)
-        except Exception: pass
+        except Exception:
+            pass
         time.sleep(30)
 
 # ─── DATA THREADS ───
@@ -555,42 +566,61 @@ def discovery_thread():
                         GLOBAL_STATE.markets[cid] = MarketData(cid, slug, tks[y_idx], tks[1-y_idx], end_ts)
                         print(f"[Discovery] Tracking: {slug}", flush=True)
                         new_markets = True
-            except Exception: pass
-        if new_markets and GLOBAL_STATE.ws_handle: GLOBAL_STATE.ws_handle.close()
+            except Exception:
+                pass
+        if new_markets and GLOBAL_STATE.ws_handle:
+            try:
+                GLOBAL_STATE.ws_handle.close()
+            except Exception:
+                pass
         time.sleep(30)
 
 def polymarket_ws_thread():
     def on_message(ws, msg):
         try:
-            for event in (json.loads(msg) if isinstance(json.loads(msg), list) else [json.loads(msg)]):
-                if not isinstance(event, dict): continue
+            parsed_msg = json.loads(msg)
+            event_list = parsed_msg if isinstance(parsed_msg, list) else [parsed_msg]
+            for event in event_list:
+                if not isinstance(event, dict):
+                    continue
                 aid = event.get("asset_id") or event.get("market")
-                if not aid: continue
+                if not aid:
+                    continue
                 if event.get("event_type") == "book":
                     book = GLOBAL_STATE.books.setdefault(aid, OrderBook())
                     book.bid = max((float(b["price"]) for b in event.get("bids", [])), default=0.0)
                     book.ask = min((float(a["price"]) for a in event.get("asks", [])), default=0.0)
                 elif event.get("event_type") == "price_change":
                     book = GLOBAL_STATE.books.get(aid)
-                    if not book: continue
+                    if not book:
+                        continue
                     for ch in event.get("changes", []):
                         s, p = ch.get("side", ""), float(ch.get("price", 0))
-                        if s == "BUY" and p > book.bid: book.bid = p
-                        elif s == "SELL" and (book.ask == 0 or p < book.ask): book.ask = p
-        except Exception: pass
+                        if s == "BUY" and p > book.bid:
+                            book.bid = p
+                        elif s == "SELL" and (book.ask == 0 or p < book.ask):
+                            book.ask = p
+        except Exception:
+            pass
 
     def on_open(ws):
         GLOBAL_STATE.ws_connected = True
         tks = [t for m in GLOBAL_STATE.markets.values() if m.state != MarketState.CLOSED for t in (m.yes_token, m.no_token)]
-        if tks: ws.send(json.dumps({"type": "Market", "assets_ids": tks}))
+        if tks:
+            try:
+                ws.send(json.dumps({"type": "Market", "assets_ids": tks}))
+            except Exception:
+                pass
 
     while GLOBAL_STATE.running:
         try:
             ws = websocket.WebSocketApp("wss://ws-subscriptions-clob.polymarket.com/ws/market", on_message=on_message, on_open=on_open)
             GLOBAL_STATE.ws_handle = ws
             ws.run_forever(ping_interval=20, ping_timeout=10)
-        except Exception: pass
-        GLOBAL_STATE.ws_handle, GLOBAL_STATE.ws_connected = None, False
+        except Exception:
+            pass
+        GLOBAL_STATE.ws_handle = None
+        GLOBAL_STATE.ws_connected = False
         time.sleep(2)
 
 if __name__ == "__main__":
@@ -600,4 +630,5 @@ if __name__ == "__main__":
     threading.Thread(target=polymarket_ws_thread, daemon=True).start()
     threading.Thread(target=tick_loop, daemon=True).start()
     threading.Thread(target=snapshot_loop, daemon=True).start()
-    while GLOBAL_STATE.running: time.sleep(1)
+    while GLOBAL_STATE.running:
+        time.sleep(1)
