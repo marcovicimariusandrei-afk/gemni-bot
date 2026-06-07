@@ -1,5 +1,5 @@
 """
-main.py — Opportunistic BSS Bot (v5.8.10 Stability & UI Fix)
+main.py — Opportunistic BSS Bot (v5.8.12 P&L Scoreboard Fix)
 """
 import os
 import sys
@@ -35,6 +35,9 @@ SELL_LOSER_T2_THRESH = 0.95
 
 LOOKAHEAD_MINUTES = int(os.getenv("LOOKAHEAD_MINUTES", "60"))
 PORT = int(os.getenv("PORT", "8080"))
+
+# Uptime Tracker
+SYSTEM_BOOT_TIME = time.time()
 
 # ─── STATE MODELS ───
 class MarketState:
@@ -104,7 +107,7 @@ def log_trade_csv_worker(ts, slug, action, side, price, shares, fees, ttr, pnl):
     except Exception:
         pass
 
-# ─── DASHBOARD HTML (v5.8.10 Dark Mode) ───
+# ─── DASHBOARD HTML ───
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -122,6 +125,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         --border-color: #334155;
         --val-green: #34D399;
         --val-red: #F87171;
+        --val-yellow: #FCD34D;
         --font-serif: Georgia, "Times New Roman", serif;
         --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
@@ -129,6 +133,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     
     .header-panel { background: var(--header-bg); border: 1px solid var(--border-color); display: flex; flex-direction: column; text-align: center; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border-radius: 6px; overflow: hidden; }
     .brand-title { font-family: var(--font-serif); font-size: 22px; font-weight: bold; color: var(--header-text); padding: 14px 0; border-bottom: 1px solid var(--border-color); }
+    .status-tags { font-size: 12px; font-family: var(--font-sans); font-weight: normal; margin-left: 15px; color: var(--text-light); }
     
     .vitals-row { display: flex; background: var(--sub-header-bg); }
     .vital-box { flex: 1; padding: 15px; border-right: 1px solid var(--border-color); text-align: center; }
@@ -153,6 +158,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     .data-row b { color: var(--text-navy); font-family: monospace; font-size: 15px;}
     .val-green { color: var(--val-green); font-weight: 800; font-family: monospace; font-size: 15px;}
     .val-red { color: var(--val-red); font-weight: 800; font-family: monospace; font-size: 15px;}
+    .val-gold { color: var(--val-yellow); font-weight: 800; font-family: monospace; font-size: 15px;}
     
     .svg-container { height: 50px; margin-top: 15px; background: #0F172A; border: 1px solid var(--border-color); border-radius: 4px;}
     
@@ -173,7 +179,10 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.10 <span id="ws-status" style="font-size: 12px; font-family: var(--font-sans); font-weight: normal; margin-left: 10px;">[WS: Checking...]</span></div>
+    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.12 
+        <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
+        <span class="status-tags" id="ws-status">[WS: Checking...]</span>
+    </div>
     <div class="vitals-row">
         <div class="vital-box"><div class="vital-label">Total Realized P&L</div><div class="vital-value" id="v-pnl">$0.00</div></div>
         <div class="vital-box"><div class="vital-label">Completed Dual-Leg Trades</div><div class="vital-value" id="v-trades">0</div></div>
@@ -218,6 +227,13 @@ function renderSparkline(history, color) {
     </svg>`;
 }
 
+function formatUptime(seconds) {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    return `${h}h ${m}m ${s}s`;
+}
+
 async function deleteFiles() {
     if(confirm("Confirm deletion of all server CSV logs?")) {
         await fetch('/api/delete_logs', {method: 'POST'});
@@ -230,6 +246,7 @@ setInterval(async () => {
         const r = await fetch('/api/status');
         const s = await r.json();
         
+        document.getElementById('bot-uptime').textContent = `[Uptime: ${formatUptime(s.uptime_s)}]`;
         document.getElementById('ws-status').textContent = s.ws_connected ? "[WS: CONNECTED]" : "[WS: DROPPED]";
         document.getElementById('ws-status').style.color = s.ws_connected ? "#34d399" : "#f87171";
         
@@ -254,12 +271,16 @@ setInterval(async () => {
             
             activeCount++;
             
-            // FIX: Prevent divide by zero JS crash
             let dYes = m.yes_entry > 0 ? ((m.yes_ask - m.yes_entry) / m.yes_entry) * 100 : 0;
             let dNo = m.no_entry > 0 ? ((m.no_ask - m.no_entry) / m.no_entry) * 100 : 0;
-            
             let cYes = dYes >= 0 ? 'val-green' : 'val-red';
             let cNo = dNo >= 0 ? 'val-green' : 'val-red';
+
+            let effYes = m.yes_entry > 0 ? m.yes_entry * 1.018 : 0;
+            let effNo = m.no_entry > 0 ? m.no_entry * 1.018 : 0;
+
+            let valYes = m.yes_shares * m.yes_ask;
+            let valNo = m.no_shares * m.no_ask;
 
             htmlCards += `<div class="card">
                 <div class="card-header">
@@ -269,18 +290,22 @@ setInterval(async () => {
                 <div class="leg-container">
                     <div class="leg-col">
                         <div class="leg-title">YES LEG MONITOR</div>
-                        <div class="data-row"><span>Entry Price:</span> <b>$${m.yes_entry.toFixed(3)}</b></div>
+                        <div class="data-row"><span>Raw Ticker Entry:</span> <b>$${m.yes_entry.toFixed(3)}</b></div>
+                        <div class="data-row"><span>Effective Entry (w/ fees):</span> <b>$${effYes.toFixed(3)}</b></div>
                         <div class="data-row"><span>Shares Acquired:</span> <b>${m.yes_shares.toFixed(2)}</b></div>
-                        <div class="data-row"><span>Live Ticker:</span> <b>$${m.yes_ask.toFixed(3)}</b></div>
+                        <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;"><span>Live Ticker:</span> <b>$${m.yes_ask.toFixed(3)}</b></div>
                         <div class="data-row"><span>Current Delta:</span> <span class="${cYes}">${(dYes>0?'+':'')+dYes.toFixed(2)+'%'}</span></div>
+                        <div class="data-row"><span>Live Value:</span> <b class="val-gold">$${valYes.toFixed(2)}</b></div>
                         <div class="svg-container">${renderSparkline(m.history_yes, '#38BDF8')}</div>
                     </div>
                     <div class="leg-col">
                         <div class="leg-title">NO LEG MONITOR</div>
-                        <div class="data-row"><span>Entry Price:</span> <b>$${m.no_entry.toFixed(3)}</b></div>
+                        <div class="data-row"><span>Raw Ticker Entry:</span> <b>$${m.no_entry.toFixed(3)}</b></div>
+                        <div class="data-row"><span>Effective Entry (w/ fees):</span> <b>$${effNo.toFixed(3)}</b></div>
                         <div class="data-row"><span>Shares Acquired:</span> <b>${m.no_shares.toFixed(2)}</b></div>
-                        <div class="data-row"><span>Live Ticker:</span> <b>$${m.no_ask.toFixed(3)}</b></div>
+                        <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;"><span>Live Ticker:</span> <b>$${m.no_ask.toFixed(3)}</b></div>
                         <div class="data-row"><span>Current Delta:</span> <span class="${cNo}">${(dNo>0?'+':'')+dNo.toFixed(2)+'%'}</span></div>
+                        <div class="data-row"><span>Live Value:</span> <b class="val-gold">$${valNo.toFixed(2)}</b></div>
                         <div class="svg-container">${renderSparkline(m.history_no, '#94A3B8')}</div>
                     </div>
                 </div>
@@ -344,6 +369,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     })
             
             payload = {
+                "uptime_s": int(time.time() - SYSTEM_BOOT_TIME),
                 "ws_connected": GLOBAL_STATE.ws_connected, "pnl": GLOBAL_STATE.total_pnl,
                 "total_trades_count": GLOBAL_STATE.total_trades, "losers": GLOBAL_STATE.sold_losers,
                 "markets": m_data, "history": history_data[-15:]
@@ -391,7 +417,8 @@ def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares:
         GLOBAL_STATE.sold_losers += 1
         mdm.salvage_revenue += (shares * price)
         
-    if action == "CLOSED" or action == "EXPIRED":
+    # FIX: Catch all variations of CLOSED
+    if "CLOSED" in action or action == "EXPIRED":
         mdm.close_time = ts
         mdm.close_reason = action
         GLOBAL_STATE.total_trades += 1
@@ -406,28 +433,23 @@ def evaluate_market(mdm: MarketData, now: float):
     if not yb or not nb: return
     ttr = int(mdm.end_ts - now)
     
-    # ── Safe Expiration Handler (Wait 5s after Buzzer) ──
     if ttr <= -5:
         mdm.state = MarketState.CLOSED
         
-        # TRUE COST FIX: Only subtract the exact money deployed
         cost_basis = mdm.total_fees_paid
         if mdm.yes_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
         if mdm.no_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
         
-        # Declare winner based on post-buzzer settled bids
         winner_shares = mdm.yes_shares if yb.bid > nb.bid else mdm.no_shares 
         calc_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
         
         execute_trade(mdm, "EXPIRED", 0.00, "EXPIRED", 0.0, 0.0, ttr, calc_pnl)
         return
         
-    # Do not evaluate entries or exits if we are in the buzzer-beating 5-second wait window
     if ttr <= 0: return
         
     t2 = T_SECOND_LIVE if ttr <= 300 else T_SECOND_PRE
     
-    # ── Entry Logic (With Deadline & FOMO) ──
     if mdm.state == MarketState.WATCH:
         if 0 < yb.ask <= T_FIRST:
             mdm.state = MarketState.WAITING_NO
@@ -445,7 +467,6 @@ def evaluate_market(mdm: MarketData, now: float):
             mdm.total_fees_paid += fee
             execute_trade(mdm, "NO", nb.ask, "LEG_1_ENTRY", mdm.no_shares, fee, ttr)
             
-        # FOMO Entry
         elif ttr <= HEDGE_DEADLINE_TTR and 0 < yb.ask and 0 < nb.ask and (yb.ask + nb.ask) <= MAX_COMBINED_COST:
             mdm.state = MarketState.BOTH
             
@@ -462,7 +483,6 @@ def evaluate_market(mdm: MarketData, now: float):
             execute_trade(mdm, "NO", nb.ask, "LEG_2_FOMO", mdm.no_shares, fee_no, ttr)
 
     elif mdm.state == MarketState.WAITING_NO:
-        # Standard logic OR Deadline Force-Hedge
         if (0 < nb.ask <= t2) or (ttr <= HEDGE_DEADLINE_TTR and nb.ask > 0):
             mdm.state = MarketState.BOTH
             mdm.no_entry_price = nb.ask
@@ -472,7 +492,6 @@ def evaluate_market(mdm: MarketData, now: float):
             execute_trade(mdm, "NO", nb.ask, "LEG_2_DEADLINE" if ttr <= HEDGE_DEADLINE_TTR else "LEG_2_ENTRY", mdm.no_shares, fee, ttr)
             
     elif mdm.state == MarketState.WAITING_YES:
-        # Standard logic OR Deadline Force-Hedge
         if (0 < yb.ask <= t2) or (ttr <= HEDGE_DEADLINE_TTR and yb.ask > 0):
             mdm.state = MarketState.BOTH
             mdm.yes_entry_price = yb.ask
@@ -481,13 +500,11 @@ def evaluate_market(mdm: MarketData, now: float):
             mdm.total_fees_paid += fee
             execute_trade(mdm, "YES", yb.ask, "LEG_2_DEADLINE" if ttr <= HEDGE_DEADLINE_TTR else "LEG_2_ENTRY", mdm.yes_shares, fee, ttr)
             
-    # ── Exit Logic ──
     elif mdm.state == MarketState.BOTH:
         
         if yb.bid > nb.bid: winner_bid, loser_side, loser_bid, loser_shares = yb.bid, "NO", nb.bid, mdm.no_shares
         else: winner_bid, loser_side, loser_bid, loser_shares = nb.bid, "YES", yb.bid, mdm.yes_shares
             
-        # Tier 1
         if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and ttr <= SELL_LOSER_T1_TTR_MAX:
             mdm.t1_executed = True
             shares_to_sell = loser_shares * 0.50
@@ -499,11 +516,9 @@ def evaluate_market(mdm: MarketData, now: float):
             mdm.total_fees_paid += fee
             execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T1", shares_to_sell, fee, ttr)
             
-        # Tier 2
         elif winner_bid >= SELL_LOSER_T2_THRESH:
             mdm.state = MarketState.CLOSED
             
-            # API Bug Workaround: Sell 99%
             shares_to_sell = loser_shares * 0.99 
             fee = (shares_to_sell * loser_bid) * 0.001 
             mdm.total_fees_paid += fee
