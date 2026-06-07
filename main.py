@@ -1,5 +1,5 @@
 """
-main.py — Opportunistic BSS Bot (v5.8.4 Strict Active Positions UI)
+main.py — Opportunistic BSS Bot (v5.8.7 Tranche Strategy & High-Contrast UI)
 """
 import os
 import sys
@@ -20,8 +20,16 @@ MODE = os.getenv("MODE", "dry").lower()
 T_FIRST = float(os.getenv("BS_BSS_T_FIRST", "0.49"))
 T_SECOND_PRE = float(os.getenv("BS_BSS_T_SECOND_PRE", "0.50"))
 T_SECOND_LIVE = float(os.getenv("BS_BSS_T_SECOND_LIVE", "0.51"))
-SELL_LOSER_THRESH = float(os.getenv("BS_SELL_LOSER_THRESHOLD", "0.93"))
-SELL_LOSER_FLOOR_S = float(os.getenv("BS_SELL_LOSER_TTR_FLOOR_S", "75"))
+
+# Scaled capital to clear Polymarket $1.00 minimums on partial exits
+BASE_CAPITAL_PER_LEG = float(os.getenv("BS_BASE_CAPITAL", "17.0")) 
+TAKER_FEE_RATE = 0.018 # ~1.8% peak bell-curve fee
+
+# Hybrid Tranche Thresholds
+SELL_LOSER_T1_THRESH = 0.86
+SELL_LOSER_T1_TTR_MAX = 60
+SELL_LOSER_T2_THRESH = 0.95
+
 LOOKAHEAD_MINUTES = int(os.getenv("LOOKAHEAD_MINUTES", "60"))
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -44,7 +52,14 @@ class MarketData:
         
         self.yes_entry_price = 0.0
         self.no_entry_price = 0.0
+        self.yes_shares = 0.0
+        self.no_shares = 0.0
+        self.total_fees_paid = 0.0
+        
+        self.t1_executed = False
+        self.salvage_revenue = 0.0
         self.realized_pnl = 0.0
+        
         self.close_time = ""
         self.close_reason = ""
         
@@ -64,28 +79,28 @@ class BotState:
         self.ws_connected = False
         self.ws_handle = None
         self.total_pnl = 0.0
-        self.total_trades = 0
+        self.total_trades = 0 
         self.sold_losers = 0
 
 GLOBAL_STATE = BotState()
 
-# ─── CSV LOGGING SYSTEM ───
+# ─── ASYNC CSV LOGGING SYSTEM (10-Column) ───
 def init_csv():
     if not os.path.exists("trades_full.csv"):
         with open("trades_full.csv", "w", newline="") as f:
-            csv.writer(f).writerow(["Timestamp", "Slug", "Action", "Side", "Price", "Realized_PnL", "Verify_Link"])
+            csv.writer(f).writerow(["Timestamp", "Slug", "Action", "Side", "Executed_Price", "Share_Quantity", "Fees_Paid", "TTR_at_Execution", "Realized_PnL", "Verify_Link"])
     if not os.path.exists("snapshot_live.csv"):
         with open("snapshot_live.csv", "w", newline="") as f:
             csv.writer(f).writerow(["Timestamp", "Slug", "State", "Yes_Ask", "Yes_Bid", "No_Ask", "No_Bid"])
 
-def log_trade_csv(ts, slug, action, side, price, pnl):
+def log_trade_csv_worker(ts, slug, action, side, price, shares, fees, ttr, pnl):
     link = f"https://polymarket.com/event/{slug}"
     try:
         with open("trades_full.csv", "a", newline="") as f:
-            csv.writer(f).writerow([ts, slug, action, side, f"{price:.3f}", f"{pnl:.3f}", link])
+            csv.writer(f).writerow([ts, slug, action, side, f"{price:.3f}", f"{shares:.2f}", f"{fees:.3f}", ttr, f"{pnl:.3f}", link])
     except Exception: pass
 
-# ─── DASHBOARD HTML (v5.8.4 Polymarket Blue UI) ───
+# ─── DASHBOARD HTML (v5.8.7 High-Contrast UI) ───
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -93,87 +108,92 @@ DASHBOARD_HTML = r"""<!doctype html>
 <title>BSS Analysis Dashboard</title>
 <style>
     :root {
-        --bg-main: #eef2f6;
+        --bg-main: #f0f2f5;
         --bg-panel: #ffffff;
-        --header-bg: #1d4ed8;
+        --header-bg: #0f172a;
         --header-text: #ffffff;
-        --sub-header-bg: #bfdbfe;
+        --sub-header-bg: #f8fafc;
         --text-navy: #0f172a;
-        --text-light: #64748b;
+        --text-light: #475569;
         --border-color: #cbd5e1;
+        --val-green: #10b981;
+        --val-red: #ef4444;
         --font-serif: Georgia, "Times New Roman", serif;
-        --font-sans: Calibri, "Segoe UI", Arial, sans-serif;
+        --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
     body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
     
-    .header-panel { background: var(--header-bg); border: 1px solid #1e3a8a; display: flex; flex-direction: column; text-align: center; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-radius: 4px; overflow: hidden; }
-    .brand-title { font-family: var(--font-serif); font-size: 24px; font-weight: bold; color: var(--header-text); padding: 12px 0; border-bottom: 1px solid #1e3a8a; }
+    .header-panel { background: var(--header-bg); border: 1px solid var(--header-bg); display: flex; flex-direction: column; text-align: center; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-radius: 6px; overflow: hidden; }
+    .brand-title { font-family: var(--font-serif); font-size: 22px; font-weight: bold; color: var(--header-text); padding: 14px 0; border-bottom: 1px solid #1e293b; }
     
     .vitals-row { display: flex; background: var(--sub-header-bg); }
-    .vital-box { flex: 1; padding: 12px; border-right: 1px solid var(--border-color); text-align: center; }
+    .vital-box { flex: 1; padding: 15px; border-right: 1px solid var(--border-color); text-align: center; }
     .vital-box:last-child { border-right: none; }
-    .vital-label { font-family: var(--font-serif); font-size: 13px; font-weight: bold; margin-bottom: 6px; color: #1e3a8a; }
-    .vital-value { background: var(--bg-panel); color: var(--text-navy); font-size: 22px; font-weight: bold; padding: 6px; border-radius: 4px; border: 1px solid var(--border-color); }
-    .vital-value.green { color: #15803d; }
+    .vital-label { font-size: 12px; font-weight: 700; text-transform: uppercase; margin-bottom: 8px; color: var(--text-light); letter-spacing: 0.5px; }
+    .vital-value { background: var(--bg-panel); color: var(--text-navy); font-size: 24px; font-weight: 800; padding: 8px; border-radius: 4px; border: 1px solid #e2e8f0; font-family: monospace; }
+    .vital-value.green { color: var(--val-green); border-color: #a7f3d0; background: #ecfdf5;}
+    .vital-value.red { color: var(--val-red); border-color: #fecaca; background: #fef2f2;}
     
-    .sec-title { background: var(--header-bg); color: var(--header-text); border: 1px solid #1e3a8a; font-family: var(--font-serif); font-size: 16px; font-weight: bold; text-align: center; padding: 10px; margin-bottom: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); border-radius: 4px; }
+    .sec-title { background: var(--header-bg); color: var(--header-text); font-family: var(--font-serif); font-size: 15px; font-weight: bold; text-align: center; padding: 12px; margin-bottom: 15px; border-radius: 6px; letter-spacing: 0.5px;}
     
-    .grid { display: grid; grid-template-columns: 1fr; gap: 15px; margin-bottom: 30px; }
-    .card { background: var(--bg-panel); border: 1px solid var(--border-color); box-shadow: 0 2px 4px rgba(0,0,0,0.05); display: flex; flex-direction: column; border-radius: 4px; overflow: hidden;}
-    .card-header { background: var(--sub-header-bg); padding: 8px 15px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; font-weight: bold; color: #1e3a8a; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 20px; margin-bottom: 35px; }
+    .card { background: var(--bg-panel); border: 1px solid var(--border-color); box-shadow: 0 4px 6px rgba(0,0,0,0.05); display: flex; flex-direction: column; border-radius: 6px; overflow: hidden;}
+    .card-header { background: var(--sub-header-bg); padding: 12px 20px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; font-weight: 800; color: var(--text-navy); font-size: 15px;}
     
     .leg-container { display: flex; width: 100%; }
-    .leg-col { flex: 1; padding: 15px; border-right: 1px solid var(--border-color); }
+    .leg-col { flex: 1; padding: 20px; border-right: 1px solid var(--border-color); }
     .leg-col:last-child { border-right: none; }
-    .leg-title { font-family: var(--font-serif); font-size: 14px; font-weight: bold; text-align: center; margin-bottom: 10px; color: var(--header-bg); text-decoration: underline; }
+    .leg-title { font-size: 13px; font-weight: 800; text-align: center; margin-bottom: 15px; color: var(--text-light); text-transform: uppercase; letter-spacing: 1px; }
     
-    .data-row { display: flex; justify-content: space-between; margin-bottom: 5px; font-size: 13px; }
-    .val-green { color: #15803d; font-weight: bold; }
-    .val-red { color: #b91c1c; font-weight: bold; }
+    .data-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; color: var(--text-light); }
+    .data-row b { color: var(--text-navy); font-family: monospace; font-size: 15px;}
+    .val-green { color: var(--val-green); font-weight: 800; font-family: monospace; font-size: 15px;}
+    .val-red { color: var(--val-red); font-weight: 800; font-family: monospace; font-size: 15px;}
     
-    .svg-container { height: 40px; margin-top: 10px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 2px;}
+    .svg-container { height: 50px; margin-top: 15px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px;}
     
-    .table-container { background: var(--bg-panel); border: 1px solid var(--border-color); margin-bottom: 30px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); border-radius: 4px; overflow: hidden; }
+    .table-container { background: var(--bg-panel); border: 1px solid var(--border-color); margin-bottom: 35px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); border-radius: 6px; overflow: hidden; }
     table { width: 100%; border-collapse: collapse; text-align: left; }
-    th { background: var(--sub-header-bg); color: #1e3a8a; font-family: var(--font-serif); font-size: 13px; padding: 10px; border-bottom: 1px solid var(--border-color); border-right: 1px solid var(--border-color); text-align: center; }
-    td { padding: 8px 10px; border-bottom: 1px solid #e2e8f0; border-right: 1px solid #e2e8f0; text-align: center; font-size: 13px; }
+    th { background: var(--sub-header-bg); color: var(--text-light); font-size: 12px; font-weight: 800; text-transform: uppercase; padding: 12px; border-bottom: 1px solid var(--border-color); text-align: center; letter-spacing: 0.5px;}
+    td { padding: 12px 10px; border-bottom: 1px solid #e2e8f0; text-align: center; font-size: 14px; font-family: monospace; color: var(--text-navy);}
     
-    .queue-container { background: var(--bg-panel); border: 1px solid var(--border-color); padding: 15px; font-family: monospace; font-size: 12px; color: var(--text-light); line-height: 1.6; border-radius: 4px; }
+    .queue-container { background: var(--bg-panel); border: 1px solid var(--border-color); padding: 20px; font-family: monospace; font-size: 13px; color: var(--text-light); line-height: 1.8; border-radius: 6px; }
     
-    .vault { display: flex; gap: 10px; background: var(--sub-header-bg); padding: 12px; border: 1px solid var(--border-color); align-items: center; justify-content: center; margin-bottom: 20px; border-radius: 4px;}
-    .btn-action { background: #ffffff; color: var(--header-bg); border: 1px solid var(--border-color); padding: 6px 16px; cursor: pointer; font-family: var(--font-sans); font-weight: bold; box-shadow: 0 1px 2px rgba(0,0,0,0.05); border-radius: 4px; }
-    .btn-action:hover { background: #f1f5f9; }
-    .btn-verify { color: #2563eb; text-decoration: underline; font-weight: bold; font-size: 12px; }
+    .vault { display: flex; gap: 15px; background: var(--sub-header-bg); padding: 15px; border: 1px solid var(--border-color); align-items: center; justify-content: center; margin-bottom: 25px; border-radius: 6px;}
+    .btn-action { background: #ffffff; color: var(--text-navy); border: 1px solid var(--border-color); padding: 8px 18px; cursor: pointer; font-weight: 700; box-shadow: 0 1px 2px rgba(0,0,0,0.05); border-radius: 4px; transition: all 0.2s;}
+    .btn-action:hover { background: #f1f5f9; border-color: #94a3b8;}
+    .btn-verify { color: #3b82f6; text-decoration: none; font-weight: 800; font-size: 12px; font-family: var(--font-sans);}
+    .btn-verify:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.4 <span id="ws-status" style="font-size: 12px; font-family: var(--font-sans); margin-left: 10px;">[WS: Checking...]</span></div>
+    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.7 <span id="ws-status" style="font-size: 12px; font-family: var(--font-sans); font-weight: normal; margin-left: 10px;">[WS: Checking...]</span></div>
     <div class="vitals-row">
-        <div class="vital-box"><div class="vital-label">Total P&L</div><div class="vital-value green" id="v-pnl">$0.00</div></div>
-        <div class="vital-box"><div class="vital-label">Total Trades Executed</div><div class="vital-value" id="v-trades">0</div></div>
+        <div class="vital-box"><div class="vital-label">Total Realized P&L</div><div class="vital-value" id="v-pnl">$0.00</div></div>
+        <div class="vital-box"><div class="vital-label">Completed Dual-Leg Trades</div><div class="vital-value" id="v-trades">0</div></div>
         <div class="vital-box"><div class="vital-label">Sold Losers</div><div class="vital-value" id="v-losers">0</div></div>
         <div class="vital-box"><div class="vital-label">Active Slots</div><div class="vital-value" id="v-active">0</div></div>
     </div>
 </div>
 
 <div class="sec-title">Active Market Dual-Leg Monitoring</div>
-<div class="grid" id="active-cards"><div style="text-align:center; padding:20px; color:var(--text-light);">Awaiting Entry Criteria...</div></div>
+<div class="grid" id="active-cards"><div style="text-align:center; padding:30px; color:var(--text-light); font-weight: bold;">Awaiting Entry Criteria...</div></div>
 
 <div class="sec-title">Consolidated Trade Lifecycle History</div>
 <div class="table-container">
     <table>
         <thead><tr><th>Time Closed</th><th>Market Slug</th><th>YES Entry</th><th>NO Entry</th><th>Close Reason</th><th>Net P&L</th><th>Audit Link</th></tr></thead>
-        <tbody id="log-body"><tr><td colspan="7" style="color: var(--text-light);">No historical data available.</td></tr></tbody>
+        <tbody id="log-body"><tr><td colspan="7" style="color: var(--text-light); padding: 20px;">No historical data available.</td></tr></tbody>
     </table>
 </div>
 
 <div class="vault">
-    <span style="font-family: var(--font-serif); font-weight: bold; margin-right: 15px; color: #1e3a8a;">Data Vault & Utilities:</span>
+    <span style="font-weight: 800; margin-right: 15px; color: var(--text-navy); text-transform: uppercase; letter-spacing: 0.5px;">Data Vault & Utilities:</span>
     <button class="btn-action" onclick="window.location.href='/api/dl_trades'">Download Trades (.csv)</button>
     <button class="btn-action" onclick="window.location.href='/api/dl_snaps'">Download Snapshots (.csv)</button>
-    <button class="btn-action" style="color: #dc2626; margin-left: 30px; border-color: #fca5a5;" onclick="deleteFiles()">⚠ Delete Old Files</button>
+    <button class="btn-action" style="color: #dc2626; margin-left: auto; border-color: #fca5a5; background: #fef2f2;" onclick="deleteFiles()">⚠ Delete Old Files</button>
 </div>
 
 <div class="sec-title">Observation Queue (Scouting)</div>
@@ -190,7 +210,7 @@ function renderSparkline(history, color) {
         return `${x},${y}`;
     }).join(' ');
     return `<svg width="100%" height="100%" viewBox="0 -10 100 120" preserveAspectRatio="none">
-        <polyline fill="none" stroke="${color}" stroke-width="2" points="${pts}" />
+        <polyline fill="none" stroke="${color}" stroke-width="2.5" points="${pts}" />
     </svg>`;
 }
 
@@ -207,8 +227,12 @@ setInterval(async () => {
         const s = await r.json();
         
         document.getElementById('ws-status').textContent = s.ws_connected ? "[WS: CONNECTED]" : "[WS: DROPPED]";
-        document.getElementById('ws-status').style.color = s.ws_connected ? "#a7f3d0" : "#fca5a5";
-        document.getElementById('v-pnl').textContent = (s.pnl >= 0 ? '+' : '') + '$' + s.pnl.toFixed(2);
+        document.getElementById('ws-status').style.color = s.ws_connected ? "#34d399" : "#f87171";
+        
+        const pnlBox = document.getElementById('v-pnl');
+        pnlBox.textContent = (s.pnl >= 0 ? '+' : '') + '$' + s.pnl.toFixed(2);
+        pnlBox.className = "vital-value " + (s.pnl > 0 ? "green" : (s.pnl < 0 ? "red" : ""));
+        
         document.getElementById('v-trades').textContent = s.total_trades_count;
         document.getElementById('v-losers').textContent = s.losers;
         
@@ -217,7 +241,6 @@ setInterval(async () => {
         let htmlQueue = '';
         
         s.markets.forEach(m => {
-            // If it's scouting or pending a leg fill, show status in the bottom observation queue
             if (m.state === 'WATCH' || m.state === 'WAITING_NO' || m.state === 'WAITING_YES') {
                 let currentStatus = m.state === 'WATCH' ? 'Scouting' : 'Filling Dual Leg';
                 htmlQueue += `[TTR: ${m.ttr_s}s] | ${m.slug} | YES Ask: $${m.yes_ask.toFixed(3)} | NO Ask: $${m.no_ask.toFixed(3)} | Status: ${currentStatus}<br>`;
@@ -225,12 +248,9 @@ setInterval(async () => {
             }
             if (m.state === 'CLOSED') return;
             
-            // Strictly only show up in Active Monitor if both legs are live
             activeCount++;
-            
             let dYes = ((m.yes_ask - m.yes_entry) / m.yes_entry) * 100;
             let dNo = ((m.no_ask - m.no_entry) / m.no_entry) * 100;
-            
             let cYes = dYes >= 0 ? 'val-green' : 'val-red';
             let cNo = dNo >= 0 ? 'val-green' : 'val-red';
 
@@ -243,13 +263,15 @@ setInterval(async () => {
                     <div class="leg-col">
                         <div class="leg-title">YES LEG MONITOR</div>
                         <div class="data-row"><span>Entry Price:</span> <b>$${m.yes_entry.toFixed(3)}</b></div>
+                        <div class="data-row"><span>Shares Acquired:</span> <b>${m.yes_shares.toFixed(2)}</b></div>
                         <div class="data-row"><span>Live Ticker:</span> <b>$${m.yes_ask.toFixed(3)}</b></div>
                         <div class="data-row"><span>Current Delta:</span> <span class="${cYes}">${(dYes>0?'+':'')+dYes.toFixed(2)+'%'}</span></div>
-                        <div class="svg-container">${renderSparkline(m.history_yes, '#1d4ed8')}</div>
+                        <div class="svg-container">${renderSparkline(m.history_yes, '#0f172a')}</div>
                     </div>
                     <div class="leg-col">
                         <div class="leg-title">NO LEG MONITOR</div>
                         <div class="data-row"><span>Entry Price:</span> <b>$${m.no_entry.toFixed(3)}</b></div>
+                        <div class="data-row"><span>Shares Acquired:</span> <b>${m.no_shares.toFixed(2)}</b></div>
                         <div class="data-row"><span>Live Ticker:</span> <b>$${m.no_ask.toFixed(3)}</b></div>
                         <div class="data-row"><span>Current Delta:</span> <span class="${cNo}">${(dNo>0?'+':'')+dNo.toFixed(2)+'%'}</span></div>
                         <div class="svg-container">${renderSparkline(m.history_no, '#64748b')}</div>
@@ -260,7 +282,7 @@ setInterval(async () => {
         
         document.getElementById('v-active').textContent = activeCount;
         if(htmlCards) document.getElementById('active-cards').innerHTML = htmlCards;
-        else document.getElementById('active-cards').innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-light);">No Active Dual-Leg Positions...</div>';
+        else document.getElementById('active-cards').innerHTML = '<div style="text-align:center; padding:30px; color:var(--text-light); font-weight: bold;">No Active Dual-Leg Positions...</div>';
         
         document.getElementById('obs-queue').innerHTML = htmlQueue || 'No upcoming markets in window.';
 
@@ -268,11 +290,11 @@ setInterval(async () => {
         s.history.reverse().forEach(h => {
             const pnlStr = h.pnl !== 0.0 ? (h.pnl > 0 ? `+${h.pnl.toFixed(2)}` : h.pnl.toFixed(2)) : '--';
             logHtml += `<tr>
-                <td>${h.time}</td>
+                <td style="color:var(--text-light); font-family:var(--font-sans); font-size: 13px;">${h.time}</td>
                 <td>${h.slug}</td>
                 <td>${h.yes_entry > 0 ? '$'+h.yes_entry.toFixed(3) : '--'}</td>
                 <td>${h.no_entry > 0 ? '$'+h.no_entry.toFixed(3) : '--'}</td>
-                <td style="font-weight: bold;">${h.reason}</td>
+                <td style="font-weight: 800; font-family:var(--font-sans); color: var(--header-bg);">${h.reason}</td>
                 <td class="${h.pnl>0?'val-green':(h.pnl<0?'val-red':'')}">${pnlStr}</td>
                 <td><a href="https://polymarket.com/event/${h.slug}" target="_blank" class="btn-verify">VERIFY ↗</a></td>
             </tr>`;
@@ -280,7 +302,7 @@ setInterval(async () => {
         if(logHtml) document.getElementById('log-body').innerHTML = logHtml;
 
     } catch(e) {}
-}, 1000);
+}, 250); 
 </script>
 </body>
 </html>
@@ -296,8 +318,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(DASHBOARD_HTML.encode('utf-8'))
         elif self.path == "/api/status":
             now = time.time()
-            m_data = []
-            history_data = []
+            m_data, history_data = [], []
             
             for m in sorted(GLOBAL_STATE.markets.values(), key=lambda x: x.end_ts):
                 if m.state == MarketState.CLOSED and m.close_time != "":
@@ -310,6 +331,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     m_data.append({
                         "slug": m.slug, "state": m.state, "ttr_s": max(0, int(m.end_ts - now)),
                         "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price,
+                        "yes_shares": m.yes_shares, "no_shares": m.no_shares,
                         "yes_ask": yb.ask if yb else 0.0, "no_ask": nb.ask if nb else 0.0,
                         "history_yes": m.history_yes[-30:], "history_no": m.history_no[-30:]
                     })
@@ -323,18 +345,13 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps(payload).encode('utf-8'))
-        elif self.path == "/api/dl_trades":
+        elif self.path in ["/api/dl_trades", "/api/dl_snaps"]:
+            filename = "trades_full.csv" if self.path == "/api/dl_trades" else "snapshot_live.csv"
             self.send_response(200)
-            self.send_header('Content-Disposition', 'attachment; filename="trades_full.csv"')
+            self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
             self.send_header('Content-Type', 'text/csv')
             self.end_headers()
-            with open("trades_full.csv", "rb") as f: self.wfile.write(f.read())
-        elif self.path == "/api/dl_snaps":
-            self.send_response(200)
-            self.send_header('Content-Disposition', 'attachment; filename="snapshot_live.csv"')
-            self.send_header('Content-Type', 'text/csv')
-            self.end_headers()
-            with open("snapshot_live.csv", "rb") as f: self.wfile.write(f.read())
+            with open(filename, "rb") as f: self.wfile.write(f.read())
         else:
             self.send_response(404)
             self.end_headers()
@@ -355,65 +372,109 @@ def run_server():
     server.serve_forever()
 
 # ─── CORE STRATEGY ───
-def execute_trade(mdm: MarketData, side: str, price: float, action: str, pnl: float = 0.0):
+def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares: float, fees: float, ttr: int, pnl: float = 0.0):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"[{ts}] [{action}] {mdm.slug} | {side} @ {price:.3f}", flush=True)
+    print(f"[{ts}] [{action}] {mdm.slug} | {side} @ {price:.3f} | Shares: {shares:.2f}", flush=True)
     
-    if "ENTRY" in action:
-        GLOBAL_STATE.total_trades += 1
-        if side == "YES": mdm.yes_entry_price = price
-        if side == "NO": mdm.no_entry_price = price
+    if action == "SELL_LOSER_T1" or action == "SELL_LOSER_T2":
+        GLOBAL_STATE.sold_losers += 1
+        mdm.salvage_revenue += (shares * price)
         
-    if pnl != 0.0:
-        mdm.realized_pnl += pnl
-        GLOBAL_STATE.total_pnl += pnl
-        
-    if action == "SELL_LOSER": GLOBAL_STATE.sold_losers += 1
-    
-    if "SELL" in action or action == "CLOSED":
+    if action == "CLOSED" or action == "EXPIRED":
         mdm.close_time = ts
         mdm.close_reason = action
+        GLOBAL_STATE.total_trades += 1
+        mdm.realized_pnl = pnl
+        GLOBAL_STATE.total_pnl += pnl
         
-    log_trade_csv(ts, mdm.slug, action, side, price, pnl)
+    threading.Thread(target=log_trade_csv_worker, args=(ts, mdm.slug, action, side, price, shares, fees, ttr, pnl), daemon=True).start()
 
 def evaluate_market(mdm: MarketData, now: float):
     if mdm.state == MarketState.CLOSED: return
     yb, nb = GLOBAL_STATE.books.get(mdm.yes_token), GLOBAL_STATE.books.get(mdm.no_token)
     if not yb or not nb: return
-    ttr = mdm.end_ts - now
+    ttr = int(mdm.end_ts - now)
+    
+    # ── Expiration Handler ──
     if ttr <= 0:
         mdm.state = MarketState.CLOSED
-        mdm.close_time = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        mdm.close_reason = "EXPIRED"
+        cost_basis = (BASE_CAPITAL_PER_LEG * 2) + mdm.total_fees_paid
+        winner_shares = mdm.yes_shares if yb.bid > nb.bid else mdm.no_shares 
+        calc_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
+        execute_trade(mdm, "EXPIRED", 0.00, "EXPIRED", 0.0, 0.0, ttr, calc_pnl)
         return
+        
     t2 = T_SECOND_LIVE if ttr <= 300 else T_SECOND_PRE
     
+    # ── Entry Logic (With Dynamic Shares & Fees) ──
     if mdm.state == MarketState.WATCH:
         if 0 < yb.ask <= T_FIRST:
             mdm.state = MarketState.WAITING_NO
-            execute_trade(mdm, "YES", yb.ask, "LEG_1_ENTRY")
+            mdm.yes_entry_price = yb.ask
+            mdm.yes_shares = BASE_CAPITAL_PER_LEG / yb.ask
+            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+            mdm.total_fees_paid += fee
+            execute_trade(mdm, "YES", yb.ask, "LEG_1_ENTRY", mdm.yes_shares, fee, ttr)
+            
         elif 0 < nb.ask <= T_FIRST:
             mdm.state = MarketState.WAITING_YES
-            execute_trade(mdm, "NO", nb.ask, "LEG_1_ENTRY")
+            mdm.no_entry_price = nb.ask
+            mdm.no_shares = BASE_CAPITAL_PER_LEG / nb.ask
+            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+            mdm.total_fees_paid += fee
+            execute_trade(mdm, "NO", nb.ask, "LEG_1_ENTRY", mdm.no_shares, fee, ttr)
             
     elif mdm.state == MarketState.WAITING_NO:
         if 0 < nb.ask <= t2:
             mdm.state = MarketState.BOTH
-            execute_trade(mdm, "NO", nb.ask, "LEG_2_ENTRY")
+            mdm.no_entry_price = nb.ask
+            mdm.no_shares = BASE_CAPITAL_PER_LEG / nb.ask
+            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+            mdm.total_fees_paid += fee
+            execute_trade(mdm, "NO", nb.ask, "LEG_2_ENTRY", mdm.no_shares, fee, ttr)
             
     elif mdm.state == MarketState.WAITING_YES:
         if 0 < yb.ask <= t2:
             mdm.state = MarketState.BOTH
-            execute_trade(mdm, "YES", yb.ask, "LEG_2_ENTRY")
+            mdm.yes_entry_price = yb.ask
+            mdm.yes_shares = BASE_CAPITAL_PER_LEG / yb.ask
+            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+            mdm.total_fees_paid += fee
+            execute_trade(mdm, "YES", yb.ask, "LEG_2_ENTRY", mdm.yes_shares, fee, ttr)
             
+    # ── Exit Logic (The Tranche System) ──
     elif mdm.state == MarketState.BOTH:
-        if ttr <= SELL_LOSER_FLOOR_S:
-            if yb.bid >= SELL_LOSER_THRESH:
-                mdm.state = MarketState.CLOSED
-                execute_trade(mdm, "NO", nb.bid, "SELL_LOSER", -0.05)
-            elif nb.bid >= SELL_LOSER_THRESH:
-                mdm.state = MarketState.CLOSED
-                execute_trade(mdm, "YES", yb.bid, "SELL_LOSER", -0.05)
+        
+        # Determine current Winner/Loser
+        if yb.bid > nb.bid: winner_bid, loser_side, loser_bid, loser_shares = yb.bid, "NO", nb.bid, mdm.no_shares
+        else: winner_bid, loser_side, loser_bid, loser_shares = nb.bid, "YES", yb.bid, mdm.yes_shares
+            
+        # Tier 1 (50% Exit) -> Triggered if Winner >= 0.86 AND TTR <= 60s
+        if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and ttr <= SELL_LOSER_T1_TTR_MAX:
+            mdm.t1_executed = True
+            shares_to_sell = loser_shares * 0.50
+            if loser_side == "YES": mdm.yes_shares -= shares_to_sell
+            else: mdm.no_shares -= shares_to_sell
+            
+            fee = (shares_to_sell * loser_bid) * 0.001 # Minimal fees on deep discount exits
+            mdm.total_fees_paid += fee
+            execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T1", shares_to_sell, fee, ttr)
+            
+        # Tier 2 (Final Exit) -> Triggered if Winner >= 0.95 (Disregard TTR)
+        elif winner_bid >= SELL_LOSER_T2_THRESH:
+            mdm.state = MarketState.CLOSED
+            shares_to_sell = loser_shares if not mdm.t1_executed else (loser_shares * 0.50)
+            
+            fee = (shares_to_sell * loser_bid) * 0.001 
+            mdm.total_fees_paid += fee
+            execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T2", shares_to_sell, fee, ttr)
+            
+            # Calculate and log final P&L round trip
+            cost_basis = (BASE_CAPITAL_PER_LEG * 2) + mdm.total_fees_paid
+            winner_shares = mdm.yes_shares if loser_side == "NO" else mdm.no_shares
+            final_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
+            
+            execute_trade(mdm, "CLOSED", winner_bid, "CLOSED_T2_RESOLVED", 0.0, 0.0, ttr, final_pnl)
 
 def tick_loop():
     while GLOBAL_STATE.running:
@@ -506,6 +567,4 @@ if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=discovery_thread, daemon=True).start()
     threading.Thread(target=polymarket_ws_thread, daemon=True).start()
-    threading.Thread(target=tick_loop, daemon=True).start()
-    threading.Thread(target=snapshot_loop, daemon=True).start()
-    while GLOBAL_STATE.running: time.sleep(1)
+    threading.Thread(target=tick_loop, daemon=True
