@@ -1,5 +1,5 @@
 """
-main.py — Opportunistic BSS Bot (v5.8.7 Tranche Strategy & High-Contrast UI)
+main.py — Opportunistic BSS Bot (v5.8.8 Tranche Strategy & API Workarounds)
 """
 import os
 import sys
@@ -21,9 +21,9 @@ T_FIRST = float(os.getenv("BS_BSS_T_FIRST", "0.49"))
 T_SECOND_PRE = float(os.getenv("BS_BSS_T_SECOND_PRE", "0.50"))
 T_SECOND_LIVE = float(os.getenv("BS_BSS_T_SECOND_LIVE", "0.51"))
 
-# Scaled capital to clear Polymarket $1.00 minimums on partial exits
-BASE_CAPITAL_PER_LEG = float(os.getenv("BS_BASE_CAPITAL", "17.0")) 
-TAKER_FEE_RATE = 0.018 # ~1.8% peak bell-curve fee
+# HARD CONSTRAINT: 5.1 USDC to clear 5-share API minimums on 50% partial exits
+BASE_CAPITAL_PER_LEG = 5.1  
+TAKER_FEE_RATE = 0.018 
 
 # Hybrid Tranche Thresholds
 SELL_LOSER_T1_THRESH = 0.86
@@ -100,7 +100,7 @@ def log_trade_csv_worker(ts, slug, action, side, price, shares, fees, ttr, pnl):
             csv.writer(f).writerow([ts, slug, action, side, f"{price:.3f}", f"{shares:.2f}", f"{fees:.3f}", ttr, f"{pnl:.3f}", link])
     except Exception: pass
 
-# ─── DASHBOARD HTML (v5.8.7 High-Contrast UI) ───
+# ─── DASHBOARD HTML (v5.8.8 High-Contrast UI) ───
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -169,7 +169,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.7 <span id="ws-status" style="font-size: 12px; font-family: var(--font-sans); font-weight: normal; margin-left: 10px;">[WS: Checking...]</span></div>
+    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.8 <span id="ws-status" style="font-size: 12px; font-family: var(--font-sans); font-weight: normal; margin-left: 10px;">[WS: Checking...]</span></div>
     <div class="vitals-row">
         <div class="vital-box"><div class="vital-label">Total Realized P&L</div><div class="vital-value" id="v-pnl">$0.00</div></div>
         <div class="vital-box"><div class="vital-label">Completed Dual-Leg Trades</div><div class="vital-value" id="v-trades">0</div></div>
@@ -442,7 +442,7 @@ def evaluate_market(mdm: MarketData, now: float):
             mdm.total_fees_paid += fee
             execute_trade(mdm, "YES", yb.ask, "LEG_2_ENTRY", mdm.yes_shares, fee, ttr)
             
-    # ── Exit Logic (The Tranche System) ──
+    # ── Exit Logic (The Tranche System with 99% API Bug Workaround) ──
     elif mdm.state == MarketState.BOTH:
         
         # Determine current Winner/Loser
@@ -453,23 +453,27 @@ def evaluate_market(mdm: MarketData, now: float):
         if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and ttr <= SELL_LOSER_T1_TTR_MAX:
             mdm.t1_executed = True
             shares_to_sell = loser_shares * 0.50
+            
+            # Update local state
             if loser_side == "YES": mdm.yes_shares -= shares_to_sell
             else: mdm.no_shares -= shares_to_sell
             
-            fee = (shares_to_sell * loser_bid) * 0.001 # Minimal fees on deep discount exits
+            fee = (shares_to_sell * loser_bid) * 0.001 # Minimal taker fees on deep discount exits
             mdm.total_fees_paid += fee
             execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T1", shares_to_sell, fee, ttr)
             
         # Tier 2 (Final Exit) -> Triggered if Winner >= 0.95 (Disregard TTR)
         elif winner_bid >= SELL_LOSER_T2_THRESH:
             mdm.state = MarketState.CLOSED
-            shares_to_sell = loser_shares if not mdm.t1_executed else (loser_shares * 0.50)
+            
+            # WORKAROUND: Sell exactly 99% to bypass Polymarket 'not enough balance' cache bug
+            shares_to_sell = loser_shares * 0.99 
             
             fee = (shares_to_sell * loser_bid) * 0.001 
             mdm.total_fees_paid += fee
             execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T2", shares_to_sell, fee, ttr)
             
-            # Calculate and log final P&L round trip
+            # Calculate and log final P&L round trip (including 1.00 winner payout and remaining dust math)
             cost_basis = (BASE_CAPITAL_PER_LEG * 2) + mdm.total_fees_paid
             winner_shares = mdm.yes_shares if loser_side == "NO" else mdm.no_shares
             final_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
@@ -567,4 +571,6 @@ if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=discovery_thread, daemon=True).start()
     threading.Thread(target=polymarket_ws_thread, daemon=True).start()
-    threading.Thread(target=tick_loop, daemon=True
+    threading.Thread(target=tick_loop, daemon=True).start()
+    threading.Thread(target=snapshot_loop, daemon=True).start()
+    while GLOBAL_STATE.running: time.sleep(1)
