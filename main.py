@@ -1,5 +1,5 @@
 """
-main.py — Opportunistic BSS Bot (v5.8.17 Shadow Mode Telemetry)
+main.py — Opportunistic BSS Bot (v5.8.18 Persistent UI & Catastrophe Fix)
 """
 import os
 import sys
@@ -76,6 +76,7 @@ class MarketData:
         
         self.close_time = ""
         self.close_reason = ""
+        self.expired_processed = False
         
         self.history_yes: List[float] = []
         self.history_no: List[float] = []
@@ -220,7 +221,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.17 
+    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.18 
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
@@ -464,7 +465,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             m_data, history_data = [], []
             
             for m in sorted(GLOBAL_STATE.markets.values(), key=lambda x: x.end_ts):
-                if m.state == MarketState.CLOSED and m.close_time != "":
+                ttr = int(m.end_ts - now)
+                if m.state == MarketState.CLOSED and m.close_time != "" and getattr(m, 'expired_processed', False):
                     history_data.append({
                         "time": m.close_time, "slug": m.slug, "reason": m.close_reason,
                         "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price, "pnl": m.realized_pnl,
@@ -479,7 +481,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     n_a_v = nb.get_local_vols(nb.ask, "ask", 0.10) if nb else 0
                     
                     m_data.append({
-                        "slug": m.slug, "state": m.state, "ttr_s": int(m.end_ts - now),
+                        "slug": m.slug, "state": m.state, "ttr_s": ttr,
                         "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price,
                         "yes_shares": m.yes_shares, "no_shares": m.no_shares,
                         "yes_ask": yb.ask if yb else 0.0, "no_ask": nb.ask if nb else 0.0,
@@ -563,27 +565,29 @@ def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares:
     threading.Thread(target=log_trade_csv_worker, args=(ts, mdm.slug, action, side, price, shares, fees, ttr, pnl), daemon=True).start()
 
 def evaluate_market(mdm: MarketData, now: float):
-    if mdm.state == MarketState.CLOSED and (mdm.end_ts - now) <= -5: return
+    if getattr(mdm, 'expired_processed', False): return
         
     yb, nb = GLOBAL_STATE.books.get(mdm.yes_token), GLOBAL_STATE.books.get(mdm.no_token)
     if not yb or not nb: return
     ttr = int(mdm.end_ts - now)
     
-    if ttr <= -5 and mdm.state != MarketState.CLOSED:
-        mdm.state = MarketState.CLOSED
-        
-        cost_basis = mdm.total_fees_paid
-        if mdm.yes_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
-        if mdm.no_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
-        
+    if ttr <= -5:
+        mdm.expired_processed = True
         winner_side = "YES" if yb.bid > nb.bid else "NO"
-        winner_shares = mdm.yes_shares if winner_side == "YES" else mdm.no_shares 
-        calc_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
         
         if (mdm.t1_side == winner_side) or (mdm.t2_side == winner_side):
             GLOBAL_STATE.catastrophes += 1
             
-        execute_trade(mdm, "EXPIRED", 0.00, "EXPIRED", 0.0, 0.0, ttr, calc_pnl)
+        if mdm.state != MarketState.CLOSED:
+            mdm.state = MarketState.CLOSED
+            cost_basis = mdm.total_fees_paid
+            if mdm.yes_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
+            if mdm.no_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
+            
+            winner_shares = mdm.yes_shares if winner_side == "YES" else mdm.no_shares 
+            calc_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
+            
+            execute_trade(mdm, "EXPIRED", 0.00, "EXPIRED", 0.0, 0.0, ttr, calc_pnl)
         return
         
     if ttr <= 0 or mdm.state == MarketState.CLOSED: return
