@@ -1,5 +1,5 @@
 """
-main.py — Opportunistic BSS Bot (v5.8.16 Catastrophes & Conviction UI)
+main.py — Opportunistic BSS Bot (v5.8.17 Shadow Mode Telemetry)
 """
 import os
 import sys
@@ -82,8 +82,28 @@ class MarketData:
 
 class OrderBook:
     def __init__(self):
-        self.ask = 1.0
-        self.bid = 0.0
+        self.bids: Dict[float, float] = {}
+        self.asks: Dict[float, float] = {}
+
+    @property
+    def bid(self):
+        return max(self.bids.keys()) if self.bids else 0.0
+
+    @property
+    def ask(self):
+        return min(self.asks.keys()) if self.asks else 0.0
+
+    def get_local_vols(self, current_price: float, side: str, depth: float = 0.10) -> float:
+        vol = 0.0
+        if side == "bid":
+            for p, s in self.bids.items():
+                if p >= current_price - depth:
+                    vol += s
+        else:
+            for p, s in self.asks.items():
+                if p <= current_price + depth:
+                    vol += s
+        return vol
 
 class BotState:
     def __init__(self):
@@ -107,6 +127,9 @@ def init_csv():
     if not os.path.exists("snapshot_live.csv"):
         with open("snapshot_live.csv", "w", newline="") as f:
             csv.writer(f).writerow(["Timestamp", "Slug", "State", "Yes_Ask", "Yes_Bid", "No_Ask", "No_Bid"])
+    if not os.path.exists("telemetry_shadow.csv"):
+        with open("telemetry_shadow.csv", "w", newline="") as f:
+            csv.writer(f).writerow(["Timestamp", "Slug", "Token", "TTR", "Ticker_Price", "Local_Bid_Vol", "Local_Ask_Vol", "Imbalance_Ratio", "Signal"])
 
 def log_trade_csv_worker(ts, slug, action, side, price, shares, fees, ttr, pnl):
     link = f"https://polymarket.com/event/{slug}"
@@ -197,7 +220,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.16 
+    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.17 
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
@@ -225,6 +248,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <span style="font-weight: 800; margin-right: 15px; color: var(--text-navy); text-transform: uppercase; letter-spacing: 0.5px;">Data Vault & Utilities:</span>
     <button class="btn-action" onclick="window.location.href='/api/dl_trades'">Download Trades (.csv)</button>
     <button class="btn-action" onclick="window.location.href='/api/dl_snaps'">Download Snapshots (.csv)</button>
+    <button class="btn-action" style="color: var(--val-gold); border-color: #B45309;" onclick="window.location.href='/api/dl_telemetry'">Download Telemetry (.csv)</button>
     <button class="btn-action" style="color: #FCA5A5; margin-left: auto; border-color: #7F1D1D; background: #450A0A;" onclick="deleteFiles()">⚠ Delete Old Files</button>
 </div>
 
@@ -269,6 +293,17 @@ function getConvictionHtml(ask) {
     else trackerText = `<span style="color:var(--text-light)">${distT1}¢ to T1 | ${distT2}¢ to T2</span>`;
     
     return { pct: fillPct, text: trackerText };
+}
+
+function getImbalanceBadge(bidV, askV) {
+    if (askV > 0 && bidV >= askV * 2.0) {
+        let r = (bidV/askV).toFixed(1);
+        return `<span style="background:var(--val-green); color:#064E3B; padding:2px 6px; border-radius:3px; font-size:10px; font-weight:800; margin-left:8px;">⚠ BID WALL (${r}x)</span>`;
+    } else if (bidV > 0 && askV >= bidV * 2.0) {
+        let r = (askV/bidV).toFixed(1);
+        return `<span style="background:var(--val-red); color:#fff; padding:2px 6px; border-radius:3px; font-size:10px; font-weight:800; margin-left:8px;">⚠ ASK WALL (${r}x)</span>`;
+    }
+    return '';
 }
 
 function formatUptime(seconds) {
@@ -330,6 +365,9 @@ setInterval(async () => {
             let cYesData = getConvictionHtml(m.yes_ask);
             let cNoData = getConvictionHtml(m.no_ask);
 
+            let yesBadge = getImbalanceBadge(m.yes_b_vol, m.yes_a_vol);
+            let noBadge = getImbalanceBadge(m.no_b_vol, m.no_a_vol);
+
             htmlCards += `<div class="card">
                 <div class="card-header">
                     <span>${m.slug} ${closedBadge}</span>
@@ -340,7 +378,10 @@ setInterval(async () => {
                         <div class="leg-title">YES LEG MONITOR</div>
                         <div class="data-row"><span>Shares Acquired:</span> <b>${m.yes_shares.toFixed(2)}</b></div>
                         <div class="data-row"><span>Effective Entry (w/ fees):</span> <b>$${m.yes_entry > 0 ? (m.yes_entry*1.018).toFixed(3) : '0.000'}</b></div>
-                        <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;"><span>Live Ticker:</span> <b>$${m.yes_ask.toFixed(3)}</b></div>
+                        <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;">
+                            <span>Live Ticker: ${yesBadge}</span> 
+                            <b>$${m.yes_ask.toFixed(3)}</b>
+                        </div>
                         <div class="data-row"><span>Current Delta:</span> <span class="${cYes}">${(dYes>0?'+':'')+dYes.toFixed(2)+'%'}</span></div>
                         <div class="data-row"><span>Live Value:</span> <b class="val-gold">$${valYes.toFixed(2)}</b></div>
                         
@@ -357,7 +398,10 @@ setInterval(async () => {
                         <div class="leg-title">NO LEG MONITOR</div>
                         <div class="data-row"><span>Shares Acquired:</span> <b>${m.no_shares.toFixed(2)}</b></div>
                         <div class="data-row"><span>Effective Entry (w/ fees):</span> <b>$${m.no_entry > 0 ? (m.no_entry*1.018).toFixed(3) : '0.000'}</b></div>
-                        <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;"><span>Live Ticker:</span> <b>$${m.no_ask.toFixed(3)}</b></div>
+                        <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;">
+                            <span>Live Ticker: ${noBadge}</span> 
+                            <b>$${m.no_ask.toFixed(3)}</b>
+                        </div>
                         <div class="data-row"><span>Current Delta:</span> <span class="${cNo}">${(dNo>0?'+':'')+dNo.toFixed(2)+'%'}</span></div>
                         <div class="data-row"><span>Live Value:</span> <b class="val-gold">$${valNo.toFixed(2)}</b></div>
                         
@@ -429,11 +473,18 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     })
                 else:
                     yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
+                    y_b_v = yb.get_local_vols(yb.bid, "bid", 0.10) if yb else 0
+                    y_a_v = yb.get_local_vols(yb.ask, "ask", 0.10) if yb else 0
+                    n_b_v = nb.get_local_vols(nb.bid, "bid", 0.10) if nb else 0
+                    n_a_v = nb.get_local_vols(nb.ask, "ask", 0.10) if nb else 0
+                    
                     m_data.append({
                         "slug": m.slug, "state": m.state, "ttr_s": int(m.end_ts - now),
                         "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price,
                         "yes_shares": m.yes_shares, "no_shares": m.no_shares,
                         "yes_ask": yb.ask if yb else 0.0, "no_ask": nb.ask if nb else 0.0,
+                        "yes_b_vol": y_b_v, "yes_a_vol": y_a_v,
+                        "no_b_vol": n_b_v, "no_a_vol": n_a_v,
                         "history_yes": m.history_yes[-30:], "history_no": m.history_no[-30:],
                         "t1_side": m.t1_side, "t1_price": m.t1_price, 
                         "t2_side": m.t2_side, "t2_price": m.t2_price
@@ -450,8 +501,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps(payload).encode('utf-8'))
-        elif self.path in ["/api/dl_trades", "/api/dl_snaps"]:
-            filename = "trades_full.csv" if self.path == "/api/dl_trades" else "snapshot_live.csv"
+        elif self.path in ["/api/dl_trades", "/api/dl_snaps", "/api/dl_telemetry"]:
+            filename = "trades_full.csv"
+            if self.path == "/api/dl_snaps": filename = "snapshot_live.csv"
+            elif self.path == "/api/dl_telemetry": filename = "telemetry_shadow.csv"
             self.send_response(200)
             self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
             self.send_header('Content-Type', 'text/csv')
@@ -469,6 +522,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         if self.path == "/api/delete_logs":
             if os.path.exists("trades_full.csv"): os.remove("trades_full.csv")
             if os.path.exists("snapshot_live.csv"): os.remove("snapshot_live.csv")
+            if os.path.exists("telemetry_shadow.csv"): os.remove("telemetry_shadow.csv")
             init_csv()
             self.send_response(200)
             self.end_headers()
@@ -509,14 +563,12 @@ def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares:
     threading.Thread(target=log_trade_csv_worker, args=(ts, mdm.slug, action, side, price, shares, fees, ttr, pnl), daemon=True).start()
 
 def evaluate_market(mdm: MarketData, now: float):
-    # Persist the UI window strictly until clock runs out and post-check finishes
     if mdm.state == MarketState.CLOSED and (mdm.end_ts - now) <= -5: return
         
     yb, nb = GLOBAL_STATE.books.get(mdm.yes_token), GLOBAL_STATE.books.get(mdm.no_token)
     if not yb or not nb: return
     ttr = int(mdm.end_ts - now)
     
-    # ── Expiration / Closure Check (-5s) ──
     if ttr <= -5 and mdm.state != MarketState.CLOSED:
         mdm.state = MarketState.CLOSED
         
@@ -528,7 +580,6 @@ def evaluate_market(mdm: MarketData, now: float):
         winner_shares = mdm.yes_shares if winner_side == "YES" else mdm.no_shares 
         calc_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
         
-        # Check for Catastrophes (We sold a token assuming it was losing, but it ended up winning)
         if (mdm.t1_side == winner_side) or (mdm.t2_side == winner_side):
             GLOBAL_STATE.catastrophes += 1
             
@@ -645,9 +696,45 @@ def snapshot_loop():
                         m.history_no.append(na)
                         if len(m.history_yes) > 30: m.history_yes.pop(0)
                         if len(m.history_no) > 30: m.history_no.pop(0)
-        except Exception:
-            pass
+        except Exception: pass
         time.sleep(30)
+
+def telemetry_loop():
+    while GLOBAL_STATE.running:
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        try:
+            with open("telemetry_shadow.csv", "a", newline="") as f:
+                writer = csv.writer(f)
+                for m in list(GLOBAL_STATE.markets.values()):
+                    if m.state == MarketState.CLOSED: continue
+                    ttr = int(m.end_ts - time.time())
+                    if ttr < 0: continue
+                    
+                    yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
+                    
+                    if yb and yb.bids and yb.asks:
+                        y_b_vol = yb.get_local_vols(yb.bid, "bid", 0.10)
+                        y_a_vol = yb.get_local_vols(yb.ask, "ask", 0.10)
+                        r_y = y_b_vol / y_a_vol if y_a_vol > 0 else 999.0
+                        r_y_inv = y_a_vol / y_b_vol if y_b_vol > 0 else 999.0
+                        
+                        if r_y >= 2.0:
+                            writer.writerow([ts, m.slug, "YES", ttr, f"{yb.ask:.3f}", f"{y_b_vol:.0f}", f"{y_a_vol:.0f}", f"{r_y:.1f}", "BID_WALL"])
+                        elif r_y_inv >= 2.0:
+                            writer.writerow([ts, m.slug, "YES", ttr, f"{yb.ask:.3f}", f"{y_b_vol:.0f}", f"{y_a_vol:.0f}", f"{r_y_inv:.1f}", "ASK_WALL"])
+                            
+                    if nb and nb.bids and nb.asks:
+                        n_b_vol = nb.get_local_vols(nb.bid, "bid", 0.10)
+                        n_a_vol = nb.get_local_vols(nb.ask, "ask", 0.10)
+                        r_n = n_b_vol / n_a_vol if n_a_vol > 0 else 999.0
+                        r_n_inv = n_a_vol / n_b_vol if n_b_vol > 0 else 999.0
+                        
+                        if r_n >= 2.0:
+                            writer.writerow([ts, m.slug, "NO", ttr, f"{nb.ask:.3f}", f"{n_b_vol:.0f}", f"{n_a_vol:.0f}", f"{r_n:.1f}", "BID_WALL"])
+                        elif r_n_inv >= 2.0:
+                            writer.writerow([ts, m.slug, "NO", ttr, f"{nb.ask:.3f}", f"{n_b_vol:.0f}", f"{n_a_vol:.0f}", f"{r_n_inv:.1f}", "ASK_WALL"])
+        except Exception: pass
+        time.sleep(5)
 
 def discovery_thread():
     while GLOBAL_STATE.running:
@@ -687,15 +774,19 @@ def polymarket_ws_thread():
                 if not aid: continue
                 if event.get("event_type") == "book":
                     book = GLOBAL_STATE.books.setdefault(aid, OrderBook())
-                    book.bid = max((float(b["price"]) for b in event.get("bids", [])), default=0.0)
-                    book.ask = min((float(a["price"]) for a in event.get("asks", [])), default=0.0)
+                    book.bids = {float(b["price"]): float(b["size"]) for b in event.get("bids", [])}
+                    book.asks = {float(a["price"]): float(a["size"]) for a in event.get("asks", [])}
                 elif event.get("event_type") == "price_change":
                     book = GLOBAL_STATE.books.get(aid)
                     if not book: continue
                     for ch in event.get("changes", []):
-                        s, p = ch.get("side", ""), float(ch.get("price", 0))
-                        if s == "BUY" and p > book.bid: book.bid = p
-                        elif s == "SELL" and (book.ask == 0 or p < book.ask): book.ask = p
+                        s, p, sz = ch.get("side", ""), float(ch.get("price", 0)), float(ch.get("size", 0))
+                        if s == "BUY":
+                            if sz == 0: book.bids.pop(p, None)
+                            else: book.bids[p] = sz
+                        elif s == "SELL":
+                            if sz == 0: book.asks.pop(p, None)
+                            else: book.asks[p] = sz
         except Exception: pass
 
     def on_open(ws):
@@ -722,5 +813,6 @@ if __name__ == "__main__":
     threading.Thread(target=polymarket_ws_thread, daemon=True).start()
     threading.Thread(target=tick_loop, daemon=True).start()
     threading.Thread(target=snapshot_loop, daemon=True).start()
+    threading.Thread(target=telemetry_loop, daemon=True).start()
     while GLOBAL_STATE.running:
         time.sleep(1)
