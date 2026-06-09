@@ -1,5 +1,5 @@
 """
-main.py — BSS Bot v5.8.21 (Telemetry Guard + Buzzer Precision)
+main.py — BSS Bot v5.8.22 (Telemetry Guard + Buzzer Precision + TTR Floor Patch)
 FULL PRODUCTION BUILD
 """
 import os
@@ -230,7 +230,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.21
+    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.22
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
@@ -587,6 +587,7 @@ def evaluate_market(mdm: MarketData, now: float):
     if not yb or not nb: return
     ttr = int(mdm.end_ts - now)
     
+    # Buzzer Precision Trigger
     if ttr <= 1:
         mdm.expired_processed = True
         winner_side = "YES" if yb.bid > nb.bid else "NO"
@@ -652,7 +653,8 @@ def evaluate_market(mdm: MarketData, now: float):
         if yb.bid > nb.bid: winner_bid, loser_side, loser_bid, loser_shares, loser_book = yb.bid, "NO", nb.bid, mdm.no_shares, nb
         else: winner_bid, loser_side, loser_bid, loser_shares, loser_book = nb.bid, "YES", yb.bid, mdm.yes_shares, yb
             
-        if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and ttr <= SELL_LOSER_T1_TTR_MAX:
+        # Hard Floor Lock Patched: (0 < ttr <= 60)
+        if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
             guard_ratio = check_guard_imbalance(loser_book)
             if guard_ratio > 0:
                 if loser_side == "YES": mdm.guard_active_yes = True
@@ -756,13 +758,18 @@ def discovery_thread():
                     m_info = res.json()[0].get("markets", [])[0]
                     cid = m_info["conditionId"]
                     if cid not in GLOBAL_STATE.markets:
-                        tks = json.loads(m_info["clobTokenIds"])
-                        outcomes = json.loads(m_info["outcomes"])
-                        y_idx = 0 if outcomes[0].lower() in ["yes", "up"] else 1
                         end_ts = datetime.fromisoformat(m_info["endDate"].replace("Z", "+00:00")).timestamp()
-                        GLOBAL_STATE.markets[cid] = MarketData(cid, slug, tks[y_idx], tks[1-y_idx], end_ts)
-                        print(f"[Discovery] Tracking: {slug}", flush=True)
-                        new_markets = True
+                        
+                        # API Sanity Check Patched: Reject stale markets (< 2 minutes to close)
+                        if end_ts > time.time() + 120:
+                            tks = json.loads(m_info["clobTokenIds"])
+                            outcomes = json.loads(m_info["outcomes"])
+                            y_idx = 0 if outcomes[0].lower() in ["yes", "up"] else 1
+                            GLOBAL_STATE.markets[cid] = MarketData(cid, slug, tks[y_idx], tks[1-y_idx], end_ts)
+                            print(f"[Discovery] Tracking: {slug}", flush=True)
+                            new_markets = True
+                        else:
+                            print(f"[Discovery] Skipped Stale Market: {slug}", flush=True)
             except Exception: pass
         if new_markets and GLOBAL_STATE.ws_handle:
             try: GLOBAL_STATE.ws_handle.close()
