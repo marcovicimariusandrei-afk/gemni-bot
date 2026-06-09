@@ -1,5 +1,5 @@
 """
-main.py — BSS Bot v5.8.22 (Telemetry Guard + Buzzer Precision + TTR Floor Patch)
+main.py — BSS Bot v5.8.23 (Entry Cutoff Deadzone Patch)
 FULL PRODUCTION BUILD
 """
 import os
@@ -26,6 +26,7 @@ BASE_CAPITAL_PER_LEG = 5.1
 TAKER_FEE_RATE = 0.018 
 
 HEDGE_DEADLINE_TTR = 320
+ENTRY_CUTOFF_TTR = 120  # Never enter a new position if less than 2 minutes remain
 MAX_COMBINED_COST = 1.02
 
 SELL_LOSER_T1_THRESH = 0.86
@@ -230,7 +231,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.22
+    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.23
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
@@ -607,21 +608,22 @@ def evaluate_market(mdm: MarketData, now: float):
     t2 = T_SECOND_LIVE if ttr <= 300 else T_SECOND_PRE
     
     if mdm.state == MarketState.WATCH:
-        if 0 < yb.ask <= T_FIRST:
+        # HARD CUTOFF PATCH: Do not enter if less than 120 seconds remain
+        if 0 < yb.ask <= T_FIRST and ttr > ENTRY_CUTOFF_TTR:
             mdm.state = MarketState.WAITING_NO
             mdm.yes_entry_price = yb.ask
             mdm.yes_shares = BASE_CAPITAL_PER_LEG / yb.ask
             fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
             mdm.total_fees_paid += fee
             execute_trade(mdm, "YES", yb.ask, "LEG_1_ENTRY", mdm.yes_shares, fee, ttr)
-        elif 0 < nb.ask <= T_FIRST:
+        elif 0 < nb.ask <= T_FIRST and ttr > ENTRY_CUTOFF_TTR:
             mdm.state = MarketState.WAITING_YES
             mdm.no_entry_price = nb.ask
             mdm.no_shares = BASE_CAPITAL_PER_LEG / nb.ask
             fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
             mdm.total_fees_paid += fee
             execute_trade(mdm, "NO", nb.ask, "LEG_1_ENTRY", mdm.no_shares, fee, ttr)
-        elif ttr <= HEDGE_DEADLINE_TTR and 0 < yb.ask and 0 < nb.ask and (yb.ask + nb.ask) <= MAX_COMBINED_COST:
+        elif ttr <= HEDGE_DEADLINE_TTR and ttr > ENTRY_CUTOFF_TTR and 0 < yb.ask and 0 < nb.ask and (yb.ask + nb.ask) <= MAX_COMBINED_COST:
             mdm.state = MarketState.BOTH
             mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
             fee_yes = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
@@ -633,7 +635,8 @@ def evaluate_market(mdm: MarketData, now: float):
             execute_trade(mdm, "NO", nb.ask, "LEG_2_FOMO", mdm.no_shares, fee_no, ttr)
 
     elif mdm.state == MarketState.WAITING_NO:
-        if (0 < nb.ask <= t2) or (ttr <= HEDGE_DEADLINE_TTR and nb.ask > 0):
+        # HARD CUTOFF PATCH applies to Leg 2 as well
+        if (0 < nb.ask <= t2 and ttr > ENTRY_CUTOFF_TTR) or (ENTRY_CUTOFF_TTR < ttr <= HEDGE_DEADLINE_TTR and nb.ask > 0):
             mdm.state = MarketState.BOTH
             mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
             fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
@@ -641,7 +644,8 @@ def evaluate_market(mdm: MarketData, now: float):
             execute_trade(mdm, "NO", nb.ask, "LEG_2_DEADLINE" if ttr <= HEDGE_DEADLINE_TTR else "LEG_2_ENTRY", mdm.no_shares, fee, ttr)
             
     elif mdm.state == MarketState.WAITING_YES:
-        if (0 < yb.ask <= t2) or (ttr <= HEDGE_DEADLINE_TTR and yb.ask > 0):
+        # HARD CUTOFF PATCH applies to Leg 2 as well
+        if (0 < yb.ask <= t2 and ttr > ENTRY_CUTOFF_TTR) or (ENTRY_CUTOFF_TTR < ttr <= HEDGE_DEADLINE_TTR and yb.ask > 0):
             mdm.state = MarketState.BOTH
             mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
             fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
@@ -653,7 +657,6 @@ def evaluate_market(mdm: MarketData, now: float):
         if yb.bid > nb.bid: winner_bid, loser_side, loser_bid, loser_shares, loser_book = yb.bid, "NO", nb.bid, mdm.no_shares, nb
         else: winner_bid, loser_side, loser_bid, loser_shares, loser_book = nb.bid, "YES", yb.bid, mdm.yes_shares, yb
             
-        # Hard Floor Lock Patched: (0 < ttr <= 60)
         if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
             guard_ratio = check_guard_imbalance(loser_book)
             if guard_ratio > 0:
@@ -759,8 +762,6 @@ def discovery_thread():
                     cid = m_info["conditionId"]
                     if cid not in GLOBAL_STATE.markets:
                         end_ts = datetime.fromisoformat(m_info["endDate"].replace("Z", "+00:00")).timestamp()
-                        
-                        # API Sanity Check Patched: Reject stale markets (< 2 minutes to close)
                         if end_ts > time.time() + 120:
                             tks = json.loads(m_info["clobTokenIds"])
                             outcomes = json.loads(m_info["outcomes"])
