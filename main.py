@@ -1,5 +1,5 @@
 """
-main.py — BSS Bot v6.1 (Impenetrable State-Machine Firewall)
+main.py — BSS Bot v6.2 (The Ironclad State Machine)
 FULL PRODUCTION BUILD
 """
 import os
@@ -173,7 +173,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>BSS Analysis Dashboard v6.1</title>
+<title>BSS Analysis Dashboard v6.2</title>
 <style>
     :root { --bg-main: #0B1120; --bg-panel: #1E293B; --header-bg: #0F172A; --header-text: #F8FAFC; --sub-header-bg: #0F172A; --text-navy: #F8FAFC; --text-light: #94A3B8; --border-color: #334155; --val-green: #34D399; --val-red: #F87171; --val-yellow: #FCD34D; --val-pink: #F472B6; --font-serif: Georgia, "Times New Roman", serif; --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
@@ -226,7 +226,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v6.1
+    <div class="brand-title">BSS Bot Analysis Dashboard v6.2
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
         <span class="status-tags" id="ntp-status">[NTP Sync Delta: 0ms]</span>
@@ -580,88 +580,87 @@ def evaluate_market(mdm: MarketData, now: float):
     if getattr(mdm, 'expired_processed', False): return
     
     ttr = int(mdm.end_ts - now)
-    
-    # ─── THE STATE-MACHINE FIREWALL (V6.1) ───
-    # 1. The Garbage Collector (Total lockout for dead markets)
-    if ttr < 0:
-        mdm.expired_processed = True
-        mdm.state = MarketState.CLOSED
-        return
-
     yb, nb = GLOBAL_STATE.books.get(mdm.yes_token), GLOBAL_STATE.books.get(mdm.no_token)
     
-    # 2. The Buzzer Killer (Absolute execution closure)
+    # ─── 1. THE TERMINATOR (Buzzer & Zombie Killer) ───
     if ttr <= 1:
         mdm.expired_processed = True
         if mdm.state != MarketState.CLOSED:
             mdm.state = MarketState.CLOSED
-            if not yb or not nb: return
-            winner_side = "YES" if yb.bid > nb.bid else "NO"
             
-            if (mdm.t1_side == winner_side) or (mdm.t2_side == winner_side):
-                GLOBAL_STATE.catastrophes += 1
+            # If we hold capital in this market, we must finalize PnL.
+            if mdm.yes_shares > 0 or mdm.no_shares > 0:
+                if not yb or not nb:
+                    winner_side = "UNKNOWN"
+                else:
+                    winner_side = "YES" if yb.bid > nb.bid else "NO"
+                    
+                if (mdm.t1_side == winner_side) or (mdm.t2_side == winner_side):
+                    GLOBAL_STATE.catastrophes += 1
+                    
+                cost_basis = mdm.total_fees_paid
+                if mdm.yes_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
+                if mdm.no_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
                 
-            cost_basis = mdm.total_fees_paid
-            if mdm.yes_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
-            if mdm.no_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
-            winner_shares = mdm.yes_shares if winner_side == "YES" else mdm.no_shares 
-            calc_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
-            execute_trade(mdm, winner_side, 0.00, "EXPIRED_AT_BUZZER", 0.0, 0.0, ttr, calc_pnl)
+                winner_shares = mdm.yes_shares if winner_side == "YES" else mdm.no_shares 
+                calc_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
+                execute_trade(mdm, winner_side, 0.00, "EXPIRED_AT_BUZZER", 0.0, 0.0, ttr, calc_pnl)
         return
         
     if not yb or not nb: return
     if mdm.state == MarketState.CLOSED: return
     
-    # 3. The Entry Lock (Strict inline cutoff)
-    if mdm.state == MarketState.WATCH:
-        if 0 < yb.ask <= T_FIRST and ttr > ENTRY_CUTOFF_TTR:
-            mdm.state = MarketState.WAITING_NO
-            mdm.yes_entry_price = yb.ask
-            mdm.yes_shares = BASE_CAPITAL_PER_LEG / yb.ask
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, "YES", yb.ask, "LEG_1_ENTRY", mdm.yes_shares, fee, ttr)
-        elif 0 < nb.ask <= T_FIRST and ttr > ENTRY_CUTOFF_TTR:
-            mdm.state = MarketState.WAITING_YES
-            mdm.no_entry_price = nb.ask
-            mdm.no_shares = BASE_CAPITAL_PER_LEG / nb.ask
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, "NO", nb.ask, "LEG_1_ENTRY", mdm.no_shares, fee, ttr)
-        elif ENTRY_CUTOFF_TTR < ttr <= HEDGE_DEADLINE_TTR and 0 < yb.ask and 0 < nb.ask and (yb.ask + nb.ask) <= MAX_COMBINED_COST:
-            mdm.state = MarketState.BOTH
-            mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
-            fee_yes = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee_yes
-            execute_trade(mdm, "YES", yb.ask, "LEG_1_FOMO", mdm.yes_shares, fee_yes, ttr)
-            mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
-            fee_no = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee_no
-            execute_trade(mdm, "NO", nb.ask, "LEG_2_FOMO", mdm.no_shares, fee_no, ttr)
+    # ─── 2. THE ENTRY DEADZONE (Nothing under 120s) ───
+    if ttr > ENTRY_CUTOFF_TTR:
+        if mdm.state == MarketState.WATCH:
+            if 0 < yb.ask <= T_FIRST:
+                mdm.state = MarketState.WAITING_NO
+                mdm.yes_entry_price = yb.ask
+                mdm.yes_shares = BASE_CAPITAL_PER_LEG / yb.ask
+                fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+                mdm.total_fees_paid += fee
+                execute_trade(mdm, "YES", yb.ask, "LEG_1_ENTRY", mdm.yes_shares, fee, ttr)
+            elif 0 < nb.ask <= T_FIRST:
+                mdm.state = MarketState.WAITING_YES
+                mdm.no_entry_price = nb.ask
+                mdm.no_shares = BASE_CAPITAL_PER_LEG / nb.ask
+                fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+                mdm.total_fees_paid += fee
+                execute_trade(mdm, "NO", nb.ask, "LEG_1_ENTRY", mdm.no_shares, fee, ttr)
+            elif ttr <= HEDGE_DEADLINE_TTR and 0 < yb.ask and 0 < nb.ask and (yb.ask + nb.ask) <= MAX_COMBINED_COST:
+                mdm.state = MarketState.BOTH
+                mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
+                fee_yes = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+                mdm.total_fees_paid += fee_yes
+                execute_trade(mdm, "YES", yb.ask, "LEG_1_FOMO", mdm.yes_shares, fee_yes, ttr)
+                mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
+                fee_no = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+                mdm.total_fees_paid += fee_no
+                execute_trade(mdm, "NO", nb.ask, "LEG_2_FOMO", mdm.no_shares, fee_no, ttr)
 
-    elif mdm.state == MarketState.WAITING_NO:
-        if (0 < nb.ask <= T_SECOND_LIVE and ttr > ENTRY_CUTOFF_TTR) or (ENTRY_CUTOFF_TTR < ttr <= HEDGE_DEADLINE_TTR and nb.ask > 0 and (mdm.yes_entry_price + nb.ask) <= MAX_COMBINED_COST):
-            mdm.state = MarketState.BOTH
-            mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, "NO", nb.ask, "LEG_2_DEADLINE" if ttr <= HEDGE_DEADLINE_TTR else "LEG_2_ENTRY", mdm.no_shares, fee, ttr)
+        elif mdm.state == MarketState.WAITING_NO:
+            if (0 < nb.ask <= T_SECOND_LIVE) or (ttr <= HEDGE_DEADLINE_TTR and nb.ask > 0 and (mdm.yes_entry_price + nb.ask) <= MAX_COMBINED_COST):
+                mdm.state = MarketState.BOTH
+                mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
+                fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+                mdm.total_fees_paid += fee
+                execute_trade(mdm, "NO", nb.ask, "LEG_2_DEADLINE" if ttr <= HEDGE_DEADLINE_TTR else "LEG_2_ENTRY", mdm.no_shares, fee, ttr)
+                
+        elif mdm.state == MarketState.WAITING_YES:
+            if (0 < yb.ask <= T_SECOND_LIVE) or (ttr <= HEDGE_DEADLINE_TTR and yb.ask > 0 and (mdm.no_entry_price + yb.ask) <= MAX_COMBINED_COST):
+                mdm.state = MarketState.BOTH
+                mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
+                fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+                mdm.total_fees_paid += fee
+                execute_trade(mdm, "YES", yb.ask, "LEG_2_DEADLINE" if ttr <= HEDGE_DEADLINE_TTR else "LEG_2_ENTRY", mdm.yes_shares, fee, ttr)
             
-    elif mdm.state == MarketState.WAITING_YES:
-        if (0 < yb.ask <= T_SECOND_LIVE and ttr > ENTRY_CUTOFF_TTR) or (ENTRY_CUTOFF_TTR < ttr <= HEDGE_DEADLINE_TTR and yb.ask > 0 and (mdm.no_entry_price + yb.ask) <= MAX_COMBINED_COST):
-            mdm.state = MarketState.BOTH
-            mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, "YES", yb.ask, "LEG_2_DEADLINE" if ttr <= HEDGE_DEADLINE_TTR else "LEG_2_ENTRY", mdm.yes_shares, fee, ttr)
-            
-    elif mdm.state == MarketState.BOTH:
+    # ─── 3. THE EXIT LOGIC (T1 & T2) ───
+    if mdm.state == MarketState.BOTH:
         mdm.guard_active_yes = mdm.guard_active_no = False
         if yb.bid > nb.bid: winner_bid, loser_side, loser_bid, loser_shares, loser_book = yb.bid, "NO", nb.bid, mdm.no_shares, nb
         else: winner_bid, loser_side, loser_bid, loser_shares, loser_book = nb.bid, "YES", yb.bid, mdm.yes_shares, yb
             
-        # 4. The Exit Lock (Absolute TTR Bounds)
-        if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
+        if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and ttr <= SELL_LOSER_T1_TTR_MAX:
             guard_ratio = check_guard_imbalance(loser_book)
             if guard_ratio > 0:
                 if loser_side == "YES": mdm.guard_active_yes = True
@@ -677,7 +676,7 @@ def evaluate_market(mdm: MarketData, now: float):
                 mdm.total_fees_paid += fee
                 execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T1", shares_to_sell, fee, ttr)
             
-        elif winner_bid >= SELL_LOSER_T2_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
+        elif winner_bid >= SELL_LOSER_T2_THRESH and ttr <= SELL_LOSER_T1_TTR_MAX:
             guard_ratio = check_guard_imbalance(loser_book)
             if guard_ratio > 0:
                 if loser_side == "YES": mdm.guard_active_yes = True
