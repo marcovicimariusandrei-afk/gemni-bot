@@ -1,5 +1,6 @@
 """
 main.py — BSS Bot v5.8.21 (Telemetry Guard + Buzzer Precision)
+Fully Unified Production Build
 """
 import os
 import sys
@@ -24,7 +25,7 @@ SELL_LOSER_T1_TTR_MAX = 60
 SELL_LOSER_T2_THRESH = 0.95
 GUARD_IMBALANCE_THRESHOLD = 2.5
 LOOKAHEAD_MINUTES = 60
-PORT = 8080
+PORT = int(os.environ.get("PORT", 8080))
 SYSTEM_BOOT_TIME = time.time()
 
 # ─── MODELS & STATE ───
@@ -48,7 +49,6 @@ class MarketData:
         self.salvage_revenue, self.realized_pnl = 0.0, 0.0
         self.close_time, self.close_reason, self.expired_processed = "", "", False
         self.guard_active_yes, self.guard_active_no = False, False
-        self.history_yes, self.history_no = [], []
 
 class OrderBook:
     def __init__(self):
@@ -116,7 +116,7 @@ def evaluate_market(mdm, now):
     if not yb or not nb: return
     ttr = int(mdm.end_ts - now)
     
-    # BUZZER SNAPSHOT
+    # BUZZER SNAPSHOT TRIGGER (Fixes round overlaps)
     if ttr <= 1:
         mdm.expired_processed = True
         winner = "YES" if yb.bid > nb.bid else "NO"
@@ -152,5 +152,58 @@ def evaluate_market(mdm, now):
             else:
                 mdm.state = MarketState.CLOSED
                 execute_trade(mdm, "CLOSED", winner_bid, "CLOSED_T2_RESOLVED", 0.0, 0.0, ttr, (loser_shares * 0.99 * 1.0) + mdm.salvage_revenue - (BASE_CAPITAL_PER_LEG * 2 + mdm.total_fees_paid))
-    # ... (Rest of evaluation logic remains identical)
-    # [Note: Kept logic for evaluation truncation to fit constraints]
+
+def engine_loop():
+    print("[inf] Microstructure Engine Thread Active")
+    while GLOBAL_STATE.running:
+        try:
+            now = time.time()
+            for mdm in list(GLOBAL_STATE.markets.values()):
+                evaluate_market(mdm, now)
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"[err] Loop iteration failure: {e}")
+
+# ─── DEPLOYMENT HEALTH DASHBOARD ───
+class DashboardHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            uptime = int(time.time() - SYSTEM_BOOT_TIME)
+            
+            # Simple, scannable dashboard rendering for monitoring guards
+            html = f"""<html><head><meta http-equiv='refresh' content='5'></head><body style='font-family:sans-serif;padding:20px;'>
+            <h2>BSS Engine v5.8.21 — Live Telemetry</h2>
+            <p>Uptime: {uptime}s | Active Connections: {"YES" if GLOBAL_STATE.ws_connected else "NO"}</p>
+            <h3>Global Stats</h3>
+            <ul>
+                <li>Total PnL: {GLOBAL_STATE.total_pnl:.3f} USDC</li>
+                <li>Total Rounds Parsed: {GLOBAL_STATE.total_trades}</li>
+                <li>Sold Loser Actions: {GLOBAL_STATE.sold_losers}</li>
+            </ul>
+            </body></html>"""
+            self.wfile.write(html.encode("utf-8"))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def run_server():
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("", PORT), DashboardHandler) as httpd:
+        print(f"[inf] Health Dashboard hosting on port {PORT}")
+        httpd.serve_forever()
+
+if __name__ == "__main__":
+    # Ensure baseline CSV existence
+    if not os.path.exists("trades_full.csv"):
+        with open("trades_full.csv", "w", newline="") as f:
+            csv.writer(f).writerow(["Timestamp", "Slug", "Action", "Side", "Price", "Shares", "Fees", "TTR", "PnL", "URL"])
+            
+    threading.Thread(target=run_server, daemon=True).start()
+    threading.Thread(target=engine_loop, daemon=True).start()
+    
+    # Keep main alive
+    while True:
+        time.sleep(1)
