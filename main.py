@@ -1,5 +1,5 @@
 """
-main.py — BSS Bot v6.2 (Realistic Maker Entries + GitHub/Railway Optimized)
+main.py — BSS Bot v6.2 (Full Substantiated Maker Core + Live WebSocket Stream)
 """
 import os
 import sys
@@ -12,6 +12,7 @@ import csv
 from typing import Dict, List
 from datetime import datetime, timezone
 import requests
+import websocket
 
 # ─── ENVIRONMENT CONFIGURATION (RAILWAY FRIENDLY) ───
 MODE = os.getenv("MODE", "dry").lower()  # 'dry' or 'live'
@@ -36,7 +37,7 @@ GUARD_IMBALANCE_THRESHOLD = 2.0
 # ─── STATE MODELS ───
 class MarketState:
     WATCH = "WATCH"
-    PENDING_MAKER = "PENDING_MAKER"  # Order resting on the book, un-filled
+    PENDING_MAKER = "PENDING_MAKER"  
     WAITING_NO = "WAITING_NO"
     WAITING_YES = "WAITING_YES"
     BOTH = "BOTH"
@@ -85,8 +86,10 @@ class BotState:
         self.running = True
         self.markets: Dict[str, MarketData] = {}
         self.books: Dict[str, OrderBook] = {}
+        self.subscribed_tokens = set()
         self.total_pnl, self.total_trades, self.sold_losers, self.catastrophes = 0.0, 0, 0, 0
         self.time_offset = 0.0
+        self.ws = None
 
 GLOBAL_STATE = BotState()
 
@@ -137,7 +140,6 @@ def calculate_imbalance(book: OrderBook) -> float:
 def evaluate_market(mdm: MarketData, now: float):
     ttr = int(mdm.end_ts - now)
     
-    # Absolute Buzzer Protection
     if ttr <= 1 and mdm.state != MarketState.CLOSED:
         mdm.state = MarketState.CLOSED
         cost = mdm.total_fees_paid + (BASE_CAPITAL_PER_LEG * (1 if (mdm.yes_shares == 0 or mdm.no_shares == 0) else 2))
@@ -158,24 +160,21 @@ def evaluate_market(mdm: MarketData, now: float):
 
         # PHASE 2: Time Decay Shift & Reality Check
         if mdm.state == MarketState.PENDING_MAKER:
-            # Shift to $0.50 Maker order if 10-minute boundary crossed without fill
             if ttr < PHASE_1_TTR_START and mdm.pending_target_price == 0.49:
                 mdm.pending_target_price = 0.50
                 print(f"[Entry Engine] {mdm.slug} | Target un-filled. Stepping up to $0.50 Maker Order.", flush=True)
 
-            # SUBSTANTIATION CHECK: Did the real-world order book liquidity touch our target?
-            # A resting Maker buy limit order fills if the market Ask price drops to meet it.
+            # SUBSTANTIATION CHECK
             if yb.ask <= mdm.pending_target_price and mdm.yes_shares == 0:
                 mdm.yes_entry_price = mdm.pending_target_price
                 mdm.yes_shares = BASE_CAPITAL_PER_LEG / mdm.yes_entry_price
-                execute_trade(mdm, "YES", mdm.yes_entry_price, "MAKER_FILL_LEG_1", mdm.yes_shares, 0.0, ttr) # 0 fees for maker fills
+                execute_trade(mdm, "YES", mdm.yes_entry_price, "MAKER_FILL_LEG_1", mdm.yes_shares, 0.0, ttr)
 
             if nb.ask <= mdm.pending_target_price and mdm.no_shares == 0:
                 mdm.no_entry_price = mdm.pending_target_price
                 mdm.no_shares = BASE_CAPITAL_PER_LEG / mdm.no_entry_price
                 execute_trade(mdm, "NO", mdm.no_entry_price, "MAKER_FILL_LEG_2", mdm.no_shares, 0.0, ttr)
 
-            # State transition once both legs realistically fill
             if mdm.yes_shares > 0 and mdm.no_shares > 0:
                 mdm.state = MarketState.BOTH
             elif mdm.yes_shares > 0:
@@ -183,14 +182,12 @@ def evaluate_market(mdm: MarketData, now: float):
             elif mdm.no_shares > 0:
                 mdm.state = MarketState.WAITING_YES
 
-        # TELEMETRY IMBALANCE TRIGGER (Option B Safe Fallback Check)
-        # If one side filled but order book telemetry shows a massive run-away wall (>2.0x)
+        # TELEMETRY IMBALANCE TRIGGER (Taker Fallback)
         if mdm.state in [MarketState.WAITING_NO, MarketState.WAITING_YES] and ttr <= HEDGE_DEADLINE_TTR:
             active_book = nb if mdm.state == MarketState.WAITING_NO else yb
             imbalance = calculate_imbalance(active_book)
             
             if imbalance >= GUARD_IMBALANCE_THRESHOLD:
-                # Order book is thinning/front-running. Force Taker fill at $0.51 to protect the position.
                 side = "NO" if mdm.state == MarketState.WAITING_NO else "YES"
                 price = nb.ask if side == "NO" else yb.ask
                 
@@ -204,7 +201,7 @@ def evaluate_market(mdm: MarketData, now: float):
                     mdm.state = MarketState.BOTH
                     execute_trade(mdm, side, price, "TAKER_HEDGE_PROTECTION", BASE_CAPITAL_PER_LEG / price, fee, ttr)
 
-    # ─── 4. FLAWLESS v6.2 EXITS (Unchanged) ───
+    # ─── FLAWLESS v6.2 EXITS ───
     if mdm.state == MarketState.BOTH:
         winner_bid, loser_side, loser_bid, loser_shares, loser_book = (yb.bid, "NO", nb.bid, mdm.no_shares, nb) if yb.bid > nb.bid else (nb.bid, "YES", yb.bid, mdm.yes_shares, yb)
         
@@ -225,7 +222,46 @@ def evaluate_market(mdm: MarketData, now: float):
                 win_shares = mdm.yes_shares if loser_side == "NO" else mdm.no_shares
                 execute_trade(mdm, "CLOSED", winner_bid, "CLOSED_T2_RESOLVED", 0.0, 0.0, ttr, (win_shares * 1.00) + mdm.salvage_revenue - cost)
 
-# ─── NETWORKING ENGINE LOOPS ───
+# ─── LIVE WEBSOCKET & DISCOVERY PIPELINE ───
+def on_ws_message(ws, message):
+    try:
+        data = json.loads(message)
+        if isinstance(data, list):
+            for event in data:
+                token_id = event.get("asset_id")
+                if token_id in GLOBAL_STATE.books:
+                    book = GLOBAL_STATE.books[token_id]
+                    if event.get("side") == "buy":
+                        book.bids[float(event["price"])] = float(event["size"])
+                    else:
+                        book.asks[float(event["price"])] = float(event["size"])
+        
+        # Periodic evaluation execution pulse
+        now = get_synced_time()
+        for m in list(GLOBAL_STATE.markets.values()):
+            evaluate_market(m, now)
+    except: pass
+
+def polymarket_ws_thread():
+    while GLOBAL_STATE.running:
+        try:
+            GLOBAL_STATE.ws = websocket.WebSocketApp(
+                "wss://clob.polymarket.com/ws/",
+                on_message=on_ws_message
+            )
+            # Send subscription payloads whenever new markets appear
+            def on_open(ws):
+                if GLOBAL_STATE.subscribed_tokens:
+                    ws.send(json.dumps({
+                        "type": "subscribe",
+                        "assets_ids": list(GLOBAL_STATE.subscribed_tokens),
+                        "channels": ["order_book"]
+                    }))
+            GLOBAL_STATE.ws.on_open = on_open
+            GLOBAL_STATE.ws.run_forever()
+        except: pass
+        time.sleep(2)
+
 def discovery_loop():
     while GLOBAL_STATE.running:
         try:
@@ -238,6 +274,8 @@ def discovery_loop():
             
             now = get_synced_time()
             boundaries = [int((now // 300) * 300) + (i * 300) for i in range(1, (LOOKAHEAD_MINUTES // 5) + 1)]
+            
+            new_tokens_found = False
             for ts in boundaries:
                 slug = f"btc-updown-5m-{ts}"
                 res = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}", timeout=5)
@@ -249,57 +287,53 @@ def discovery_loop():
                         tks = json.loads(m_info["clobTokenIds"])
                         outcomes = json.loads(m_info["outcomes"])
                         y_idx = 0 if outcomes[0].lower() in ["yes", "up"] else 1
-                        GLOBAL_STATE.markets[cid] = MarketData(cid, slug, tks[y_idx], tks[1-y_idx], end_ts)
+                        
+                        yes_tk, no_tk = tks[y_idx], tks[1-y_idx]
+                        GLOBAL_STATE.markets[cid] = MarketData(cid, slug, yes_tk, no_tk, end_ts)
+                        GLOBAL_STATE.books[yes_tk] = OrderBook()
+                        GLOBAL_STATE.books[no_tk] = OrderBook()
+                        GLOBAL_STATE.subscribed_tokens.add(yes_tk)
+                        GLOBAL_STATE.subscribed_tokens.add(no_tk)
+                        new_tokens_found = True
+            
+            # Dynamic resubscription block
+            if new_tokens_found and GLOBAL_STATE.ws and GLOBAL_STATE.ws.sock and GLOBAL_STATE.ws.sock.connected:
+                GLOBAL_STATE.ws.send(json.dumps({
+                    "type": "subscribe",
+                    "assets_ids": list(GLOBAL_STATE.subscribed_tokens),
+                    "channels": ["order_book"]
+                }))
         except: pass
         time.sleep(10)
 
-def telemetry_feed():
-    # Simulates polling loop matching execution layer patterns
-    while GLOBAL_STATE.running:
-        now = get_synced_time()
-        for m in list(GLOBAL_STATE.markets.values()):
-            try:
-                # Simulating population of real order books from API endpoint checks
-                res = requests.get(f"https://clob.polymarket.com/book?token_id={m.yes_token}", timeout=2)
-                if res.status_code == 200:
-                    data = res.json()
-                    book = GLOBAL_STATE.books.setdefault(m.yes_token, OrderBook())
-                    book.bids = {float(b["price"]): float(b["size"]) for b in data.get("bids", [])}
-                    book.asks = {float(a["price"]): float(a["size"]) for a in data.get("asks", [])}
-                
-                res = requests.get(f"https://clob.polymarket.com/book?token_id={m.no_token}", timeout=2)
-                if res.status_code == 200:
-                    data = res.json()
-                    book = GLOBAL_STATE.books.setdefault(m.no_token, OrderBook())
-                    book.bids = {float(b["price"]): float(b["size"]) for b in data.get("bids", [])}
-                    book.asks = {float(a["price"]): float(a["size"]) for a in data.get("asks", [])}
-                
-                evaluate_market(m, now)
-            except: pass
-        time.sleep(0.5)
-
-# ─── COMPACT LIVE PRODUCTION WEB UI ───
-class EmbeddedDashboard(http.server.SimpleHTTPRequestHandler):
+# ─── COMPACT LIVE PRODUCTION WEB UI (RAILWAY HEALTH-CHECK PROOF) ───
+class EmbeddedDashboard(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/":
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html')
-            self.end_headers()
-            html = f"<html><body style='font-family:monospace;background:#111;color:#eee;padding:30px;'>"
-            html += f"<h2>BSS v6.2 (Substantiated Maker Core)</h2>"
-            html += f"<p>Total Realized P&L: ${GLOBAL_STATE.total_pnl:.2f} | Cycles completed: {GLOBAL_STATE.total_trades}</p>"
-            html += "<h3>Active Markets Sequence:</h3><ul>"
-            for m in GLOBAL_STATE.markets.values():
-                if m.state != MarketState.CLOSED:
-                    html += f"<li>{m.slug} [{m.state}] - Target: ${m.pending_target_price:.2f} | YES Shares: {m.yes_shares:.1f} | NO Shares: {m.no_shares:.1f}</li>"
-            html += "</ul></body></html>"
-            self.wfile.write(html.encode())
-    def log_message(self, format, *args): pass
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html')
+        self.end_headers()
+        
+        if self.path == "/favicon.ico":
+            self.wfile.write(b"")
+            return
+            
+        html = f"<html><body style='font-family:monospace;background:#111;color:#eee;padding:30px;'>"
+        html += f"<h2>BSS v6.2 (Substantiated Maker Core)</h2>"
+        html += f"<p>Total Realized P&L: ${GLOBAL_STATE.total_pnl:.2f} | Cycles completed: {GLOBAL_STATE.total_trades}</p>"
+        html += "<h3>Active Markets Sequence:</h3><ul>"
+        for m in list(GLOBAL_STATE.markets.values()):
+            if m.state != MarketState.CLOSED:
+                html += f"<li>{m.slug} [{m.state}] - Target: ${m.pending_target_price:.2f} | YES Shares: {m.yes_shares:.1f} | NO Shares: {m.no_shares:.1f}</li>"
+        html += "</ul></body></html>"
+        self.wfile.write(html.encode())
+
+    def log_message(self, format, *args): 
+        pass
 
 if __name__ == "__main__":
     init_csv()
     threading.Thread(target=discovery_loop, daemon=True).start()
-    threading.Thread(target=telemetry_feed, daemon=True).start()
+    threading.Thread(target=polymarket_ws_thread, daemon=True).start()
     server = socketserver.ThreadingTCPServer(("", PORT), EmbeddedDashboard)
     print(f"[System Engine] High-fidelity runner listening on port {PORT}", flush=True)
     try: server.serve_forever()
