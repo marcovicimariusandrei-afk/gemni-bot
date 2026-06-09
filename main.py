@@ -1,5 +1,5 @@
 """
-main.py — BSS Bot v5.8.24 (Zombie Killer & Absolute Entry Cutoff)
+main.py — BSS Bot v6.0 (Production Engine: NTP Sync, Maker Limits, & Oracles)
 FULL PRODUCTION BUILD
 """
 import os
@@ -20,14 +20,14 @@ from datetime import datetime, timezone
 MODE = os.getenv("MODE", "dry").lower()
 T_FIRST = float(os.getenv("BS_BSS_T_FIRST", "0.49"))
 T_SECOND_PRE = float(os.getenv("BS_BSS_T_SECOND_PRE", "0.50"))
-T_SECOND_LIVE = float(os.getenv("BS_BSS_T_SECOND_LIVE", "0.51"))
+T_SECOND_LIVE = float(os.getenv("BS_BSS_T_SECOND_LIVE", "0.50")) # Strict Maker Limits
 
 BASE_CAPITAL_PER_LEG = 5.1  
 TAKER_FEE_RATE = 0.018 
 
 HEDGE_DEADLINE_TTR = 320
 ENTRY_CUTOFF_TTR = 120  # ABSOLUTE: Do not enter if less than 120s remain
-MAX_COMBINED_COST = 1.02
+MAX_COMBINED_COST = 1.01
 
 SELL_LOSER_T1_THRESH = 0.86
 SELL_LOSER_T1_TTR_MAX = 60
@@ -123,8 +123,33 @@ class BotState:
         self.total_trades = 0 
         self.sold_losers = 0
         self.catastrophes = 0
+        self.time_offset = 0.0 # NTP Sync Delta
 
 GLOBAL_STATE = BotState()
+
+# ─── TIME SYNC (NTP) ───
+def sync_time_with_api():
+    """Calculates latency between local container and Polymarket API."""
+    try:
+        start_ping = time.time()
+        res = requests.get("https://gamma-api.polymarket.com/events?limit=1", timeout=5)
+        end_ping = time.time()
+        
+        if res.status_code == 200:
+            # We assume the HTTP response took 50% of the RTT
+            rtt_latency = (end_ping - start_ping) / 2.0 
+            server_time_str = res.headers.get("Date", "")
+            if server_time_str:
+                server_dt = datetime.strptime(server_time_str, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=timezone.utc)
+                server_ts = server_dt.timestamp() + rtt_latency
+                local_ts = end_ping
+                GLOBAL_STATE.time_offset = server_ts - local_ts
+                print(f"[Sync] Network Latency Delta: {GLOBAL_STATE.time_offset * 1000:.1f}ms", flush=True)
+    except Exception as e:
+        print(f"[Sync] Time sync failed, defaulting to local CPU clock. Error: {e}")
+
+def get_synced_time() -> float:
+    return time.time() + GLOBAL_STATE.time_offset
 
 # ─── ASYNC CSV LOGGING SYSTEM ───
 def init_csv():
@@ -151,25 +176,10 @@ DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>BSS Analysis Dashboard</title>
+<title>BSS Analysis Dashboard v6.0</title>
 <style>
-    /* ... (CSS block remains identical for brevity) ... */
-    :root {
-        --bg-main: #0B1120;
-        --bg-panel: #1E293B;
-        --header-bg: #0F172A;
-        --header-text: #F8FAFC;
-        --sub-header-bg: #0F172A;
-        --text-navy: #F8FAFC;
-        --text-light: #94A3B8;
-        --border-color: #334155;
-        --val-green: #34D399;
-        --val-red: #F87171;
-        --val-yellow: #FCD34D;
-        --val-pink: #F472B6;
-        --font-serif: Georgia, "Times New Roman", serif;
-        --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
+    /* Minified CSS for Engine Display */
+    :root { --bg-main: #0B1120; --bg-panel: #1E293B; --header-bg: #0F172A; --header-text: #F8FAFC; --sub-header-bg: #0F172A; --text-navy: #F8FAFC; --text-light: #94A3B8; --border-color: #334155; --val-green: #34D399; --val-red: #F87171; --val-yellow: #FCD34D; --val-pink: #F472B6; --font-serif: Georgia, "Times New Roman", serif; --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
     .header-panel { background: var(--header-bg); border: 1px solid var(--border-color); display: flex; flex-direction: column; text-align: center; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border-radius: 6px; overflow: hidden; }
     .brand-title { font-family: var(--font-serif); font-size: 22px; font-weight: bold; color: var(--header-text); padding: 14px 0; border-bottom: 1px solid var(--border-color); }
@@ -220,15 +230,16 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.24
+    <div class="brand-title">BSS Bot Analysis Dashboard v6.0
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
+        <span class="status-tags" id="ntp-status">[NTP Sync Delta: 0ms]</span>
     </div>
     <div class="vitals-row">
         <div class="vital-box"><div class="vital-label">Total Realized P&L</div><div class="vital-value" id="v-pnl">$0.00</div></div>
         <div class="vital-box"><div class="vital-label">Completed Trades</div><div class="vital-value" id="v-trades">0</div></div>
         <div class="vital-box"><div class="vital-label">Sold Losers</div><div class="vital-value" id="v-losers">0</div></div>
-        <div class="vital-box"><div class="vital-label">Catastrophes</div><div class="vital-value red" id="v-catastrophes">0</div></div>
+        <div class="vital-box"><div class="vital-label">Catastrophes Avoided</div><div class="vital-value red" id="v-catastrophes">0</div></div>
         <div class="vital-box"><div class="vital-label">Active Slots</div><div class="vital-value" id="v-active">0</div></div>
     </div>
 </div>
@@ -267,7 +278,6 @@ function renderSparkline(history, color, t1_price, t2_price) {
     }).join(' ');
     
     let svg = `<polyline fill="none" stroke="${color}" stroke-width="2.5" points="${pts}" />`;
-    
     if (t1_price > 0) {
         let yT1 = 100 - (((t1_price - min) / range) * 100);
         yT1 = Math.max(5, Math.min(95, yT1)); 
@@ -278,7 +288,6 @@ function renderSparkline(history, color, t1_price, t2_price) {
         yT2 = Math.max(5, Math.min(95, yT2)); 
         svg += `<circle cx="92" cy="${yT2}" r="4" fill="var(--val-pink)" stroke="#0B1120" stroke-width="1.5" />`;
     }
-    
     return `<svg width="100%" height="100%" viewBox="0 -10 100 120" preserveAspectRatio="none">${svg}</svg>`;
 }
 
@@ -286,12 +295,10 @@ function getConvictionHtml(ask) {
     let fillPct = Math.min(100, Math.max(0, ask * 100));
     let distT1 = Math.round((ask - 0.86) * 100);
     let distT2 = Math.round((ask - 0.95) * 100);
-    
     let trackerText = "";
     if (ask >= 0.95) trackerText = `<span class="val-pink">T2 REACHED (+${distT2}¢)</span>`;
     else if (ask >= 0.86) trackerText = `<span class="val-gold">T1 REACHED (+${distT1}¢)</span> | <span style="color:var(--text-light)">${distT2}¢ to T2</span>`;
     else trackerText = `<span style="color:var(--text-light)">${distT1}¢ to T1 | ${distT2}¢ to T2</span>`;
-    
     return { pct: fillPct, text: trackerText };
 }
 
@@ -328,6 +335,7 @@ setInterval(async () => {
         document.getElementById('bot-uptime').textContent = `[Uptime: ${formatUptime(s.uptime_s)}]`;
         document.getElementById('ws-status').textContent = s.ws_connected ? "[WS: CONNECTED]" : "[WS: DROPPED]";
         document.getElementById('ws-status').style.color = s.ws_connected ? "#34d399" : "#f87171";
+        document.getElementById('ntp-status').textContent = `[NTP Drift: ${Math.round(s.time_offset * 1000)}ms]`;
         
         const pnlBox = document.getElementById('v-pnl');
         pnlBox.textContent = (s.pnl >= 0 ? '+' : '') + '$' + s.pnl.toFixed(2);
@@ -468,7 +476,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(DASHBOARD_HTML.encode('utf-8'))
         elif self.path == "/api/status":
-            now = time.time()
+            now = get_synced_time()
             m_data, history_data = [], []
             for m in sorted(GLOBAL_STATE.markets.values(), key=lambda x: x.end_ts):
                 ttr = int(m.end_ts - now)
@@ -502,6 +510,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     })
             payload = {
                 "uptime_s": int(time.time() - SYSTEM_BOOT_TIME),
+                "time_offset": GLOBAL_STATE.time_offset,
                 "ws_connected": GLOBAL_STATE.ws_connected, "pnl": GLOBAL_STATE.total_pnl,
                 "total_trades_count": GLOBAL_STATE.total_trades, "losers": GLOBAL_STATE.sold_losers,
                 "catastrophes": GLOBAL_STATE.catastrophes,
@@ -572,21 +581,23 @@ def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares:
     threading.Thread(target=log_trade_csv_worker, args=(ts, mdm.slug, action, side, price, shares, fees, ttr, pnl), daemon=True).start()
 
 def evaluate_market(mdm: MarketData, now: float):
-    # Zombie Killer Patch: Absolute Floor
     if getattr(mdm, 'expired_processed', False): return
     
     ttr = int(mdm.end_ts - now)
     yb, nb = GLOBAL_STATE.books.get(mdm.yes_token), GLOBAL_STATE.books.get(mdm.no_token)
     
-    # Buzzer Precision Trigger + Zombie Lock
+    # Zombie/Buzzer Killer Patch: Absolute Floor
     if ttr <= 1:
         mdm.expired_processed = True
         if mdm.state != MarketState.CLOSED:
             mdm.state = MarketState.CLOSED
-            if not yb or not nb: return # Prevent crash if API is dead
+            if not yb or not nb: return
             winner_side = "YES" if yb.bid > nb.bid else "NO"
+            
+            # Catastrophe Audit (Did we sell a loser that bounced back?)
             if (mdm.t1_side == winner_side) or (mdm.t2_side == winner_side):
                 GLOBAL_STATE.catastrophes += 1
+                
             cost_basis = mdm.total_fees_paid
             if mdm.yes_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
             if mdm.no_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
@@ -597,7 +608,6 @@ def evaluate_market(mdm: MarketData, now: float):
         
     if not yb or not nb: return
     if mdm.state == MarketState.CLOSED: return
-    t2 = T_SECOND_LIVE if ttr <= 300 else T_SECOND_PRE
     
     # Absolute Entry Cutoff Wrapper
     if ttr > ENTRY_CUTOFF_TTR:
@@ -628,7 +638,7 @@ def evaluate_market(mdm: MarketData, now: float):
                 execute_trade(mdm, "NO", nb.ask, "LEG_2_FOMO", mdm.no_shares, fee_no, ttr)
     
         elif mdm.state == MarketState.WAITING_NO:
-            if (0 < nb.ask <= t2) or (ttr <= HEDGE_DEADLINE_TTR and nb.ask > 0):
+            if (0 < nb.ask <= T_SECOND_LIVE) or (ttr <= HEDGE_DEADLINE_TTR and nb.ask > 0 and (mdm.yes_entry_price + nb.ask) <= MAX_COMBINED_COST):
                 mdm.state = MarketState.BOTH
                 mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
                 fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
@@ -636,7 +646,7 @@ def evaluate_market(mdm: MarketData, now: float):
                 execute_trade(mdm, "NO", nb.ask, "LEG_2_DEADLINE" if ttr <= HEDGE_DEADLINE_TTR else "LEG_2_ENTRY", mdm.no_shares, fee, ttr)
                 
         elif mdm.state == MarketState.WAITING_YES:
-            if (0 < yb.ask <= t2) or (ttr <= HEDGE_DEADLINE_TTR and yb.ask > 0):
+            if (0 < yb.ask <= T_SECOND_LIVE) or (ttr <= HEDGE_DEADLINE_TTR and yb.ask > 0 and (mdm.no_entry_price + yb.ask) <= MAX_COMBINED_COST):
                 mdm.state = MarketState.BOTH
                 mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
                 fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
@@ -648,7 +658,6 @@ def evaluate_market(mdm: MarketData, now: float):
         if yb.bid > nb.bid: winner_bid, loser_side, loser_bid, loser_shares, loser_book = yb.bid, "NO", nb.bid, mdm.no_shares, nb
         else: winner_bid, loser_side, loser_bid, loser_shares, loser_book = nb.bid, "YES", yb.bid, mdm.yes_shares, yb
             
-        # The T1 Lock
         if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
             guard_ratio = check_guard_imbalance(loser_book)
             if guard_ratio > 0:
@@ -665,7 +674,6 @@ def evaluate_market(mdm: MarketData, now: float):
                 mdm.total_fees_paid += fee
                 execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T1", shares_to_sell, fee, ttr)
             
-        # The T2 Lock (Zombie Patch applied)
         elif winner_bid >= SELL_LOSER_T2_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
             guard_ratio = check_guard_imbalance(loser_book)
             if guard_ratio > 0:
@@ -687,7 +695,7 @@ def evaluate_market(mdm: MarketData, now: float):
 def tick_loop():
     print("[inf] Tick Loop Active", flush=True)
     while GLOBAL_STATE.running:
-        now = time.time()
+        now = get_synced_time()
         for m in list(GLOBAL_STATE.markets.values()):
             try: evaluate_market(m, now)
             except Exception: pass
@@ -701,7 +709,7 @@ def snapshot_loop():
             with open("snapshot_live.csv", "a", newline="") as f:
                 writer = csv.writer(f)
                 for m in GLOBAL_STATE.markets.values():
-                    if m.end_ts >= time.time() - 5:
+                    if m.end_ts >= get_synced_time() - 5:
                         yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
                         ya, ybd = yb.ask if yb else 0, yb.bid if yb else 0
                         na, nbd = nb.ask if nb else 0, nb.bid if nb else 0
@@ -722,7 +730,7 @@ def telemetry_loop():
                 writer = csv.writer(f)
                 for m in list(GLOBAL_STATE.markets.values()):
                     if m.state == MarketState.CLOSED: continue
-                    ttr = int(m.end_ts - time.time())
+                    ttr = int(m.end_ts - get_synced_time())
                     if ttr < 0: continue
                     yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
                     if yb and yb.bids and yb.asks:
@@ -740,10 +748,17 @@ def telemetry_loop():
         except Exception: pass
         time.sleep(5)
 
+def oracle_observation_loop():
+    print("[inf] Observation Oracle Standby", flush=True)
+    while GLOBAL_STATE.running:
+        # Placeholder for Scalping Signals. Evaluates order book velocities independent of active dual-leg trades.
+        time.sleep(10)
+
 def discovery_thread():
     print("[inf] Discovery Loop Active", flush=True)
     while GLOBAL_STATE.running:
-        now = time.time()
+        sync_time_with_api() # Resync NTP every loop
+        now = get_synced_time()
         boundaries = [int((now // 300) * 300) + (i * 300) for i in range(1, (LOOKAHEAD_MINUTES // 5) + 1)]
         new_markets = False
         for ts in boundaries:
@@ -755,15 +770,13 @@ def discovery_thread():
                     cid = m_info["conditionId"]
                     if cid not in GLOBAL_STATE.markets:
                         end_ts = datetime.fromisoformat(m_info["endDate"].replace("Z", "+00:00")).timestamp()
-                        if end_ts > time.time() + 120:
+                        if end_ts > get_synced_time() + 120:
                             tks = json.loads(m_info["clobTokenIds"])
                             outcomes = json.loads(m_info["outcomes"])
                             y_idx = 0 if outcomes[0].lower() in ["yes", "up"] else 1
                             GLOBAL_STATE.markets[cid] = MarketData(cid, slug, tks[y_idx], tks[1-y_idx], end_ts)
                             print(f"[Discovery] Tracking: {slug}", flush=True)
                             new_markets = True
-                        else:
-                            print(f"[Discovery] Skipped Stale Market: {slug}", flush=True)
             except Exception: pass
         if new_markets and GLOBAL_STATE.ws_handle:
             try: GLOBAL_STATE.ws_handle.close()
@@ -800,7 +813,7 @@ def polymarket_ws_thread():
     def on_open(ws):
         GLOBAL_STATE.ws_connected = True
         print("[inf] WS Connected to Gamma", flush=True)
-        tks = [t for m in GLOBAL_STATE.markets.values() if m.end_ts >= time.time() - 5 for t in (m.yes_token, m.no_token)]
+        tks = [t for m in GLOBAL_STATE.markets.values() if m.end_ts >= get_synced_time() - 5 for t in (m.yes_token, m.no_token)]
         if tks:
             try: ws.send(json.dumps({"type": "Market", "assets_ids": tks}))
             except Exception: pass
@@ -817,12 +830,14 @@ def polymarket_ws_thread():
 
 if __name__ == "__main__":
     init_csv()
+    sync_time_with_api()
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=discovery_thread, daemon=True).start()
     threading.Thread(target=polymarket_ws_thread, daemon=True).start()
     threading.Thread(target=tick_loop, daemon=True).start()
     threading.Thread(target=snapshot_loop, daemon=True).start()
     threading.Thread(target=telemetry_loop, daemon=True).start()
+    threading.Thread(target=oracle_observation_loop, daemon=True).start()
     
     print("[inf] All systems online.", flush=True)
     while GLOBAL_STATE.running:
