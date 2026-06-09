@@ -1,5 +1,5 @@
 """
-main.py — Opportunistic BSS Bot (v5.8.18 Persistent UI & Catastrophe Fix)
+main.py — Opportunistic BSS Bot (v5.8.20 Self-Diagnosing Telemetry Guard)
 """
 import os
 import sys
@@ -32,6 +32,9 @@ MAX_COMBINED_COST = 1.02
 SELL_LOSER_T1_THRESH = 0.86
 SELL_LOSER_T1_TTR_MAX = 60
 SELL_LOSER_T2_THRESH = 0.95
+
+# Telemetry Guard Config
+GUARD_IMBALANCE_THRESHOLD = 2.5
 
 LOOKAHEAD_MINUTES = int(os.getenv("LOOKAHEAD_MINUTES", "60"))
 PORT = int(os.getenv("PORT", "8080"))
@@ -66,10 +69,14 @@ class MarketData:
         self.t1_side = ""
         self.t1_price = 0.0
         self.t1_time = ""
+        self.t1_guarded = False
+        self.t1_guard_ratio = 0.0
         
         self.t2_side = ""
         self.t2_price = 0.0
         self.t2_time = ""
+        self.t2_guarded = False
+        self.t2_guard_ratio = 0.0
         
         self.salvage_revenue = 0.0
         self.realized_pnl = 0.0
@@ -77,6 +84,14 @@ class MarketData:
         self.close_time = ""
         self.close_reason = ""
         self.expired_processed = False
+        
+        # Self-Diagnosis Additions
+        self.presumed_winner = ""
+        self.resolution_verified = False
+        self.hallucination_detected = False
+        
+        self.guard_active_yes = False
+        self.guard_active_no = False
         
         self.history_yes: List[float] = []
         self.history_no: List[float] = []
@@ -117,6 +132,7 @@ class BotState:
         self.total_trades = 0 
         self.sold_losers = 0
         self.catastrophes = 0
+        self.hallucinations = 0
 
 GLOBAL_STATE = BotState()
 
@@ -176,6 +192,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     .vital-value { background: var(--bg-panel); color: var(--text-navy); font-size: 24px; font-weight: 800; padding: 8px; border-radius: 4px; border: 1px solid var(--border-color); font-family: monospace; }
     .vital-value.green { color: var(--val-green); border-color: #064E3B; background: #065F46;}
     .vital-value.red { color: var(--val-red); border-color: #7F1D1D; background: #991B1B;}
+    .vital-value.orange { color: var(--val-yellow); border-color: #B45309; background: #78350F;}
     
     .sec-title { background: var(--header-bg); color: var(--header-text); font-family: var(--font-serif); font-size: 15px; font-weight: bold; text-align: center; padding: 12px; margin-bottom: 15px; border-radius: 6px; letter-spacing: 0.5px; border: 1px solid var(--border-color);}
     
@@ -216,12 +233,18 @@ DASHBOARD_HTML = r"""<!doctype html>
     .btn-action:hover { background: #334155; border-color: #475569;}
     .btn-verify { color: #60A5FA; text-decoration: none; font-weight: 800; font-size: 12px; font-family: var(--font-sans);}
     .btn-verify:hover { text-decoration: underline; }
+
+    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+    .guard-badge { background: #B45309; color: #FFFBEB; padding: 3px 8px; border-radius: 4px; font-size: 10px; font-weight: 800; margin-left: 8px; animation: pulse 1.5s infinite; border: 1px solid #F59E0B;}
+    .guard-static { background: #1E3A8A; color: #DBEAFE; padding: 3px 6px; border-radius: 3px; font-size: 11px; font-weight: 800; border: 1px solid #3B82F6;}
+    .mismatch-badge { background: #7F1D1D; color: #FCA5A5; padding: 3px 6px; border-radius: 3px; font-size: 10px; font-weight: 800; border: 1px solid #EF4444; margin-top:4px; display:inline-block;}
+    .verified-badge { color: var(--val-green); font-size: 11px; font-weight: bold;}
 </style>
 </head>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.18 
+    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.20 
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
@@ -230,6 +253,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         <div class="vital-box"><div class="vital-label">Completed Trades</div><div class="vital-value" id="v-trades">0</div></div>
         <div class="vital-box"><div class="vital-label">Sold Losers</div><div class="vital-value" id="v-losers">0</div></div>
         <div class="vital-box"><div class="vital-label">Catastrophes</div><div class="vital-value red" id="v-catastrophes">0</div></div>
+        <div class="vital-box"><div class="vital-label">Hallucinations</div><div class="vital-value orange" id="v-hallucinations">0</div></div>
         <div class="vital-box"><div class="vital-label">Active Slots</div><div class="vital-value" id="v-active">0</div></div>
     </div>
 </div>
@@ -337,6 +361,7 @@ setInterval(async () => {
         document.getElementById('v-trades').textContent = s.total_trades_count;
         document.getElementById('v-losers').textContent = s.losers;
         document.getElementById('v-catastrophes').textContent = s.catastrophes;
+        document.getElementById('v-hallucinations').textContent = s.hallucinations;
         
         let activeCount = 0;
         let htmlCards = '';
@@ -348,7 +373,7 @@ setInterval(async () => {
                 htmlQueue += `[TTR: ${m.ttr_s}s] | ${m.slug} | YES Ask: $${m.yes_ask.toFixed(3)} | NO Ask: $${m.no_ask.toFixed(3)} | Status: ${currentStatus}<br>`;
                 return;
             }
-            if (m.state === 'CLOSED' && m.ttr_s <= -5) return;
+            if (m.state === 'CLOSED' && m.ttr_s <= 0) return;
             
             activeCount++;
             
@@ -368,6 +393,9 @@ setInterval(async () => {
 
             let yesBadge = getImbalanceBadge(m.yes_b_vol, m.yes_a_vol);
             let noBadge = getImbalanceBadge(m.no_b_vol, m.no_a_vol);
+
+            if (m.guard_active_yes) yesBadge += `<span class="guard-badge">🛡 GUARDED</span>`;
+            if (m.guard_active_no) noBadge += `<span class="guard-badge">🛡 GUARDED</span>`;
 
             htmlCards += `<div class="card">
                 <div class="card-header">
@@ -429,12 +457,24 @@ setInterval(async () => {
         s.history.reverse().forEach(h => {
             const pnlStr = h.pnl !== 0.0 ? (h.pnl > 0 ? `+${h.pnl.toFixed(2)}` : h.pnl.toFixed(2)) : '--';
             
-            let t1Str = h.t1_side && h.t1_side !== "" ? `<span class="val-gold">${h.t1_side}</span> @ $${h.t1_price.toFixed(3)}<br><span style="font-size:10px;color:var(--text-light);">${h.t1_time}</span>` : '--';
-            let t2Str = h.t2_side && h.t2_side !== "" ? `<span class="val-pink">${h.t2_side}</span> @ $${h.t2_price.toFixed(3)}<br><span style="font-size:10px;color:var(--text-light);">${h.t2_time}</span>` : '--';
+            let slugLabel = h.slug;
+            if (h.hallucination) {
+                slugLabel += `<br><span class="mismatch-badge">⚠ ORACLE MISMATCH</span>`;
+            } else if (h.verified) {
+                slugLabel += `<br><span class="verified-badge">✓ AUDITED</span>`;
+            }
+
+            let t1Str = '--';
+            if (h.t1_side && h.t1_side !== "") t1Str = `<span class="val-gold">${h.t1_side}</span> @ $${h.t1_price.toFixed(3)}<br><span style="font-size:10px;color:var(--text-light);">${h.t1_time}</span>`;
+            else if (h.t1_guarded) t1Str = `<span class="guard-static">🛡 GUARDED (${h.t1_guard_ratio.toFixed(1)}x)</span>`;
+
+            let t2Str = '--';
+            if (h.t2_side && h.t2_side !== "") t2Str = `<span class="val-pink">${h.t2_side}</span> @ $${h.t2_price.toFixed(3)}<br><span style="font-size:10px;color:var(--text-light);">${h.t2_time}</span>`;
+            else if (h.t2_guarded) t2Str = `<span class="guard-static">🛡 GUARDED (${h.t2_guard_ratio.toFixed(1)}x)</span>`;
             
             logHtml += `<tr>
                 <td style="color:var(--text-light); font-family:var(--font-sans); font-size: 13px;">${h.time}</td>
-                <td>${h.slug}</td>
+                <td style="line-height:1.3; font-family:var(--font-sans); font-weight:bold;">${slugLabel}</td>
                 <td>${h.yes_entry > 0 ? '$'+h.yes_entry.toFixed(3) : '--'}</td>
                 <td>${h.no_entry > 0 ? '$'+h.no_entry.toFixed(3) : '--'}</td>
                 <td style="line-height:1.4;">${t1Str}</td>
@@ -471,7 +511,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         "time": m.close_time, "slug": m.slug, "reason": m.close_reason,
                         "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price, "pnl": m.realized_pnl,
                         "t1_side": m.t1_side, "t1_price": m.t1_price, "t1_time": m.t1_time,
-                        "t2_side": m.t2_side, "t2_price": m.t2_price, "t2_time": m.t2_time
+                        "t1_guarded": m.t1_guarded, "t1_guard_ratio": m.t1_guard_ratio,
+                        "t2_side": m.t2_side, "t2_price": m.t2_price, "t2_time": m.t2_time,
+                        "t2_guarded": m.t2_guarded, "t2_guard_ratio": m.t2_guard_ratio,
+                        "verified": m.resolution_verified, "hallucination": m.hallucination_detected
                     })
                 else:
                     yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
@@ -487,6 +530,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         "yes_ask": yb.ask if yb else 0.0, "no_ask": nb.ask if nb else 0.0,
                         "yes_b_vol": y_b_v, "yes_a_vol": y_a_v,
                         "no_b_vol": n_b_v, "no_a_vol": n_a_v,
+                        "guard_active_yes": m.guard_active_yes,
+                        "guard_active_no": m.guard_active_no,
                         "history_yes": m.history_yes[-30:], "history_no": m.history_no[-30:],
                         "t1_side": m.t1_side, "t1_price": m.t1_price, 
                         "t2_side": m.t2_side, "t2_price": m.t2_price
@@ -496,7 +541,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 "uptime_s": int(time.time() - SYSTEM_BOOT_TIME),
                 "ws_connected": GLOBAL_STATE.ws_connected, "pnl": GLOBAL_STATE.total_pnl,
                 "total_trades_count": GLOBAL_STATE.total_trades, "losers": GLOBAL_STATE.sold_losers,
-                "catastrophes": GLOBAL_STATE.catastrophes,
+                "catastrophes": GLOBAL_STATE.catastrophes, "hallucinations": GLOBAL_STATE.hallucinations,
                 "markets": m_data, "history": history_data[-15:]
             }
             self.send_response(200)
@@ -537,6 +582,15 @@ def run_server():
     server.serve_forever()
 
 # ─── CORE STRATEGY ───
+def check_guard_imbalance(book: OrderBook) -> float:
+    if not book: return 0.0
+    b_vol = book.get_local_vols(book.bid, "bid", 0.10)
+    a_vol = book.get_local_vols(book.ask, "ask", 0.10)
+    if a_vol == 0 and b_vol > 0: return 999.0 
+    if a_vol == 0: return 0.0
+    ratio = b_vol / a_vol
+    return ratio if ratio >= GUARD_IMBALANCE_THRESHOLD else 0.0
+
 def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares: float, fees: float, ttr: int, pnl: float = 0.0):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[{ts}] [{action}] {mdm.slug} | {side} @ {price:.3f} | Shares: {shares:.2f}", flush=True)
@@ -555,7 +609,7 @@ def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares:
         mdm.t2_price = price
         mdm.t2_time = ts
         
-    if "CLOSED" in action or action == "EXPIRED":
+    if "CLOSED" in action or "EXPIRED" in action:
         mdm.close_time = ts
         mdm.close_reason = action
         GLOBAL_STATE.total_trades += 1
@@ -571,11 +625,12 @@ def evaluate_market(mdm: MarketData, now: float):
     if not yb or not nb: return
     ttr = int(mdm.end_ts - now)
     
-    if ttr <= -5:
+    # Buzzer Snapshot (TTR <= 1)
+    if ttr <= 1:
         mdm.expired_processed = True
-        winner_side = "YES" if yb.bid > nb.bid else "NO"
+        mdm.presumed_winner = "YES" if yb.bid > nb.bid else "NO"
         
-        if (mdm.t1_side == winner_side) or (mdm.t2_side == winner_side):
+        if (mdm.t1_side == mdm.presumed_winner) or (mdm.t2_side == mdm.presumed_winner):
             GLOBAL_STATE.catastrophes += 1
             
         if mdm.state != MarketState.CLOSED:
@@ -584,13 +639,13 @@ def evaluate_market(mdm: MarketData, now: float):
             if mdm.yes_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
             if mdm.no_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
             
-            winner_shares = mdm.yes_shares if winner_side == "YES" else mdm.no_shares 
+            winner_shares = mdm.yes_shares if mdm.presumed_winner == "YES" else mdm.no_shares 
             calc_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
             
-            execute_trade(mdm, "EXPIRED", 0.00, "EXPIRED", 0.0, 0.0, ttr, calc_pnl)
+            execute_trade(mdm, mdm.presumed_winner, 0.00, "EXPIRED_AT_BUZZER", 0.0, 0.0, ttr, calc_pnl)
         return
         
-    if ttr <= 0 or mdm.state == MarketState.CLOSED: return
+    if mdm.state == MarketState.CLOSED: return
         
     t2 = T_SECOND_LIVE if ttr <= 300 else T_SECOND_PRE
     
@@ -613,7 +668,6 @@ def evaluate_market(mdm: MarketData, now: float):
             
         elif ttr <= HEDGE_DEADLINE_TTR and 0 < yb.ask and 0 < nb.ask and (yb.ask + nb.ask) <= MAX_COMBINED_COST:
             mdm.state = MarketState.BOTH
-            
             mdm.yes_entry_price = yb.ask
             mdm.yes_shares = BASE_CAPITAL_PER_LEG / yb.ask
             fee_yes = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
@@ -645,43 +699,62 @@ def evaluate_market(mdm: MarketData, now: float):
             execute_trade(mdm, "YES", yb.ask, "LEG_2_DEADLINE" if ttr <= HEDGE_DEADLINE_TTR else "LEG_2_ENTRY", mdm.yes_shares, fee, ttr)
             
     elif mdm.state == MarketState.BOTH:
+        mdm.guard_active_yes = False
+        mdm.guard_active_no = False
         
-        if yb.bid > nb.bid: winner_bid, loser_side, loser_bid, loser_shares = yb.bid, "NO", nb.bid, mdm.no_shares
-        else: winner_bid, loser_side, loser_bid, loser_shares = nb.bid, "YES", yb.bid, mdm.yes_shares
+        if yb.bid > nb.bid: 
+            winner_bid, loser_side, loser_bid, loser_shares = yb.bid, "NO", nb.bid, mdm.no_shares
+            loser_book = nb
+        else: 
+            winner_bid, loser_side, loser_bid, loser_shares = nb.bid, "YES", yb.bid, mdm.yes_shares
+            loser_book = yb
             
         if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and ttr <= SELL_LOSER_T1_TTR_MAX:
-            mdm.t1_executed = True
-            
-            shares_to_sell = loser_shares * 0.50
-            if loser_side == "YES": mdm.yes_shares -= shares_to_sell
-            else: mdm.no_shares -= shares_to_sell
-            
-            fee = (shares_to_sell * loser_bid) * 0.001 
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T1", shares_to_sell, fee, ttr)
+            guard_ratio = check_guard_imbalance(loser_book)
+            if guard_ratio > 0:
+                if loser_side == "YES": mdm.guard_active_yes = True
+                else: mdm.guard_active_no = True
+                
+                if not mdm.t1_guarded:
+                    mdm.t1_guarded = True
+                    mdm.t1_guard_ratio = guard_ratio
+            else:
+                mdm.t1_executed = True
+                shares_to_sell = loser_shares * 0.50
+                if loser_side == "YES": mdm.yes_shares -= shares_to_sell
+                else: mdm.no_shares -= shares_to_sell
+                fee = (shares_to_sell * loser_bid) * 0.001 
+                mdm.total_fees_paid += fee
+                execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T1", shares_to_sell, fee, ttr)
             
         elif winner_bid >= SELL_LOSER_T2_THRESH:
-            mdm.state = MarketState.CLOSED
-            
-            shares_to_sell = loser_shares * 0.99 
-            fee = (shares_to_sell * loser_bid) * 0.001 
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T2", shares_to_sell, fee, ttr)
-            
-            cost_basis = (BASE_CAPITAL_PER_LEG * 2) + mdm.total_fees_paid
-            winner_shares = mdm.yes_shares if loser_side == "NO" else mdm.no_shares
-            final_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
-            
-            execute_trade(mdm, "CLOSED", winner_bid, "CLOSED_T2_RESOLVED", 0.0, 0.0, ttr, final_pnl)
+            guard_ratio = check_guard_imbalance(loser_book)
+            if guard_ratio > 0:
+                if loser_side == "YES": mdm.guard_active_yes = True
+                else: mdm.guard_active_no = True
+                
+                if not mdm.t2_guarded:
+                    mdm.t2_guarded = True
+                    mdm.t2_guard_ratio = guard_ratio
+            else:
+                mdm.state = MarketState.CLOSED
+                shares_to_sell = loser_shares * 0.99 
+                fee = (shares_to_sell * loser_bid) * 0.001 
+                mdm.total_fees_paid += fee
+                execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T2", shares_to_sell, fee, ttr)
+                
+                cost_basis = (BASE_CAPITAL_PER_LEG * 2) + mdm.total_fees_paid
+                winner_shares = mdm.yes_shares if loser_side == "NO" else mdm.no_shares
+                final_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
+                mdm.presumed_winner = "YES" if loser_side == "NO" else "NO"
+                execute_trade(mdm, "CLOSED", winner_bid, "CLOSED_T2_RESOLVED", 0.0, 0.0, ttr, final_pnl)
 
 def tick_loop():
     while GLOBAL_STATE.running:
         now = time.time()
         for m in list(GLOBAL_STATE.markets.values()):
-            try:
-                evaluate_market(m, now)
-            except Exception:
-                pass
+            try: evaluate_market(m, now)
+            except Exception: pass
         time.sleep(0.05)
 
 def snapshot_loop():
@@ -722,10 +795,8 @@ def telemetry_loop():
                         r_y = y_b_vol / y_a_vol if y_a_vol > 0 else 999.0
                         r_y_inv = y_a_vol / y_b_vol if y_b_vol > 0 else 999.0
                         
-                        if r_y >= 2.0:
-                            writer.writerow([ts, m.slug, "YES", ttr, f"{yb.ask:.3f}", f"{y_b_vol:.0f}", f"{y_a_vol:.0f}", f"{r_y:.1f}", "BID_WALL"])
-                        elif r_y_inv >= 2.0:
-                            writer.writerow([ts, m.slug, "YES", ttr, f"{yb.ask:.3f}", f"{y_b_vol:.0f}", f"{y_a_vol:.0f}", f"{r_y_inv:.1f}", "ASK_WALL"])
+                        if r_y >= 2.0: writer.writerow([ts, m.slug, "YES", ttr, f"{yb.ask:.3f}", f"{y_b_vol:.0f}", f"{y_a_vol:.0f}", f"{r_y:.1f}", "BID_WALL"])
+                        elif r_y_inv >= 2.0: writer.writerow([ts, m.slug, "YES", ttr, f"{yb.ask:.3f}", f"{y_b_vol:.0f}", f"{y_a_vol:.0f}", f"{r_y_inv:.1f}", "ASK_WALL"])
                             
                     if nb and nb.bids and nb.asks:
                         n_b_vol = nb.get_local_vols(nb.bid, "bid", 0.10)
@@ -733,12 +804,52 @@ def telemetry_loop():
                         r_n = n_b_vol / n_a_vol if n_a_vol > 0 else 999.0
                         r_n_inv = n_a_vol / n_b_vol if n_b_vol > 0 else 999.0
                         
-                        if r_n >= 2.0:
-                            writer.writerow([ts, m.slug, "NO", ttr, f"{nb.ask:.3f}", f"{n_b_vol:.0f}", f"{n_a_vol:.0f}", f"{r_n:.1f}", "BID_WALL"])
-                        elif r_n_inv >= 2.0:
-                            writer.writerow([ts, m.slug, "NO", ttr, f"{nb.ask:.3f}", f"{n_b_vol:.0f}", f"{n_a_vol:.0f}", f"{r_n_inv:.1f}", "ASK_WALL"])
+                        if r_n >= 2.0: writer.writerow([ts, m.slug, "NO", ttr, f"{nb.ask:.3f}", f"{n_b_vol:.0f}", f"{n_a_vol:.0f}", f"{r_n:.1f}", "BID_WALL"])
+                        elif r_n_inv >= 2.0: writer.writerow([ts, m.slug, "NO", ttr, f"{nb.ask:.3f}", f"{n_b_vol:.0f}", f"{n_a_vol:.0f}", f"{r_n_inv:.1f}", "ASK_WALL"])
         except Exception: pass
         time.sleep(5)
+
+# ─── ASYNC SELF-DIAGNOSIS AUDITOR ───
+def resolution_verifier_loop():
+    while GLOBAL_STATE.running:
+        for mdm in list(GLOBAL_STATE.markets.values()):
+            if mdm.state == MarketState.CLOSED and not mdm.resolution_verified:
+                try:
+                    res = requests.get(f"https://gamma-api.polymarket.com/events?slug={mdm.slug}", timeout=5)
+                    if res.status_code == 200 and res.json():
+                        m_info = res.json()[0].get("markets", [])[0]
+                        if m_info.get("resolved") is True:
+                            outcomes = json.loads(m_info.get("outcomes", "[]"))
+                            api_outcome = m_info.get("outcome", "")
+                            
+                            if outcomes and api_outcome:
+                                y_idx = 0 if outcomes[0].lower() in ["yes", "up"] else 1
+                                resolved_idx = outcomes.index(api_outcome) if api_outcome in outcomes else -1
+                                
+                                if resolved_idx != -1:
+                                    true_winner = "YES" if resolved_idx == y_idx else "NO"
+                                    mdm.resolution_verified = True
+                                    
+                                    if true_winner != mdm.presumed_winner:
+                                        mdm.hallucination_detected = True
+                                        GLOBAL_STATE.hallucinations += 1
+                                        
+                                        # Recalculate true P&L metrics against actual oracle settlement
+                                        old_pnl = mdm.realized_pnl
+                                        cost_basis = mdm.total_fees_paid
+                                        if mdm.yes_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
+                                        if mdm.no_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
+                                        
+                                        true_winner_shares = mdm.yes_shares if true_winner == "YES" else mdm.no_shares
+                                        mdm.realized_pnl = (true_winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
+                                        GLOBAL_STATE.total_pnl += (mdm.realized_pnl - old_pnl)
+                                        
+                                        print(f"[Self-Diagnosis] ⚠ Hallucination Caught on {mdm.slug}! Presumed: {mdm.presumed_winner} | Actual: {true_winner}. P&L Corrected.", flush=True)
+                                    else:
+                                        print(f"[Self-Diagnosis] ✓ Verified {mdm.slug}: Snapshot matched oracle.", flush=True)
+                except Exception:
+                    pass
+        time.sleep(30)
 
 def discovery_thread():
     while GLOBAL_STATE.running:
@@ -760,8 +871,7 @@ def discovery_thread():
                         GLOBAL_STATE.markets[cid] = MarketData(cid, slug, tks[y_idx], tks[1-y_idx], end_ts)
                         print(f"[Discovery] Tracking: {slug}", flush=True)
                         new_markets = True
-            except Exception:
-                pass
+            except Exception: pass
         if new_markets and GLOBAL_STATE.ws_handle:
             try: GLOBAL_STATE.ws_handle.close()
             except Exception: pass
@@ -818,5 +928,6 @@ if __name__ == "__main__":
     threading.Thread(target=tick_loop, daemon=True).start()
     threading.Thread(target=snapshot_loop, daemon=True).start()
     threading.Thread(target=telemetry_loop, daemon=True).start()
+    threading.Thread(target=resolution_verifier_loop, daemon=True).start()
     while GLOBAL_STATE.running:
         time.sleep(1)
