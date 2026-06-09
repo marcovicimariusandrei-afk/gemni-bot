@@ -1,5 +1,5 @@
 """
-main.py — BSS Bot v6.2 (Rate-Limit Proof + Hybrid WS/REST Telemetry)
+main.py — BSS Bot v6.3 (Rate-Limit Proof + Hybrid WS/REST Telemetry + Patched Logic)
 FULL PRODUCTION BUILD
 """
 import os
@@ -92,6 +92,7 @@ class OrderBook:
 class BotState:
     def __init__(self):
         self.running = True
+        self.lock = threading.Lock() # Thread safety lock added
         self.markets: Dict[str, MarketData] = {}
         self.books: Dict[str, OrderBook] = {}
         self.subscribed_tokens = set()
@@ -137,7 +138,7 @@ def log_trade_worker(ts, slug, action, side, price, shares, fees, ttr, pnl):
 def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares: float, fees: float, ttr: int, pnl: float = 0.0):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[{ts}] [{action}] {mdm.slug} | {side} @ {price:.3f} | Shares: {shares:.2f}", flush=True)
-    if "SELL" in action or "DUMP" in action:
+    if "SELL" in action or "DUMP" in action or "ABORT" in action:
         GLOBAL_STATE.sold_losers += 1
         mdm.salvage_revenue += (shares * price)
     if action == "SELL_LOSER_T1": mdm.t1_side, mdm.t1_price, mdm.t1_time = side, price, ts
@@ -178,7 +179,9 @@ def evaluate_market(mdm: MarketData, now: float):
             if mdm.t1_side == winner_side or mdm.t2_side == winner_side: GLOBAL_STATE.catastrophes += 1
             cost_basis = mdm.total_fees_paid + (BASE_CAPITAL_PER_LEG * (1 if mdm.yes_shares == 0 or mdm.no_shares == 0 else 2))
             win_shares = mdm.yes_shares if winner_side == "YES" else mdm.no_shares 
-            execute_trade(mdm, winner_side, 0.0, "EXPIRED_AT_BUZZER", 0.0, 0.0, ttr, (win_shares * 1.0) + mdm.salvage_revenue - cost_basis)
+            
+            # PATCH: Pass actual win_shares to the log function instead of 0.0
+            execute_trade(mdm, winner_side, 0.0, "EXPIRED_AT_BUZZER", win_shares, 0.0, ttr, (win_shares * 1.0) + mdm.salvage_revenue - cost_basis)
         return
         
     if not yb or not nb: return
@@ -214,13 +217,30 @@ def evaluate_market(mdm: MarketData, now: float):
             if check_imbalance(active_book) > 0:
                 side = "NO" if mdm.state == MarketState.WAITING_NO else "YES"
                 price = nb.ask if side == "NO" else yb.ask
-                if 0 < price <= 0.51:
+                
+                # PATCH: Restricted Taker Hedge Window to 0.48 - 0.51
+                if 0.48 <= price <= 0.51:
                     fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
                     mdm.total_fees_paid += fee
                     if side == "NO": mdm.no_entry_price, mdm.no_shares = price, BASE_CAPITAL_PER_LEG / price
                     else: mdm.yes_entry_price, mdm.yes_shares = price, BASE_CAPITAL_PER_LEG / price
                     mdm.state = MarketState.BOTH
                     execute_trade(mdm, side, price, "TAKER_HEDGE_PROTECTION", BASE_CAPITAL_PER_LEG / price, fee, ttr)
+                else:
+                    # PATCH: Abort the strategy if the market broke the balanced spread
+                    held_side = "YES" if mdm.state == MarketState.WAITING_NO else "NO"
+                    held_shares = mdm.yes_shares if held_side == "YES" else mdm.no_shares
+                    dump_price = yb.bid if held_side == "YES" else nb.bid
+                    
+                    if held_shares > 0 and dump_price > 0:
+                        fee = (held_shares * dump_price) * TAKER_FEE_RATE
+                        mdm.total_fees_paid += fee
+                        execute_trade(mdm, held_side, dump_price, "ABORT_ORPHANED_LEG", held_shares, fee, ttr)
+                        
+                        if held_side == "YES": mdm.yes_shares = 0.0
+                        else: mdm.no_shares = 0.0
+                    
+                    mdm.state = MarketState.CLOSED
 
     if mdm.state == MarketState.BOTH:
         mdm.guard_active_yes = mdm.guard_active_no = False
@@ -261,9 +281,22 @@ def evaluate_market(mdm: MarketData, now: float):
 def tick_loop():
     while GLOBAL_STATE.running:
         now = get_synced_time()
-        for m in list(GLOBAL_STATE.markets.values()):
-            try: evaluate_market(m, now)
-            except Exception: pass
+        # PATCH: Wrapped in lock and added Garbage Collection for dead markets
+        with GLOBAL_STATE.lock:
+            keys_to_delete = []
+            for cid, m in list(GLOBAL_STATE.markets.items()):
+                try: evaluate_market(m, now)
+                except Exception: pass
+                
+                if m.state == MarketState.CLOSED and now > m.end_ts + 300:
+                    keys_to_delete.append(cid)
+                    GLOBAL_STATE.subscribed_tokens.discard(m.yes_token)
+                    GLOBAL_STATE.subscribed_tokens.discard(m.no_token)
+                    GLOBAL_STATE.books.pop(m.yes_token, None)
+                    GLOBAL_STATE.books.pop(m.no_token, None)
+            
+            for cid in keys_to_delete:
+                del GLOBAL_STATE.markets[cid]
         time.sleep(0.05)
 
 def snapshot_loop():
@@ -272,16 +305,17 @@ def snapshot_loop():
         try:
             with open("snapshot_live.csv", "a", newline="") as f:
                 writer = csv.writer(f)
-                for m in GLOBAL_STATE.markets.values():
-                    if m.end_ts >= get_synced_time() - 5:
-                        yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
-                        ya, ybd = yb.ask if yb else 0, yb.bid if yb else 0
-                        na, nbd = nb.ask if nb else 0, nb.bid if nb else 0
-                        writer.writerow([ts, m.slug, m.state, f"{ya:.3f}", f"{ybd:.3f}", f"{na:.3f}", f"{nbd:.3f}"])
-                        m.history_yes.append(ya)
-                        m.history_no.append(na)
-                        if len(m.history_yes) > 30: m.history_yes.pop(0)
-                        if len(m.history_no) > 30: m.history_no.pop(0)
+                with GLOBAL_STATE.lock:
+                    for m in GLOBAL_STATE.markets.values():
+                        if m.end_ts >= get_synced_time() - 5:
+                            yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
+                            ya, ybd = yb.ask if yb else 0, yb.bid if yb else 0
+                            na, nbd = nb.ask if nb else 0, nb.bid if nb else 0
+                            writer.writerow([ts, m.slug, m.state, f"{ya:.3f}", f"{ybd:.3f}", f"{na:.3f}", f"{nbd:.3f}"])
+                            m.history_yes.append(ya)
+                            m.history_no.append(na)
+                            if len(m.history_yes) > 30: m.history_yes.pop(0)
+                            if len(m.history_no) > 30: m.history_no.pop(0)
         except Exception: pass
         time.sleep(30)
 
@@ -291,35 +325,41 @@ def telemetry_loop():
         try:
             with open("telemetry_shadow.csv", "a", newline="") as f:
                 writer = csv.writer(f)
-                for m in list(GLOBAL_STATE.markets.values()):
-                    if m.state == MarketState.CLOSED: continue
-                    ttr = int(m.end_ts - get_synced_time())
-                    if ttr < 0: continue
-                    yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
-                    for book, side, tk in [(yb, "YES", m.yes_token), (nb, "NO", m.no_token)]:
-                        if book and book.bids and book.asks:
-                            b_vol, a_vol = book.get_local_vols(book.bid, "bid"), book.get_local_vols(book.ask, "ask")
-                            r = b_vol / a_vol if a_vol > 0 else 999.0
-                            r_inv = a_vol / b_vol if b_vol > 0 else 999.0
-                            if r >= 2.0: writer.writerow([ts, m.slug, side, ttr, f"{book.ask:.3f}", f"{b_vol:.0f}", f"{a_vol:.0f}", f"{r:.1f}", "BID_WALL"])
-                            elif r_inv >= 2.0: writer.writerow([ts, m.slug, side, ttr, f"{book.ask:.3f}", f"{b_vol:.0f}", f"{a_vol:.0f}", f"{r_inv:.1f}", "ASK_WALL"])
+                with GLOBAL_STATE.lock:
+                    for m in list(GLOBAL_STATE.markets.values()):
+                        if m.state == MarketState.CLOSED: continue
+                        ttr = int(m.end_ts - get_synced_time())
+                        if ttr < 0: continue
+                        yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
+                        for book, side, tk in [(yb, "YES", m.yes_token), (nb, "NO", m.no_token)]:
+                            if book and book.bids and book.asks:
+                                b_vol, a_vol = book.get_local_vols(book.bid, "bid"), book.get_local_vols(book.ask, "ask")
+                                r = b_vol / a_vol if a_vol > 0 else 999.0
+                                r_inv = a_vol / b_vol if b_vol > 0 else 999.0
+                                if r >= 2.0: writer.writerow([ts, m.slug, side, ttr, f"{book.ask:.3f}", f"{b_vol:.0f}", f"{a_vol:.0f}", f"{r:.1f}", "BID_WALL"])
+                                elif r_inv >= 2.0: writer.writerow([ts, m.slug, side, ttr, f"{book.ask:.3f}", f"{b_vol:.0f}", f"{a_vol:.0f}", f"{r_inv:.1f}", "ASK_WALL"])
         except Exception: pass
         time.sleep(5)
 
 def hybrid_rest_fallback():
     while GLOBAL_STATE.running:
-        for m in list(GLOBAL_STATE.markets.values()):
+        with GLOBAL_STATE.lock:
+            markets_snapshot = list(GLOBAL_STATE.markets.values())
+        
+        for m in markets_snapshot:
             if m.state == MarketState.CLOSED: continue
             for tk in [m.yes_token, m.no_token]:
-                book = GLOBAL_STATE.books.get(tk)
+                with GLOBAL_STATE.lock:
+                    book = GLOBAL_STATE.books.get(tk)
                 if book and time.time() - book.last_update > 10.0:
                     try:
                         res = requests.get(f"https://clob.polymarket.com/book?token_id={tk}", timeout=2)
                         if res.status_code == 200:
                             data = res.json()
-                            book.bids = {float(b["price"]): float(b["size"]) for b in data.get("bids", [])}
-                            book.asks = {float(a["price"]): float(a["size"]) for a in data.get("asks", [])}
-                            book.last_update = time.time()
+                            with GLOBAL_STATE.lock:
+                                book.bids = {float(b["price"]): float(b["size"]) for b in data.get("bids", [])}
+                                book.asks = {float(a["price"]): float(a["size"]) for a in data.get("asks", [])}
+                                book.last_update = time.time()
                     except Exception: pass
         time.sleep(2)
 
@@ -337,24 +377,29 @@ def discovery_thread():
                 if res.status_code == 200 and res.json():
                     m_info = res.json()[0].get("markets", [])[0]
                     cid = m_info["conditionId"]
-                    if cid not in GLOBAL_STATE.markets:
-                        end_ts = datetime.fromisoformat(m_info["endDate"].replace("Z", "+00:00")).timestamp()
-                        if end_ts > get_synced_time() + 120:
-                            tks = json.loads(m_info["clobTokenIds"])
-                            y_idx = 0 if json.loads(m_info["outcomes"])[0].lower() in ["yes", "up"] else 1
-                            yes_tk, no_tk = tks[y_idx], tks[1-y_idx]
-                            GLOBAL_STATE.markets[cid] = MarketData(cid, slug, yes_tk, no_tk, end_ts)
-                            GLOBAL_STATE.books[yes_tk] = OrderBook()
-                            GLOBAL_STATE.books[no_tk] = OrderBook()
-                            GLOBAL_STATE.subscribed_tokens.add(yes_tk)
-                            GLOBAL_STATE.subscribed_tokens.add(no_tk)
-                            print(f"[Discovery] Tracking: {slug}", flush=True)
-                            new_markets = True
+                    
+                    with GLOBAL_STATE.lock:
+                        if cid not in GLOBAL_STATE.markets:
+                            end_ts = datetime.fromisoformat(m_info["endDate"].replace("Z", "+00:00")).timestamp()
+                            if end_ts > get_synced_time() + 120:
+                                tks = json.loads(m_info["clobTokenIds"])
+                                y_idx = 0 if json.loads(m_info["outcomes"])[0].lower() in ["yes", "up"] else 1
+                                yes_tk, no_tk = tks[y_idx], tks[1-y_idx]
+                                GLOBAL_STATE.markets[cid] = MarketData(cid, slug, yes_tk, no_tk, end_ts)
+                                GLOBAL_STATE.books[yes_tk] = OrderBook()
+                                GLOBAL_STATE.books[no_tk] = OrderBook()
+                                GLOBAL_STATE.subscribed_tokens.add(yes_tk)
+                                GLOBAL_STATE.subscribed_tokens.add(no_tk)
+                                print(f"[Discovery] Tracking: {slug}", flush=True)
+                                new_markets = True
             except Exception as e: print(f"[Discovery Warning] {slug} fetch failed: {e}", flush=True)
             time.sleep(0.5) 
             
-        if new_markets and GLOBAL_STATE.ws_handle:
-            try: GLOBAL_STATE.ws_handle.close()
+        # PATCH: Update WS dynamically instead of forcibly closing it
+        if new_markets and GLOBAL_STATE.ws_handle and GLOBAL_STATE.ws_connected:
+            try:
+                payload = {"type": "market", "assets_ids": list(GLOBAL_STATE.subscribed_tokens)}
+                GLOBAL_STATE.ws_handle.send(json.dumps(payload))
             except Exception: pass
         time.sleep(15)
 
@@ -365,26 +410,28 @@ def polymarket_ws_thread():
             parsed = json.loads(msg)
             for event in (parsed if isinstance(parsed, list) else [parsed]):
                 aid = event.get("asset_id") or event.get("market")
-                if not aid or aid not in GLOBAL_STATE.books: continue
-                book = GLOBAL_STATE.books[aid]
-                book.last_update = time.time()
-                if event.get("event_type") == "book":
-                    book.bids = {float(b["price"]): float(b["size"]) for b in event.get("bids", [])}
-                    book.asks = {float(a["price"]): float(a["size"]) for a in event.get("asks", [])}
-                elif event.get("event_type") == "price_change":
-                    for ch in event.get("changes", []):
-                        s, p, sz = ch.get("side", ""), float(ch.get("price", 0)), float(ch.get("size", 0))
-                        target = book.bids if s == "BUY" else book.asks
-                        if sz == 0: target.pop(p, None)
-                        else: target[p] = sz
+                with GLOBAL_STATE.lock:
+                    if not aid or aid not in GLOBAL_STATE.books: continue
+                    book = GLOBAL_STATE.books[aid]
+                    book.last_update = time.time()
+                    if event.get("event_type") == "book":
+                        book.bids = {float(b["price"]): float(b["size"]) for b in event.get("bids", [])}
+                        book.asks = {float(a["price"]): float(a["size"]) for a in event.get("asks", [])}
+                    elif event.get("event_type") == "price_change":
+                        for ch in event.get("changes", []):
+                            s, p, sz = ch.get("side", ""), float(ch.get("price", 0)), float(ch.get("size", 0))
+                            target = book.bids if s == "BUY" else book.asks
+                            if sz == 0: target.pop(p, None)
+                            else: target[p] = sz
         except Exception: pass
 
     def on_open(ws):
         GLOBAL_STATE.ws_connected = True
         print("[inf] WS Connected to Gamma", flush=True)
-        if GLOBAL_STATE.subscribed_tokens:
-            try: ws.send(json.dumps({"type": "market", "assets_ids": list(GLOBAL_STATE.subscribed_tokens)}))
-            except Exception: pass
+        with GLOBAL_STATE.lock:
+            if GLOBAL_STATE.subscribed_tokens:
+                try: ws.send(json.dumps({"type": "market", "assets_ids": list(GLOBAL_STATE.subscribed_tokens)}))
+                except Exception: pass
 
     while GLOBAL_STATE.running:
         try:
@@ -400,7 +447,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>BSS Maker Analysis Dashboard v6.2</title>
+<title>BSS Maker Analysis Dashboard v6.3</title>
 <style>
     :root { --bg-main: #0B1120; --bg-panel: #1E293B; --header-bg: #0F172A; --header-text: #F8FAFC; --sub-header-bg: #0F172A; --text-navy: #F8FAFC; --text-light: #94A3B8; --border-color: #334155; --val-green: #34D399; --val-red: #F87171; --val-yellow: #FCD34D; --val-pink: #F472B6; --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
@@ -436,7 +483,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Maker Analysis Dashboard v6.2
+    <div class="brand-title">BSS Maker Analysis Dashboard v6.3
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
@@ -542,20 +589,22 @@ class EmbeddedDashboard(http.server.BaseHTTPRequestHandler):
         if self.path == "/api/status":
             now = get_synced_time()
             m_data, history_data = [], []
-            for m in sorted(GLOBAL_STATE.markets.values(), key=lambda x: x.end_ts):
-                ttr = int(m.end_ts - now)
-                if m.state == MarketState.CLOSED and m.close_time != "":
-                    history_data.append({
-                        "time": m.close_time, "slug": m.slug, "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price, "pnl": m.realized_pnl,
-                        "t1_side": m.t1_side, "t1_price": m.t1_price, "t2_side": m.t2_side, "t2_price": m.t2_price
-                    })
-                else:
-                    yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
-                    m_data.append({
-                        "slug": m.slug, "state": m.state, "ttr_s": ttr, "target_price": m.pending_target_price,
-                        "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price,
-                        "yes_ask": yb.ask if yb else 0.0, "no_ask": nb.ask if nb else 0.0,
-                    })
+            
+            with GLOBAL_STATE.lock:
+                for m in sorted(GLOBAL_STATE.markets.values(), key=lambda x: x.end_ts):
+                    ttr = int(m.end_ts - now)
+                    if m.state == MarketState.CLOSED and m.close_time != "":
+                        history_data.append({
+                            "time": m.close_time, "slug": m.slug, "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price, "pnl": m.realized_pnl,
+                            "t1_side": m.t1_side, "t1_price": m.t1_price, "t2_side": m.t2_side, "t2_price": m.t2_price
+                        })
+                    else:
+                        yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
+                        m_data.append({
+                            "slug": m.slug, "state": m.state, "ttr_s": ttr, "target_price": m.pending_target_price,
+                            "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price,
+                            "yes_ask": yb.ask if yb else 0.0, "no_ask": nb.ask if nb else 0.0,
+                        })
             self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers()
             self.wfile.write(json.dumps({"uptime_s": int(time.time() - SYSTEM_BOOT_TIME), "ws_connected": GLOBAL_STATE.ws_connected, "pnl": GLOBAL_STATE.total_pnl, "total_trades_count": GLOBAL_STATE.total_trades, "markets": m_data, "history": history_data[-15:]}).encode())
             return
