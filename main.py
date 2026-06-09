@@ -1,5 +1,5 @@
 """
-main.py — BSS Bot v5.8.23 (Entry Cutoff Deadzone Patch)
+main.py — BSS Bot v5.8.24 (Zombie Killer & Absolute Entry Cutoff)
 FULL PRODUCTION BUILD
 """
 import os
@@ -26,7 +26,7 @@ BASE_CAPITAL_PER_LEG = 5.1
 TAKER_FEE_RATE = 0.018 
 
 HEDGE_DEADLINE_TTR = 320
-ENTRY_CUTOFF_TTR = 120  # Never enter a new position if less than 2 minutes remain
+ENTRY_CUTOFF_TTR = 120  # ABSOLUTE: Do not enter if less than 120s remain
 MAX_COMBINED_COST = 1.02
 
 SELL_LOSER_T1_THRESH = 0.86
@@ -153,6 +153,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <title>BSS Analysis Dashboard</title>
 <style>
+    /* ... (CSS block remains identical for brevity) ... */
     :root {
         --bg-main: #0B1120;
         --bg-panel: #1E293B;
@@ -170,11 +171,9 @@ DASHBOARD_HTML = r"""<!doctype html>
         --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
     body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
-    
     .header-panel { background: var(--header-bg); border: 1px solid var(--border-color); display: flex; flex-direction: column; text-align: center; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border-radius: 6px; overflow: hidden; }
     .brand-title { font-family: var(--font-serif); font-size: 22px; font-weight: bold; color: var(--header-text); padding: 14px 0; border-bottom: 1px solid var(--border-color); }
     .status-tags { font-size: 12px; font-family: var(--font-sans); font-weight: normal; margin-left: 15px; color: var(--text-light); }
-    
     .vitals-row { display: flex; background: var(--sub-header-bg); }
     .vital-box { flex: 1; padding: 15px; border-right: 1px solid var(--border-color); text-align: center; }
     .vital-box:last-child { border-right: none; }
@@ -182,47 +181,37 @@ DASHBOARD_HTML = r"""<!doctype html>
     .vital-value { background: var(--bg-panel); color: var(--text-navy); font-size: 24px; font-weight: 800; padding: 8px; border-radius: 4px; border: 1px solid var(--border-color); font-family: monospace; }
     .vital-value.green { color: var(--val-green); border-color: #064E3B; background: #065F46;}
     .vital-value.red { color: var(--val-red); border-color: #7F1D1D; background: #991B1B;}
-    
     .sec-title { background: var(--header-bg); color: var(--header-text); font-family: var(--font-serif); font-size: 15px; font-weight: bold; text-align: center; padding: 12px; margin-bottom: 15px; border-radius: 6px; letter-spacing: 0.5px; border: 1px solid var(--border-color);}
-    
     .grid { display: grid; grid-template-columns: 1fr; gap: 20px; margin-bottom: 35px; }
     .card { background: var(--bg-panel); border: 1px solid var(--border-color); box-shadow: 0 4px 6px rgba(0,0,0,0.3); display: flex; flex-direction: column; border-radius: 6px; overflow: hidden;}
     .card-header { background: var(--sub-header-bg); padding: 12px 20px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; font-weight: 800; color: var(--text-navy); font-size: 15px; align-items: center;}
-    
     .leg-container { display: flex; width: 100%; }
     .leg-col { flex: 1; padding: 20px; border-right: 1px solid var(--border-color); }
     .leg-col:last-child { border-right: none; }
     .leg-title { font-size: 13px; font-weight: 800; text-align: center; margin-bottom: 15px; color: var(--text-light); text-transform: uppercase; letter-spacing: 1px; }
-    
     .data-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; color: var(--text-light); align-items: center;}
     .data-row b { color: var(--text-navy); font-family: monospace; font-size: 15px;}
     .val-green { color: var(--val-green); font-weight: 800; font-family: monospace; font-size: 15px;}
     .val-red { color: var(--val-red); font-weight: 800; font-family: monospace; font-size: 15px;}
     .val-gold { color: var(--val-yellow); font-weight: 800; font-family: monospace; font-size: 15px;}
     .val-pink { color: var(--val-pink); font-weight: 800; font-family: monospace; font-size: 15px;}
-    
     .conviction-bar { height: 6px; background: #0F172A; border: 1px solid #334155; border-radius: 4px; position: relative; margin-top: 6px; margin-bottom: 15px; width: 100%; }
     .conviction-fill { height: 100%; border-radius: 3px; transition: width 0.3s ease; }
     .conviction-fill.yes { background: #38BDF8; }
     .conviction-fill.no { background: #94A3B8; }
     .marker { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--val-yellow); z-index: 5; }
     .marker.t2 { background: var(--val-pink); }
-    
     .svg-container { height: 50px; margin-top: 10px; background: #0F172A; border: 1px solid var(--border-color); border-radius: 4px;}
-    
     .table-container { background: var(--bg-panel); border: 1px solid var(--border-color); margin-bottom: 35px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border-radius: 6px; overflow: hidden; }
     table { width: 100%; border-collapse: collapse; text-align: left; }
     th { background: var(--sub-header-bg); color: var(--text-light); font-size: 11px; font-weight: 800; text-transform: uppercase; padding: 12px; border-bottom: 1px solid var(--border-color); text-align: center; letter-spacing: 0.5px;}
     td { padding: 12px 10px; border-bottom: 1px solid var(--border-color); text-align: center; font-size: 13px; font-family: monospace; color: var(--text-navy);}
-    
     .queue-container { background: var(--bg-panel); border: 1px solid var(--border-color); padding: 20px; font-family: monospace; font-size: 13px; color: var(--text-light); line-height: 1.8; border-radius: 6px; }
-    
     .vault { display: flex; gap: 15px; background: var(--sub-header-bg); padding: 15px; border: 1px solid var(--border-color); align-items: center; justify-content: center; margin-bottom: 25px; border-radius: 6px;}
     .btn-action { background: #1E293B; color: var(--text-navy); border: 1px solid var(--border-color); padding: 8px 18px; cursor: pointer; font-weight: 700; box-shadow: 0 1px 2px rgba(0,0,0,0.2); border-radius: 4px; transition: all 0.2s;}
     .btn-action:hover { background: #334155; border-color: #475569;}
     .btn-verify { color: #60A5FA; text-decoration: none; font-weight: 800; font-size: 12px; font-family: var(--font-sans);}
     .btn-verify:hover { text-decoration: underline; }
-
     @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
     .guard-badge { background: #B45309; color: #FFFBEB; padding: 3px 8px; border-radius: 4px; font-size: 10px; font-weight: 800; margin-left: 8px; animation: pulse 1.5s infinite; border: 1px solid #F59E0B;}
     .guard-static { background: #1E3A8A; color: #DBEAFE; padding: 3px 6px; border-radius: 3px; font-size: 11px; font-weight: 800; border: 1px solid #3B82F6;}
@@ -231,7 +220,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.23
+    <div class="brand-title">BSS Bot Analysis Dashboard v5.8.24
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
@@ -583,19 +572,21 @@ def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares:
     threading.Thread(target=log_trade_csv_worker, args=(ts, mdm.slug, action, side, price, shares, fees, ttr, pnl), daemon=True).start()
 
 def evaluate_market(mdm: MarketData, now: float):
+    # Zombie Killer Patch: Absolute Floor
     if getattr(mdm, 'expired_processed', False): return
-    yb, nb = GLOBAL_STATE.books.get(mdm.yes_token), GLOBAL_STATE.books.get(mdm.no_token)
-    if not yb or not nb: return
-    ttr = int(mdm.end_ts - now)
     
-    # Buzzer Precision Trigger
+    ttr = int(mdm.end_ts - now)
+    yb, nb = GLOBAL_STATE.books.get(mdm.yes_token), GLOBAL_STATE.books.get(mdm.no_token)
+    
+    # Buzzer Precision Trigger + Zombie Lock
     if ttr <= 1:
         mdm.expired_processed = True
-        winner_side = "YES" if yb.bid > nb.bid else "NO"
-        if (mdm.t1_side == winner_side) or (mdm.t2_side == winner_side):
-            GLOBAL_STATE.catastrophes += 1
         if mdm.state != MarketState.CLOSED:
             mdm.state = MarketState.CLOSED
+            if not yb or not nb: return # Prevent crash if API is dead
+            winner_side = "YES" if yb.bid > nb.bid else "NO"
+            if (mdm.t1_side == winner_side) or (mdm.t2_side == winner_side):
+                GLOBAL_STATE.catastrophes += 1
             cost_basis = mdm.total_fees_paid
             if mdm.yes_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
             if mdm.no_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
@@ -604,59 +595,60 @@ def evaluate_market(mdm: MarketData, now: float):
             execute_trade(mdm, winner_side, 0.00, "EXPIRED_AT_BUZZER", 0.0, 0.0, ttr, calc_pnl)
         return
         
+    if not yb or not nb: return
     if mdm.state == MarketState.CLOSED: return
     t2 = T_SECOND_LIVE if ttr <= 300 else T_SECOND_PRE
     
-    if mdm.state == MarketState.WATCH:
-        # HARD CUTOFF PATCH: Do not enter if less than 120 seconds remain
-        if 0 < yb.ask <= T_FIRST and ttr > ENTRY_CUTOFF_TTR:
-            mdm.state = MarketState.WAITING_NO
-            mdm.yes_entry_price = yb.ask
-            mdm.yes_shares = BASE_CAPITAL_PER_LEG / yb.ask
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, "YES", yb.ask, "LEG_1_ENTRY", mdm.yes_shares, fee, ttr)
-        elif 0 < nb.ask <= T_FIRST and ttr > ENTRY_CUTOFF_TTR:
-            mdm.state = MarketState.WAITING_YES
-            mdm.no_entry_price = nb.ask
-            mdm.no_shares = BASE_CAPITAL_PER_LEG / nb.ask
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, "NO", nb.ask, "LEG_1_ENTRY", mdm.no_shares, fee, ttr)
-        elif ttr <= HEDGE_DEADLINE_TTR and ttr > ENTRY_CUTOFF_TTR and 0 < yb.ask and 0 < nb.ask and (yb.ask + nb.ask) <= MAX_COMBINED_COST:
-            mdm.state = MarketState.BOTH
-            mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
-            fee_yes = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee_yes
-            execute_trade(mdm, "YES", yb.ask, "LEG_1_FOMO", mdm.yes_shares, fee_yes, ttr)
-            mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
-            fee_no = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee_no
-            execute_trade(mdm, "NO", nb.ask, "LEG_2_FOMO", mdm.no_shares, fee_no, ttr)
-
-    elif mdm.state == MarketState.WAITING_NO:
-        # HARD CUTOFF PATCH applies to Leg 2 as well
-        if (0 < nb.ask <= t2 and ttr > ENTRY_CUTOFF_TTR) or (ENTRY_CUTOFF_TTR < ttr <= HEDGE_DEADLINE_TTR and nb.ask > 0):
-            mdm.state = MarketState.BOTH
-            mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, "NO", nb.ask, "LEG_2_DEADLINE" if ttr <= HEDGE_DEADLINE_TTR else "LEG_2_ENTRY", mdm.no_shares, fee, ttr)
+    # Absolute Entry Cutoff Wrapper
+    if ttr > ENTRY_CUTOFF_TTR:
+        if mdm.state == MarketState.WATCH:
+            if 0 < yb.ask <= T_FIRST:
+                mdm.state = MarketState.WAITING_NO
+                mdm.yes_entry_price = yb.ask
+                mdm.yes_shares = BASE_CAPITAL_PER_LEG / yb.ask
+                fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+                mdm.total_fees_paid += fee
+                execute_trade(mdm, "YES", yb.ask, "LEG_1_ENTRY", mdm.yes_shares, fee, ttr)
+            elif 0 < nb.ask <= T_FIRST:
+                mdm.state = MarketState.WAITING_YES
+                mdm.no_entry_price = nb.ask
+                mdm.no_shares = BASE_CAPITAL_PER_LEG / nb.ask
+                fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+                mdm.total_fees_paid += fee
+                execute_trade(mdm, "NO", nb.ask, "LEG_1_ENTRY", mdm.no_shares, fee, ttr)
+            elif ttr <= HEDGE_DEADLINE_TTR and 0 < yb.ask and 0 < nb.ask and (yb.ask + nb.ask) <= MAX_COMBINED_COST:
+                mdm.state = MarketState.BOTH
+                mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
+                fee_yes = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+                mdm.total_fees_paid += fee_yes
+                execute_trade(mdm, "YES", yb.ask, "LEG_1_FOMO", mdm.yes_shares, fee_yes, ttr)
+                mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
+                fee_no = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+                mdm.total_fees_paid += fee_no
+                execute_trade(mdm, "NO", nb.ask, "LEG_2_FOMO", mdm.no_shares, fee_no, ttr)
+    
+        elif mdm.state == MarketState.WAITING_NO:
+            if (0 < nb.ask <= t2) or (ttr <= HEDGE_DEADLINE_TTR and nb.ask > 0):
+                mdm.state = MarketState.BOTH
+                mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
+                fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+                mdm.total_fees_paid += fee
+                execute_trade(mdm, "NO", nb.ask, "LEG_2_DEADLINE" if ttr <= HEDGE_DEADLINE_TTR else "LEG_2_ENTRY", mdm.no_shares, fee, ttr)
+                
+        elif mdm.state == MarketState.WAITING_YES:
+            if (0 < yb.ask <= t2) or (ttr <= HEDGE_DEADLINE_TTR and yb.ask > 0):
+                mdm.state = MarketState.BOTH
+                mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
+                fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+                mdm.total_fees_paid += fee
+                execute_trade(mdm, "YES", yb.ask, "LEG_2_DEADLINE" if ttr <= HEDGE_DEADLINE_TTR else "LEG_2_ENTRY", mdm.yes_shares, fee, ttr)
             
-    elif mdm.state == MarketState.WAITING_YES:
-        # HARD CUTOFF PATCH applies to Leg 2 as well
-        if (0 < yb.ask <= t2 and ttr > ENTRY_CUTOFF_TTR) or (ENTRY_CUTOFF_TTR < ttr <= HEDGE_DEADLINE_TTR and yb.ask > 0):
-            mdm.state = MarketState.BOTH
-            mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, "YES", yb.ask, "LEG_2_DEADLINE" if ttr <= HEDGE_DEADLINE_TTR else "LEG_2_ENTRY", mdm.yes_shares, fee, ttr)
-            
-    elif mdm.state == MarketState.BOTH:
+    if mdm.state == MarketState.BOTH:
         mdm.guard_active_yes = mdm.guard_active_no = False
         if yb.bid > nb.bid: winner_bid, loser_side, loser_bid, loser_shares, loser_book = yb.bid, "NO", nb.bid, mdm.no_shares, nb
         else: winner_bid, loser_side, loser_bid, loser_shares, loser_book = nb.bid, "YES", yb.bid, mdm.yes_shares, yb
             
+        # The T1 Lock
         if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
             guard_ratio = check_guard_imbalance(loser_book)
             if guard_ratio > 0:
@@ -673,7 +665,8 @@ def evaluate_market(mdm: MarketData, now: float):
                 mdm.total_fees_paid += fee
                 execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T1", shares_to_sell, fee, ttr)
             
-        elif winner_bid >= SELL_LOSER_T2_THRESH:
+        # The T2 Lock (Zombie Patch applied)
+        elif winner_bid >= SELL_LOSER_T2_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
             guard_ratio = check_guard_imbalance(loser_book)
             if guard_ratio > 0:
                 if loser_side == "YES": mdm.guard_active_yes = True
