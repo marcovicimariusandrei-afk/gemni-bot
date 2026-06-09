@@ -1,5 +1,5 @@
 """
-main.py — BSS Bot v6.2 (Master Restoration: Maker Logic + Cloud Fixes + WS/Telemetry Restored)
+main.py — BSS Bot v6.2 (Rate-Limit Proof + Hybrid WS/REST Telemetry)
 FULL PRODUCTION BUILD
 """
 import os
@@ -17,16 +17,12 @@ import websocket
 
 # ─── CONFIGURATION ───
 MODE = os.getenv("MODE", "dry").lower()
-T_FIRST = float(os.getenv("BS_BSS_T_FIRST", "0.49"))
-T_SECOND_PRE = float(os.getenv("BS_BSS_T_SECOND_PRE", "0.50"))
-T_SECOND_LIVE = float(os.getenv("BS_BSS_T_SECOND_LIVE", "0.50"))
-
 BASE_CAPITAL_PER_LEG = 5.1  
 TAKER_FEE_RATE = 0.018 
 
 # Maker Phase Timings
-PHASE_1_TTR_START = 600   # 10 minutes out
-ENTRY_CUTOFF_TTR = 120    # 2 minutes out (Absolute Deadzone)
+PHASE_1_TTR_START = 600   
+ENTRY_CUTOFF_TTR = 120    
 HEDGE_DEADLINE_TTR = 320
 
 SELL_LOSER_T1_THRESH = 0.86
@@ -57,35 +53,17 @@ class MarketData:
         self.state = MarketState.WATCH
         
         self.pending_target_price = 0.0
-        self.yes_entry_price = 0.0
-        self.no_entry_price = 0.0
-        self.yes_shares = 0.0
-        self.no_shares = 0.0
+        self.yes_entry_price, self.no_entry_price, self.yes_shares, self.no_shares = 0.0, 0.0, 0.0, 0.0
         self.total_fees_paid = 0.0
         
-        self.t1_executed = False
-        self.t1_side = ""
-        self.t1_price = 0.0
-        self.t1_time = ""
-        self.t1_guarded = False
-        self.t1_guard_ratio = 0.0
+        self.t1_executed, self.t1_side, self.t1_price, self.t1_time = False, "", 0.0, ""
+        self.t1_guarded, self.t1_guard_ratio = False, 0.0
+        self.t2_side, self.t2_price, self.t2_time = "", 0.0, ""
+        self.t2_guarded, self.t2_guard_ratio = False, 0.0
         
-        self.t2_side = ""
-        self.t2_price = 0.0
-        self.t2_time = ""
-        self.t2_guarded = False
-        self.t2_guard_ratio = 0.0
-        
-        self.salvage_revenue = 0.0
-        self.realized_pnl = 0.0
-        
-        self.close_time = ""
-        self.close_reason = ""
-        self.expired_processed = False
-        
-        self.guard_active_yes = False
-        self.guard_active_no = False
-        
+        self.salvage_revenue, self.realized_pnl = 0.0, 0.0
+        self.close_time, self.close_reason, self.expired_processed = "", "", False
+        self.guard_active_yes, self.guard_active_no = False, False
         self.history_yes: List[float] = []
         self.history_no: List[float] = []
 
@@ -93,25 +71,22 @@ class OrderBook:
     def __init__(self):
         self.bids: Dict[float, float] = {}
         self.asks: Dict[float, float] = {}
+        self.last_update = time.time()
 
     @property
-    def bid(self):
-        return max(self.bids.keys()) if self.bids else 0.0
+    def bid(self): return max(self.bids.keys()) if self.bids else 0.0
 
     @property
-    def ask(self):
-        return min(self.asks.keys()) if self.asks else 0.0
+    def ask(self): return min(self.asks.keys()) if self.asks else 0.0
 
     def get_local_vols(self, current_price: float, side: str, depth: float = 0.10) -> float:
         vol = 0.0
         if side == "bid":
             for p, s in self.bids.items():
-                if p >= current_price - depth:
-                    vol += s
+                if p >= current_price - depth: vol += s
         else:
             for p, s in self.asks.items():
-                if p <= current_price + depth:
-                    vol += s
+                if p <= current_price + depth: vol += s
         return vol
 
 class BotState:
@@ -119,459 +94,65 @@ class BotState:
         self.running = True
         self.markets: Dict[str, MarketData] = {}
         self.books: Dict[str, OrderBook] = {}
+        self.subscribed_tokens = set()
         self.ws_connected = False
         self.ws_handle = None
         self.total_pnl = 0.0
-        self.total_trades = 0 
-        self.sold_losers = 0
-        self.catastrophes = 0
+        self.total_trades, self.sold_losers, self.catastrophes = 0, 0, 0
         self.time_offset = 0.0
 
 GLOBAL_STATE = BotState()
 
-# ─── TIME SYNC (NTP) ───
 def sync_time_with_api():
     try:
-        start_ping = time.time()
+        t0 = time.time()
         res = requests.get("https://gamma-api.polymarket.com/events?limit=1", timeout=5)
-        end_ping = time.time()
+        t1 = time.time()
         if res.status_code == 200:
-            rtt_latency = (end_ping - start_ping) / 2.0 
             server_time_str = res.headers.get("Date", "")
             if server_time_str:
                 server_dt = datetime.strptime(server_time_str, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=timezone.utc)
-                server_ts = server_dt.timestamp() + rtt_latency
-                local_ts = end_ping
-                GLOBAL_STATE.time_offset = server_ts - local_ts
-    except Exception as e:
-        pass
+                GLOBAL_STATE.time_offset = (server_dt.timestamp() + ((t1 - t0) / 2.0)) - t1
+    except Exception: pass
 
-def get_synced_time() -> float:
-    return time.time() + GLOBAL_STATE.time_offset
+def get_synced_time() -> float: return time.time() + GLOBAL_STATE.time_offset
 
-# ─── ASYNC CSV LOGGING SYSTEM ───
+# ─── LOGGING & EXECUTION ───
 def init_csv():
-    if not os.path.exists("trades_full.csv"):
-        with open("trades_full.csv", "w", newline="") as f:
-            csv.writer(f).writerow(["Timestamp", "Slug", "Action", "Side", "Executed_Price", "Share_Quantity", "Fees_Paid", "TTR_at_Execution", "Realized_PnL", "Verify_Link"])
-    if not os.path.exists("snapshot_live.csv"):
-        with open("snapshot_live.csv", "w", newline="") as f:
-            csv.writer(f).writerow(["Timestamp", "Slug", "State", "Yes_Ask", "Yes_Bid", "No_Ask", "No_Bid"])
-    if not os.path.exists("telemetry_shadow.csv"):
-        with open("telemetry_shadow.csv", "w", newline="") as f:
-            csv.writer(f).writerow(["Timestamp", "Slug", "Token", "TTR", "Ticker_Price", "Local_Bid_Vol", "Local_Ask_Vol", "Imbalance_Ratio", "Signal"])
+    files = [
+        ("trades_full.csv", ["Timestamp", "Slug", "Action", "Side", "Executed_Price", "Share_Quantity", "Fees_Paid", "TTR_at_Execution", "Realized_PnL", "Verify_Link"]),
+        ("snapshot_live.csv", ["Timestamp", "Slug", "State", "Yes_Ask", "Yes_Bid", "No_Ask", "No_Bid"]),
+        ("telemetry_shadow.csv", ["Timestamp", "Slug", "Token", "TTR", "Ticker_Price", "Local_Bid_Vol", "Local_Ask_Vol", "Imbalance_Ratio", "Signal"])
+    ]
+    for f, headers in files:
+        if not os.path.exists(f):
+            with open(f, "w", newline="") as fp: csv.writer(fp).writerow(headers)
 
-def log_trade_csv_worker(ts, slug, action, side, price, shares, fees, ttr, pnl):
-    link = f"https://polymarket.com/event/{slug}"
+def log_trade_worker(ts, slug, action, side, price, shares, fees, ttr, pnl):
     try:
         with open("trades_full.csv", "a", newline="") as f:
-            csv.writer(f).writerow([ts, slug, action, side, f"{price:.3f}", f"{shares:.2f}", f"{fees:.3f}", ttr, f"{pnl:.3f}", link])
-    except Exception:
-        pass
+            csv.writer(f).writerow([ts, slug, action, side, f"{price:.3f}", f"{shares:.2f}", f"{fees:.3f}", ttr, f"{pnl:.3f}", f"https://polymarket.com/event/{slug}"])
+    except Exception: pass
 
-# ─── DASHBOARD HTML ───
-DASHBOARD_HTML = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>BSS Analysis Dashboard v6.2</title>
-<style>
-    :root { --bg-main: #0B1120; --bg-panel: #1E293B; --header-bg: #0F172A; --header-text: #F8FAFC; --sub-header-bg: #0F172A; --text-navy: #F8FAFC; --text-light: #94A3B8; --border-color: #334155; --val-green: #34D399; --val-red: #F87171; --val-yellow: #FCD34D; --val-pink: #F472B6; --font-serif: Georgia, "Times New Roman", serif; --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
-    .header-panel { background: var(--header-bg); border: 1px solid var(--border-color); display: flex; flex-direction: column; text-align: center; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border-radius: 6px; overflow: hidden; }
-    .brand-title { font-family: var(--font-serif); font-size: 22px; font-weight: bold; color: var(--header-text); padding: 14px 0; border-bottom: 1px solid var(--border-color); }
-    .status-tags { font-size: 12px; font-family: var(--font-sans); font-weight: normal; margin-left: 15px; color: var(--text-light); }
-    .vitals-row { display: flex; background: var(--sub-header-bg); }
-    .vital-box { flex: 1; padding: 15px; border-right: 1px solid var(--border-color); text-align: center; }
-    .vital-box:last-child { border-right: none; }
-    .vital-label { font-size: 12px; font-weight: 700; text-transform: uppercase; margin-bottom: 8px; color: var(--text-light); letter-spacing: 0.5px; }
-    .vital-value { background: var(--bg-panel); color: var(--text-navy); font-size: 24px; font-weight: 800; padding: 8px; border-radius: 4px; border: 1px solid var(--border-color); font-family: monospace; }
-    .vital-value.green { color: var(--val-green); border-color: #064E3B; background: #065F46;}
-    .vital-value.red { color: var(--val-red); border-color: #7F1D1D; background: #991B1B;}
-    .sec-title { background: var(--header-bg); color: var(--header-text); font-family: var(--font-serif); font-size: 15px; font-weight: bold; text-align: center; padding: 12px; margin-bottom: 15px; border-radius: 6px; letter-spacing: 0.5px; border: 1px solid var(--border-color);}
-    .grid { display: grid; grid-template-columns: 1fr; gap: 20px; margin-bottom: 35px; }
-    .card { background: var(--bg-panel); border: 1px solid var(--border-color); box-shadow: 0 4px 6px rgba(0,0,0,0.3); display: flex; flex-direction: column; border-radius: 6px; overflow: hidden;}
-    .card-header { background: var(--sub-header-bg); padding: 12px 20px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; font-weight: 800; color: var(--text-navy); font-size: 15px; align-items: center;}
-    .leg-container { display: flex; width: 100%; }
-    .leg-col { flex: 1; padding: 20px; border-right: 1px solid var(--border-color); }
-    .leg-col:last-child { border-right: none; }
-    .leg-title { font-size: 13px; font-weight: 800; text-align: center; margin-bottom: 15px; color: var(--text-light); text-transform: uppercase; letter-spacing: 1px; }
-    .data-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; color: var(--text-light); align-items: center;}
-    .data-row b { color: var(--text-navy); font-family: monospace; font-size: 15px;}
-    .val-green { color: var(--val-green); font-weight: 800; font-family: monospace; font-size: 15px;}
-    .val-red { color: var(--val-red); font-weight: 800; font-family: monospace; font-size: 15px;}
-    .val-gold { color: var(--val-yellow); font-weight: 800; font-family: monospace; font-size: 15px;}
-    .val-pink { color: var(--val-pink); font-weight: 800; font-family: monospace; font-size: 15px;}
-    .conviction-bar { height: 6px; background: #0F172A; border: 1px solid #334155; border-radius: 4px; position: relative; margin-top: 6px; margin-bottom: 15px; width: 100%; }
-    .conviction-fill { height: 100%; border-radius: 3px; transition: width 0.3s ease; }
-    .conviction-fill.yes { background: #38BDF8; }
-    .conviction-fill.no { background: #94A3B8; }
-    .marker { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--val-yellow); z-index: 5; }
-    .marker.t2 { background: var(--val-pink); }
-    .svg-container { height: 50px; margin-top: 10px; background: #0F172A; border: 1px solid var(--border-color); border-radius: 4px;}
-    .table-container { background: var(--bg-panel); border: 1px solid var(--border-color); margin-bottom: 35px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border-radius: 6px; overflow: hidden; }
-    table { width: 100%; border-collapse: collapse; text-align: left; }
-    th { background: var(--sub-header-bg); color: var(--text-light); font-size: 11px; font-weight: 800; text-transform: uppercase; padding: 12px; border-bottom: 1px solid var(--border-color); text-align: center; letter-spacing: 0.5px;}
-    td { padding: 12px 10px; border-bottom: 1px solid var(--border-color); text-align: center; font-size: 13px; font-family: monospace; color: var(--text-navy);}
-    .queue-container { background: var(--bg-panel); border: 1px solid var(--border-color); padding: 20px; font-family: monospace; font-size: 13px; color: var(--text-light); line-height: 1.8; border-radius: 6px; }
-    .vault { display: flex; gap: 15px; background: var(--sub-header-bg); padding: 15px; border: 1px solid var(--border-color); align-items: center; justify-content: center; margin-bottom: 25px; border-radius: 6px;}
-    .btn-action { background: #1E293B; color: var(--text-navy); border: 1px solid var(--border-color); padding: 8px 18px; cursor: pointer; font-weight: 700; box-shadow: 0 1px 2px rgba(0,0,0,0.2); border-radius: 4px; transition: all 0.2s;}
-    .btn-action:hover { background: #334155; border-color: #475569;}
-    .btn-verify { color: #60A5FA; text-decoration: none; font-weight: 800; font-size: 12px; font-family: var(--font-sans);}
-    .btn-verify:hover { text-decoration: underline; }
-    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
-    .guard-badge { background: #B45309; color: #FFFBEB; padding: 3px 8px; border-radius: 4px; font-size: 10px; font-weight: 800; margin-left: 8px; animation: pulse 1.5s infinite; border: 1px solid #F59E0B;}
-    .guard-static { background: #1E3A8A; color: #DBEAFE; padding: 3px 6px; border-radius: 3px; font-size: 11px; font-weight: 800; border: 1px solid #3B82F6;}
-</style>
-</head>
-<body>
+def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares: float, fees: float, ttr: int, pnl: float = 0.0):
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    print(f"[{ts}] [{action}] {mdm.slug} | {side} @ {price:.3f} | Shares: {shares:.2f}", flush=True)
+    if "SELL" in action or "DUMP" in action:
+        GLOBAL_STATE.sold_losers += 1
+        mdm.salvage_revenue += (shares * price)
+    if action == "SELL_LOSER_T1": mdm.t1_side, mdm.t1_price, mdm.t1_time = side, price, ts
+    if action == "SELL_LOSER_T2": mdm.t2_side, mdm.t2_price, mdm.t2_time = side, price, ts
+    if "CLOSED" in action or "EXPIRED" in action:
+        mdm.close_time, mdm.close_reason = ts, action
+        GLOBAL_STATE.total_trades += 1
+        mdm.realized_pnl = pnl
+        GLOBAL_STATE.total_pnl += pnl
+    threading.Thread(target=log_trade_worker, args=(ts, mdm.slug, action, side, price, shares, fees, ttr, pnl), daemon=True).start()
 
-<div class="header-panel">
-    <div class="brand-title">BSS Maker Analysis Dashboard v6.2
-        <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
-        <span class="status-tags" id="ws-status">[WS: Checking...]</span>
-        <span class="status-tags" id="ntp-status">[NTP Sync Delta: 0ms]</span>
-    </div>
-    <div class="vitals-row">
-        <div class="vital-box"><div class="vital-label">Total Realized P&L</div><div class="vital-value" id="v-pnl">$0.00</div></div>
-        <div class="vital-box"><div class="vital-label">Completed Trades</div><div class="vital-value" id="v-trades">0</div></div>
-        <div class="vital-box"><div class="vital-label">Sold Losers</div><div class="vital-value" id="v-losers">0</div></div>
-        <div class="vital-box"><div class="vital-label">Catastrophes Avoided</div><div class="vital-value red" id="v-catastrophes">0</div></div>
-        <div class="vital-box"><div class="vital-label">Active Slots</div><div class="vital-value" id="v-active">0</div></div>
-    </div>
-</div>
-
-<div class="sec-title">Active Market Dual-Leg Monitoring</div>
-<div class="grid" id="active-cards"><div style="text-align:center; padding:30px; color:var(--text-light); font-weight: bold;">Awaiting Entry Criteria...</div></div>
-
-<div class="sec-title">Consolidated Trade Lifecycle History</div>
-<div class="table-container">
-    <table>
-        <thead><tr><th>Time Closed</th><th>Market Slug</th><th>YES Entry</th><th>NO Entry</th><th>T1 Exit</th><th>T2 Exit</th><th>Net P&L</th><th>Audit Link</th></tr></thead>
-        <tbody id="log-body"><tr><td colspan="8" style="color: var(--text-light); padding: 20px;">No historical data available.</td></tr></tbody>
-    </table>
-</div>
-
-<div class="vault">
-    <span style="font-weight: 800; margin-right: 15px; color: var(--text-navy); text-transform: uppercase; letter-spacing: 0.5px;">Data Vault & Utilities:</span>
-    <button class="btn-action" onclick="window.location.href='/api/dl_trades'">Download Trades (.csv)</button>
-    <button class="btn-action" onclick="window.location.href='/api/dl_snaps'">Download Snapshots (.csv)</button>
-    <button class="btn-action" style="color: var(--val-gold); border-color: #B45309;" onclick="window.location.href='/api/dl_telemetry'">Download Telemetry (.csv)</button>
-    <button class="btn-action" style="color: #FCA5A5; margin-left: auto; border-color: #7F1D1D; background: #450A0A;" onclick="deleteFiles()">⚠ Delete Old Files</button>
-</div>
-
-<div class="sec-title">Observation Queue (Scouting & Maker Waiting)</div>
-<div class="queue-container" id="obs-queue">Scanning...</div>
-
-<script>
-function renderSparkline(history, color, t1_price, t2_price) {
-    if(!history || history.length < 2) return '';
-    const min = Math.min(...history), max = Math.max(...history);
-    const range = (max - min) || 0.01;
-    const pts = history.map((val, i) => {
-        const x = (i / (history.length - 1)) * 100;
-        const y = 100 - (((val - min) / range) * 100);
-        return `${x},${y}`;
-    }).join(' ');
-    
-    let svg = `<polyline fill="none" stroke="${color}" stroke-width="2.5" points="${pts}" />`;
-    if (t1_price > 0) {
-        let yT1 = 100 - (((t1_price - min) / range) * 100);
-        yT1 = Math.max(5, Math.min(95, yT1)); 
-        svg += `<circle cx="80" cy="${yT1}" r="4" fill="var(--val-yellow)" stroke="#0B1120" stroke-width="1.5" />`;
-    }
-    if (t2_price > 0) {
-        let yT2 = 100 - (((t2_price - min) / range) * 100);
-        yT2 = Math.max(5, Math.min(95, yT2)); 
-        svg += `<circle cx="92" cy="${yT2}" r="4" fill="var(--val-pink)" stroke="#0B1120" stroke-width="1.5" />`;
-    }
-    return `<svg width="100%" height="100%" viewBox="0 -10 100 120" preserveAspectRatio="none">${svg}</svg>`;
-}
-
-function getConvictionHtml(ask) {
-    let fillPct = Math.min(100, Math.max(0, ask * 100));
-    let distT1 = Math.round((ask - 0.86) * 100);
-    let distT2 = Math.round((ask - 0.95) * 100);
-    let trackerText = "";
-    if (ask >= 0.95) trackerText = `<span class="val-pink">T2 REACHED (+${distT2}¢)</span>`;
-    else if (ask >= 0.86) trackerText = `<span class="val-gold">T1 REACHED (+${distT1}¢)</span> | <span style="color:var(--text-light)">${distT2}¢ to T2</span>`;
-    else trackerText = `<span style="color:var(--text-light)">${distT1}¢ to T1 | ${distT2}¢ to T2</span>`;
-    return { pct: fillPct, text: trackerText };
-}
-
-function getImbalanceBadge(bidV, askV) {
-    if (askV > 0 && bidV >= askV * 2.0) {
-        let r = (bidV/askV).toFixed(1);
-        return `<span style="background:var(--val-green); color:#064E3B; padding:2px 6px; border-radius:3px; font-size:10px; font-weight:800; margin-left:8px;">⚠ BID WALL (${r}x)</span>`;
-    } else if (bidV > 0 && askV >= bidV * 2.0) {
-        let r = (askV/bidV).toFixed(1);
-        return `<span style="background:var(--val-red); color:#fff; padding:2px 6px; border-radius:3px; font-size:10px; font-weight:800; margin-left:8px;">⚠ ASK WALL (${r}x)</span>`;
-    }
-    return '';
-}
-
-function formatUptime(seconds) {
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = seconds % 60;
-    return `${h}h ${m}m ${s}s`;
-}
-
-async function deleteFiles() {
-    if(confirm("Confirm deletion of all server CSV logs?")) {
-        await fetch('/api/delete_logs', {method: 'POST'});
-        alert("Logs purged.");
-    }
-}
-
-setInterval(async () => {
-    try {
-        const r = await fetch('/api/status');
-        const s = await r.json();
-        
-        document.getElementById('bot-uptime').textContent = `[Uptime: ${formatUptime(s.uptime_s)}]`;
-        document.getElementById('ws-status').textContent = s.ws_connected ? "[WS: CONNECTED]" : "[WS: DROPPED]";
-        document.getElementById('ws-status').style.color = s.ws_connected ? "#34d399" : "#f87171";
-        document.getElementById('ntp-status').textContent = `[NTP Drift: ${Math.round(s.time_offset * 1000)}ms]`;
-        
-        const pnlBox = document.getElementById('v-pnl');
-        pnlBox.textContent = (s.pnl >= 0 ? '+' : '') + '$' + s.pnl.toFixed(2);
-        pnlBox.className = "vital-value " + (s.pnl > 0 ? "green" : (s.pnl < 0 ? "red" : ""));
-        
-        document.getElementById('v-trades').textContent = s.total_trades_count;
-        document.getElementById('v-losers').textContent = s.losers;
-        document.getElementById('v-catastrophes').textContent = s.catastrophes;
-        
-        let activeCount = 0;
-        let htmlCards = '';
-        let htmlQueue = '';
-        
-        s.markets.forEach(m => {
-            if (m.state === 'WATCH' || m.state === 'WAITING_NO' || m.state === 'WAITING_YES' || m.state === 'PENDING_MAKER') {
-                let currentStatus = m.state === 'WATCH' ? 'Scouting' : (m.state === 'PENDING_MAKER' ? `Resting Maker Order @ $${m.target_price.toFixed(2)}` : 'Filling Dual Leg');
-                htmlQueue += `[TTR: ${m.ttr_s}s] | ${m.slug} | Target: $${m.target_price.toFixed(2)} | YES Ask: $${m.yes_ask.toFixed(3)} | NO Ask: $${m.no_ask.toFixed(3)} | Status: ${currentStatus}<br>`;
-                return;
-            }
-            if (m.state === 'CLOSED' && m.ttr_s <= 0) return;
-            
-            activeCount++;
-            
-            let isClosed = m.state === 'CLOSED';
-            let closedBadge = isClosed ? `<span style="background:var(--val-red); color:#fff; padding:3px 8px; border-radius:4px; font-size:11px; margin-left:10px; font-family:var(--font-sans);">SOLD - TICKER ONLY</span>` : '';
-            
-            let dYes = m.yes_entry > 0 ? ((m.yes_ask - m.yes_entry) / m.yes_entry) * 100 : 0;
-            let dNo = m.no_entry > 0 ? ((m.no_ask - m.no_entry) / m.no_entry) * 100 : 0;
-            let cYes = dYes >= 0 ? 'val-green' : 'val-red';
-            let cNo = dNo >= 0 ? 'val-green' : 'val-red';
-
-            let valYes = m.yes_shares * m.yes_ask;
-            let valNo = m.no_shares * m.no_ask;
-            
-            let cYesData = getConvictionHtml(m.yes_ask);
-            let cNoData = getConvictionHtml(m.no_ask);
-
-            let yesBadge = getImbalanceBadge(m.yes_b_vol, m.yes_a_vol);
-            let noBadge = getImbalanceBadge(m.no_b_vol, m.no_a_vol);
-
-            if (m.guard_active_yes) yesBadge += `<span class="guard-badge">🛡 GUARDED</span>`;
-            if (m.guard_active_no) noBadge += `<span class="guard-badge">🛡 GUARDED</span>`;
-
-            htmlCards += `<div class="card">
-                <div class="card-header">
-                    <span>${m.slug} ${closedBadge}</span>
-                    <span style="color:var(--text-light);">TTR: <span style="color:var(--text-navy);">${m.ttr_s}s</span></span>
-                </div>
-                <div class="leg-container">
-                    <div class="leg-col">
-                        <div class="leg-title">YES LEG MONITOR</div>
-                        <div class="data-row"><span>Shares Acquired:</span> <b>${m.yes_shares.toFixed(2)}</b></div>
-                        <div class="data-row"><span>Effective Entry (w/ fees):</span> <b>$${m.yes_entry > 0 ? (m.yes_entry*1.018).toFixed(3) : '0.000'}</b></div>
-                        <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;">
-                            <span>Live Ticker: ${yesBadge}</span> 
-                            <b>$${m.yes_ask.toFixed(3)}</b>
-                        </div>
-                        <div class="data-row"><span>Current Delta:</span> <span class="${cYes}">${(dYes>0?'+':'')+dYes.toFixed(2)+'%'}</span></div>
-                        <div class="data-row"><span>Live Value:</span> <b class="val-gold">$${valYes.toFixed(2)}</b></div>
-                        
-                        <div class="data-row" style="margin-top:12px; font-size:12px;"><span>Conviction Proximity:</span> <b>${cYesData.text}</b></div>
-                        <div class="conviction-bar">
-                            <div class="conviction-fill yes" style="width: ${cYesData.pct}%"></div>
-                            <div class="marker" style="left: 86%" title="Tier 1 (0.86)"></div>
-                            <div class="marker t2" style="left: 95%" title="Tier 2 (0.95)"></div>
-                        </div>
-                        
-                        <div class="svg-container">${renderSparkline(m.history_yes, '#38BDF8', (m.t1_side==='YES'?m.t1_price:0), (m.t2_side==='YES'?m.t2_price:0))}</div>
-                    </div>
-                    <div class="leg-col">
-                        <div class="leg-title">NO LEG MONITOR</div>
-                        <div class="data-row"><span>Shares Acquired:</span> <b>${m.no_shares.toFixed(2)}</b></div>
-                        <div class="data-row"><span>Effective Entry (w/ fees):</span> <b>$${m.no_entry > 0 ? (m.no_entry*1.018).toFixed(3) : '0.000'}</b></div>
-                        <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;">
-                            <span>Live Ticker: ${noBadge}</span> 
-                            <b>$${m.no_ask.toFixed(3)}</b>
-                        </div>
-                        <div class="data-row"><span>Current Delta:</span> <span class="${cNo}">${(dNo>0?'+':'')+dNo.toFixed(2)+'%'}</span></div>
-                        <div class="data-row"><span>Live Value:</span> <b class="val-gold">$${valNo.toFixed(2)}</b></div>
-                        
-                        <div class="data-row" style="margin-top:12px; font-size:12px;"><span>Conviction Proximity:</span> <b>${cNoData.text}</b></div>
-                        <div class="conviction-bar">
-                            <div class="conviction-fill no" style="width: ${cNoData.pct}%"></div>
-                            <div class="marker" style="left: 86%" title="Tier 1 (0.86)"></div>
-                            <div class="marker t2" style="left: 95%" title="Tier 2 (0.95)"></div>
-                        </div>
-                        
-                        <div class="svg-container">${renderSparkline(m.history_no, '#94A3B8', (m.t1_side==='NO'?m.t1_price:0), (m.t2_side==='NO'?m.t2_price:0))}</div>
-                    </div>
-                </div>
-            </div>`;
-        });
-        
-        document.getElementById('v-active').textContent = activeCount;
-        if(htmlCards) document.getElementById('active-cards').innerHTML = htmlCards;
-        else document.getElementById('active-cards').innerHTML = '<div style="text-align:center; padding:30px; color:var(--text-light); font-weight: bold;">No Active Dual-Leg Positions...</div>';
-        
-        document.getElementById('obs-queue').innerHTML = htmlQueue || 'No upcoming markets in window.';
-
-        let logHtml = '';
-        s.history.reverse().forEach(h => {
-            const pnlStr = h.pnl !== 0.0 ? (h.pnl > 0 ? `+${h.pnl.toFixed(2)}` : h.pnl.toFixed(2)) : '--';
-            
-            let t1Str = '--';
-            if (h.t1_side && h.t1_side !== "") t1Str = `<span class="val-gold">${h.t1_side}</span> @ $${h.t1_price.toFixed(3)}<br><span style="font-size:10px;color:var(--text-light);">${h.t1_time}</span>`;
-            else if (h.t1_guarded) t1Str = `<span class="guard-static">🛡 GUARDED (${h.t1_guard_ratio.toFixed(1)}x)</span>`;
-
-            let t2Str = '--';
-            if (h.t2_side && h.t2_side !== "") t2Str = `<span class="val-pink">${h.t2_side}</span> @ $${h.t2_price.toFixed(3)}<br><span style="font-size:10px;color:var(--text-light);">${h.t2_time}</span>`;
-            else if (h.t2_guarded) t2Str = `<span class="guard-static">🛡 GUARDED (${h.t2_guard_ratio.toFixed(1)}x)</span>`;
-            
-            logHtml += `<tr>
-                <td style="color:var(--text-light); font-family:var(--font-sans); font-size: 13px;">${h.time}</td>
-                <td>${h.slug}</td>
-                <td>${h.yes_entry > 0 ? '$'+h.yes_entry.toFixed(3) : '--'}</td>
-                <td>${h.no_entry > 0 ? '$'+h.no_entry.toFixed(3) : '--'}</td>
-                <td style="line-height:1.4;">${t1Str}</td>
-                <td style="line-height:1.4;">${t2Str}</td>
-                <td class="${h.pnl>0?'val-green':(h.pnl<0?'val-red':'')}">${pnlStr}</td>
-                <td><a href="https://polymarket.com/event/${h.slug}" target="_blank" class="btn-verify">VERIFY ↗</a></td>
-            </tr>`;
-        });
-        if(logHtml) document.getElementById('log-body').innerHTML = logHtml;
-
-    } catch(e) {}
-}, 500); 
-</script>
-</body>
-</html>
-"""
-
-# ─── API & SERVER (RAILWAY HEALTH-CHECK PROOF) ───
-class EmbeddedDashboard(http.server.BaseHTTPRequestHandler):
-    def do_HEAD(self):
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html')
-        self.end_headers()
-
-    def do_GET(self):
-        if self.path in ["/health", "/healthz", "/ping"]:
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"OK")
-            return
-            
-        if self.path == "/favicon.ico":
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"")
-            return
-
-        if self.path == "/api/status":
-            now = get_synced_time()
-            m_data, history_data = [], []
-            for m in sorted(GLOBAL_STATE.markets.values(), key=lambda x: x.end_ts):
-                ttr = int(m.end_ts - now)
-                if m.state == MarketState.CLOSED and m.close_time != "" and getattr(m, 'expired_processed', False):
-                    history_data.append({
-                        "time": m.close_time, "slug": m.slug, "reason": m.close_reason,
-                        "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price, "pnl": m.realized_pnl,
-                        "t1_side": m.t1_side, "t1_price": m.t1_price, "t1_time": m.t1_time,
-                        "t1_guarded": m.t1_guarded, "t1_guard_ratio": m.t1_guard_ratio,
-                        "t2_side": m.t2_side, "t2_price": m.t2_price, "t2_time": m.t2_time,
-                        "t2_guarded": m.t2_guarded, "t2_guard_ratio": m.t2_guard_ratio
-                    })
-                else:
-                    yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
-                    y_b_v = yb.get_local_vols(yb.bid, "bid", 0.10) if yb else 0
-                    y_a_v = yb.get_local_vols(yb.ask, "ask", 0.10) if yb else 0
-                    n_b_v = nb.get_local_vols(nb.bid, "bid", 0.10) if nb else 0
-                    n_a_v = nb.get_local_vols(nb.ask, "ask", 0.10) if nb else 0
-                    m_data.append({
-                        "slug": m.slug, "state": m.state, "ttr_s": ttr,
-                        "target_price": getattr(m, 'pending_target_price', 0.0),
-                        "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price,
-                        "yes_shares": m.yes_shares, "no_shares": m.no_shares,
-                        "yes_ask": yb.ask if yb else 0.0, "no_ask": nb.ask if nb else 0.0,
-                        "yes_b_vol": y_b_v, "yes_a_vol": y_a_v,
-                        "no_b_vol": n_b_v, "no_a_vol": n_a_v,
-                        "guard_active_yes": m.guard_active_yes,
-                        "guard_active_no": m.guard_active_no,
-                        "history_yes": m.history_yes[-30:], "history_no": m.history_no[-30:],
-                        "t1_side": m.t1_side, "t1_price": m.t1_price, 
-                        "t2_side": m.t2_side, "t2_price": m.t2_price
-                    })
-            payload = {
-                "uptime_s": int(time.time() - SYSTEM_BOOT_TIME),
-                "time_offset": GLOBAL_STATE.time_offset,
-                "ws_connected": GLOBAL_STATE.ws_connected, "pnl": GLOBAL_STATE.total_pnl,
-                "total_trades_count": GLOBAL_STATE.total_trades, "losers": GLOBAL_STATE.sold_losers,
-                "catastrophes": GLOBAL_STATE.catastrophes,
-                "markets": m_data, "history": history_data[-15:]
-            }
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(payload).encode('utf-8'))
-            return
-            
-        if self.path in ["/api/dl_trades", "/api/dl_snaps", "/api/dl_telemetry"]:
-            filename = "trades_full.csv"
-            if self.path == "/api/dl_snaps": filename = "snapshot_live.csv"
-            elif self.path == "/api/dl_telemetry": filename = "telemetry_shadow.csv"
-            self.send_response(200)
-            self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
-            self.send_header('Content-Type', 'text/csv')
-            self.end_headers()
-            try:
-                with open(filename, "rb") as f:
-                    self.wfile.write(f.read())
-            except Exception: pass
-            return
-
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
-        self.end_headers()
-        self.wfile.write(DASHBOARD_HTML.encode('utf-8'))
-
-    def do_POST(self):
-        if self.path == "/api/delete_logs":
-            if os.path.exists("trades_full.csv"): os.remove("trades_full.csv")
-            if os.path.exists("snapshot_live.csv"): os.remove("snapshot_live.csv")
-            if os.path.exists("telemetry_shadow.csv"): os.remove("telemetry_shadow.csv")
-            init_csv()
-            self.send_response(200)
-            self.end_headers()
-
-    def log_message(self, format, *args): 
-        pass
-
-class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-# ─── CORE STRATEGY EVALUATION ENGINE ───
-def check_guard_imbalance(book: OrderBook) -> float:
+# ─── ENGINE ───
+def check_imbalance(book: OrderBook) -> float:
     if not book: return 0.0
-    b_vol = book.get_local_vols(book.bid, "bid", 0.10)
-    a_vol = book.get_local_vols(book.ask, "ask", 0.10)
+    b_vol, a_vol = book.get_local_vols(book.bid, "bid"), book.get_local_vols(book.ask, "ask")
     if a_vol == 0 and b_vol > 0: return 999.0 
     if a_vol == 0: return 0.0
     ratio = b_vol / a_vol
@@ -579,10 +160,8 @@ def check_guard_imbalance(book: OrderBook) -> float:
 
 def evaluate_market(mdm: MarketData, now: float):
     if getattr(mdm, 'expired_processed', False): return
-    
     ttr = int(mdm.end_ts - now)
     
-    # 1. Garbage Collector
     if ttr < 0:
         mdm.expired_processed = True
         mdm.state = MarketState.CLOSED
@@ -590,29 +169,21 @@ def evaluate_market(mdm: MarketData, now: float):
 
     yb, nb = GLOBAL_STATE.books.get(mdm.yes_token), GLOBAL_STATE.books.get(mdm.no_token)
     
-    # 2. Buzzer Killer
     if ttr <= 1:
         mdm.expired_processed = True
         if mdm.state != MarketState.CLOSED:
             mdm.state = MarketState.CLOSED
             if not yb or not nb: return
             winner_side = "YES" if yb.bid > nb.bid else "NO"
-            
-            if (mdm.t1_side == winner_side) or (mdm.t2_side == winner_side):
-                GLOBAL_STATE.catastrophes += 1
-                
-            cost_basis = mdm.total_fees_paid
-            if mdm.yes_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
-            if mdm.no_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
-            winner_shares = mdm.yes_shares if winner_side == "YES" else mdm.no_shares 
-            calc_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
-            execute_trade(mdm, winner_side, 0.00, "EXPIRED_AT_BUZZER", 0.0, 0.0, ttr, calc_pnl)
+            if mdm.t1_side == winner_side or mdm.t2_side == winner_side: GLOBAL_STATE.catastrophes += 1
+            cost_basis = mdm.total_fees_paid + (BASE_CAPITAL_PER_LEG * (1 if mdm.yes_shares == 0 or mdm.no_shares == 0 else 2))
+            win_shares = mdm.yes_shares if winner_side == "YES" else mdm.no_shares 
+            execute_trade(mdm, winner_side, 0.0, "EXPIRED_AT_BUZZER", 0.0, 0.0, ttr, (win_shares * 1.0) + mdm.salvage_revenue - cost_basis)
         return
         
     if not yb or not nb: return
     if mdm.state == MarketState.CLOSED: return
     
-    # 3. Subtantiated Maker Logic
     if ttr > ENTRY_CUTOFF_TTR:
         if mdm.state == MarketState.WATCH and ttr >= PHASE_1_TTR_START:
             mdm.state = MarketState.PENDING_MAKER
@@ -624,53 +195,43 @@ def evaluate_market(mdm: MarketData, now: float):
                 mdm.pending_target_price = 0.50
                 print(f"[Entry Engine] {mdm.slug} | Target un-filled. Stepping up to $0.50 Maker Order.", flush=True)
 
-            if yb.ask <= mdm.pending_target_price and yb.ask > 0 and mdm.yes_shares == 0:
+            if 0 < yb.ask <= mdm.pending_target_price and mdm.yes_shares == 0:
                 mdm.yes_entry_price = mdm.pending_target_price
                 mdm.yes_shares = BASE_CAPITAL_PER_LEG / mdm.yes_entry_price
                 execute_trade(mdm, "YES", mdm.yes_entry_price, "MAKER_FILL_LEG_1", mdm.yes_shares, 0.0, ttr)
 
-            if nb.ask <= mdm.pending_target_price and nb.ask > 0 and mdm.no_shares == 0:
+            if 0 < nb.ask <= mdm.pending_target_price and mdm.no_shares == 0:
                 mdm.no_entry_price = mdm.pending_target_price
                 mdm.no_shares = BASE_CAPITAL_PER_LEG / mdm.no_entry_price
                 execute_trade(mdm, "NO", mdm.no_entry_price, "MAKER_FILL_LEG_2", mdm.no_shares, 0.0, ttr)
 
-            if mdm.yes_shares > 0 and mdm.no_shares > 0:
-                mdm.state = MarketState.BOTH
-            elif mdm.yes_shares > 0:
-                mdm.state = MarketState.WAITING_NO
-            elif mdm.no_shares > 0:
-                mdm.state = MarketState.WAITING_YES
+            if mdm.yes_shares > 0 and mdm.no_shares > 0: mdm.state = MarketState.BOTH
+            elif mdm.yes_shares > 0: mdm.state = MarketState.WAITING_NO
+            elif mdm.no_shares > 0: mdm.state = MarketState.WAITING_YES
 
-        # Telemetry Imbalance Trigger (Fallback)
         if mdm.state in [MarketState.WAITING_NO, MarketState.WAITING_YES] and ttr <= HEDGE_DEADLINE_TTR:
             active_book = nb if mdm.state == MarketState.WAITING_NO else yb
-            imbalance = check_guard_imbalance(active_book)
-            if imbalance > 0:
+            if check_imbalance(active_book) > 0:
                 side = "NO" if mdm.state == MarketState.WAITING_NO else "YES"
                 price = nb.ask if side == "NO" else yb.ask
                 if 0 < price <= 0.51:
                     fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
                     mdm.total_fees_paid += fee
-                    if side == "NO":
-                        mdm.no_entry_price, mdm.no_shares = price, BASE_CAPITAL_PER_LEG / price
-                    else:
-                        mdm.yes_entry_price, mdm.yes_shares = price, BASE_CAPITAL_PER_LEG / price
+                    if side == "NO": mdm.no_entry_price, mdm.no_shares = price, BASE_CAPITAL_PER_LEG / price
+                    else: mdm.yes_entry_price, mdm.yes_shares = price, BASE_CAPITAL_PER_LEG / price
                     mdm.state = MarketState.BOTH
                     execute_trade(mdm, side, price, "TAKER_HEDGE_PROTECTION", BASE_CAPITAL_PER_LEG / price, fee, ttr)
 
-    # 4. Flawless v6.2 Exits
     if mdm.state == MarketState.BOTH:
         mdm.guard_active_yes = mdm.guard_active_no = False
-        if yb.bid > nb.bid: winner_bid, loser_side, loser_bid, loser_shares, loser_book = yb.bid, "NO", nb.bid, mdm.no_shares, nb
-        else: winner_bid, loser_side, loser_bid, loser_shares, loser_book = nb.bid, "YES", yb.bid, mdm.yes_shares, yb
+        winner_bid, loser_side, loser_bid, loser_shares, loser_book = (yb.bid, "NO", nb.bid, mdm.no_shares, nb) if yb.bid > nb.bid else (nb.bid, "YES", yb.bid, mdm.yes_shares, yb)
             
         if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
-            guard_ratio = check_guard_imbalance(loser_book)
+            guard_ratio = check_imbalance(loser_book)
             if guard_ratio > 0:
                 if loser_side == "YES": mdm.guard_active_yes = True
                 else: mdm.guard_active_no = True
-                if not mdm.t1_guarded:
-                    mdm.t1_guarded, mdm.t1_guard_ratio = True, guard_ratio
+                mdm.t1_guarded, mdm.t1_guard_ratio = True, guard_ratio
             else:
                 mdm.t1_executed = True
                 shares_to_sell = loser_shares * 0.50
@@ -681,12 +242,11 @@ def evaluate_market(mdm: MarketData, now: float):
                 execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T1", shares_to_sell, fee, ttr)
             
         elif winner_bid >= SELL_LOSER_T2_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
-            guard_ratio = check_guard_imbalance(loser_book)
+            guard_ratio = check_imbalance(loser_book)
             if guard_ratio > 0:
                 if loser_side == "YES": mdm.guard_active_yes = True
                 else: mdm.guard_active_no = True
-                if not mdm.t2_guarded:
-                    mdm.t2_guarded, mdm.t2_guard_ratio = True, guard_ratio
+                mdm.t2_guarded, mdm.t2_guard_ratio = True, guard_ratio
             else:
                 mdm.state = MarketState.CLOSED
                 shares_to_sell = loser_shares * 0.99 
@@ -694,13 +254,11 @@ def evaluate_market(mdm: MarketData, now: float):
                 mdm.total_fees_paid += fee
                 execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T2", shares_to_sell, fee, ttr)
                 cost_basis = (BASE_CAPITAL_PER_LEG * 2) + mdm.total_fees_paid
-                winner_shares = mdm.yes_shares if loser_side == "NO" else mdm.no_shares
-                final_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
-                execute_trade(mdm, "CLOSED", winner_bid, "CLOSED_T2_RESOLVED", 0.0, 0.0, ttr, final_pnl)
+                win_shares = mdm.yes_shares if loser_side == "NO" else mdm.no_shares
+                execute_trade(mdm, "CLOSED", winner_bid, "CLOSED_T2_RESOLVED", 0.0, 0.0, ttr, (win_shares * 1.0) + mdm.salvage_revenue - cost_basis)
 
 # ─── THREAD LOOPS ───
 def tick_loop():
-    print("[inf] Tick Loop Active", flush=True)
     while GLOBAL_STATE.running:
         now = get_synced_time()
         for m in list(GLOBAL_STATE.markets.values()):
@@ -709,7 +267,6 @@ def tick_loop():
         time.sleep(0.05)
 
 def snapshot_loop():
-    print("[inf] Snapshot Loop Active", flush=True)
     while GLOBAL_STATE.running:
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         try:
@@ -729,7 +286,6 @@ def snapshot_loop():
         time.sleep(30)
 
 def telemetry_loop():
-    print("[inf] Telemetry Loop Active", flush=True)
     while GLOBAL_STATE.running:
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         try:
@@ -740,20 +296,32 @@ def telemetry_loop():
                     ttr = int(m.end_ts - get_synced_time())
                     if ttr < 0: continue
                     yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
-                    if yb and yb.bids and yb.asks:
-                        y_b_vol, y_a_vol = yb.get_local_vols(yb.bid, "bid", 0.10), yb.get_local_vols(yb.ask, "ask", 0.10)
-                        r_y = y_b_vol / y_a_vol if y_a_vol > 0 else 999.0
-                        r_y_inv = y_a_vol / y_b_vol if y_b_vol > 0 else 999.0
-                        if r_y >= 2.0: writer.writerow([ts, m.slug, "YES", ttr, f"{yb.ask:.3f}", f"{y_b_vol:.0f}", f"{y_a_vol:.0f}", f"{r_y:.1f}", "BID_WALL"])
-                        elif r_y_inv >= 2.0: writer.writerow([ts, m.slug, "YES", ttr, f"{yb.ask:.3f}", f"{y_b_vol:.0f}", f"{y_a_vol:.0f}", f"{r_y_inv:.1f}", "ASK_WALL"])
-                    if nb and nb.bids and nb.asks:
-                        n_b_vol, n_a_vol = nb.get_local_vols(nb.bid, "bid", 0.10), nb.get_local_vols(nb.ask, "ask", 0.10)
-                        r_n = n_b_vol / n_a_vol if n_a_vol > 0 else 999.0
-                        r_n_inv = n_a_vol / n_b_vol if n_b_vol > 0 else 999.0
-                        if r_n >= 2.0: writer.writerow([ts, m.slug, "NO", ttr, f"{nb.ask:.3f}", f"{n_b_vol:.0f}", f"{n_a_vol:.0f}", f"{r_n:.1f}", "BID_WALL"])
-                        elif r_n_inv >= 2.0: writer.writerow([ts, m.slug, "NO", ttr, f"{nb.ask:.3f}", f"{n_b_vol:.0f}", f"{n_a_vol:.0f}", f"{r_n_inv:.1f}", "ASK_WALL"])
+                    for book, side, tk in [(yb, "YES", m.yes_token), (nb, "NO", m.no_token)]:
+                        if book and book.bids and book.asks:
+                            b_vol, a_vol = book.get_local_vols(book.bid, "bid"), book.get_local_vols(book.ask, "ask")
+                            r = b_vol / a_vol if a_vol > 0 else 999.0
+                            r_inv = a_vol / b_vol if b_vol > 0 else 999.0
+                            if r >= 2.0: writer.writerow([ts, m.slug, side, ttr, f"{book.ask:.3f}", f"{b_vol:.0f}", f"{a_vol:.0f}", f"{r:.1f}", "BID_WALL"])
+                            elif r_inv >= 2.0: writer.writerow([ts, m.slug, side, ttr, f"{book.ask:.3f}", f"{b_vol:.0f}", f"{a_vol:.0f}", f"{r_inv:.1f}", "ASK_WALL"])
         except Exception: pass
         time.sleep(5)
+
+def hybrid_rest_fallback():
+    while GLOBAL_STATE.running:
+        for m in list(GLOBAL_STATE.markets.values()):
+            if m.state == MarketState.CLOSED: continue
+            for tk in [m.yes_token, m.no_token]:
+                book = GLOBAL_STATE.books.get(tk)
+                if book and time.time() - book.last_update > 10.0:
+                    try:
+                        res = requests.get(f"https://clob.polymarket.com/book?token_id={tk}", timeout=2)
+                        if res.status_code == 200:
+                            data = res.json()
+                            book.bids = {float(b["price"]): float(b["size"]) for b in data.get("bids", [])}
+                            book.asks = {float(a["price"]): float(a["size"]) for a in data.get("asks", [])}
+                            book.last_update = time.time()
+                    except Exception: pass
+        time.sleep(2)
 
 def discovery_thread():
     print("[inf] Discovery Loop Active", flush=True)
@@ -773,53 +341,49 @@ def discovery_thread():
                         end_ts = datetime.fromisoformat(m_info["endDate"].replace("Z", "+00:00")).timestamp()
                         if end_ts > get_synced_time() + 120:
                             tks = json.loads(m_info["clobTokenIds"])
-                            outcomes = json.loads(m_info["outcomes"])
-                            y_idx = 0 if outcomes[0].lower() in ["yes", "up"] else 1
-                            
+                            y_idx = 0 if json.loads(m_info["outcomes"])[0].lower() in ["yes", "up"] else 1
                             yes_tk, no_tk = tks[y_idx], tks[1-y_idx]
                             GLOBAL_STATE.markets[cid] = MarketData(cid, slug, yes_tk, no_tk, end_ts)
+                            GLOBAL_STATE.books[yes_tk] = OrderBook()
+                            GLOBAL_STATE.books[no_tk] = OrderBook()
                             GLOBAL_STATE.subscribed_tokens.add(yes_tk)
                             GLOBAL_STATE.subscribed_tokens.add(no_tk)
                             print(f"[Discovery] Tracking: {slug}", flush=True)
                             new_markets = True
-            except Exception: pass
+            except Exception as e: print(f"[Discovery Warning] {slug} fetch failed: {e}", flush=True)
+            time.sleep(0.5) 
+            
         if new_markets and GLOBAL_STATE.ws_handle:
             try: GLOBAL_STATE.ws_handle.close()
             except Exception: pass
-        time.sleep(30)
+        time.sleep(15)
 
 def polymarket_ws_thread():
     print("[inf] WS Manager Active", flush=True)
     def on_message(ws, msg):
         try:
-            parsed_msg = json.loads(msg)
-            event_list = parsed_msg if isinstance(parsed_msg, list) else [parsed_msg]
-            for event in event_list:
-                if not isinstance(event, dict): continue
+            parsed = json.loads(msg)
+            for event in (parsed if isinstance(parsed, list) else [parsed]):
                 aid = event.get("asset_id") or event.get("market")
-                if not aid: continue
+                if not aid or aid not in GLOBAL_STATE.books: continue
+                book = GLOBAL_STATE.books[aid]
+                book.last_update = time.time()
                 if event.get("event_type") == "book":
-                    book = GLOBAL_STATE.books.setdefault(aid, OrderBook())
                     book.bids = {float(b["price"]): float(b["size"]) for b in event.get("bids", [])}
                     book.asks = {float(a["price"]): float(a["size"]) for a in event.get("asks", [])}
                 elif event.get("event_type") == "price_change":
-                    book = GLOBAL_STATE.books.get(aid)
-                    if not book: continue
                     for ch in event.get("changes", []):
                         s, p, sz = ch.get("side", ""), float(ch.get("price", 0)), float(ch.get("size", 0))
-                        if s == "BUY":
-                            if sz == 0: book.bids.pop(p, None)
-                            else: book.bids[p] = sz
-                        elif s == "SELL":
-                            if sz == 0: book.asks.pop(p, None)
-                            else: book.asks[p] = sz
+                        target = book.bids if s == "BUY" else book.asks
+                        if sz == 0: target.pop(p, None)
+                        else: target[p] = sz
         except Exception: pass
 
     def on_open(ws):
         GLOBAL_STATE.ws_connected = True
         print("[inf] WS Connected to Gamma", flush=True)
         if GLOBAL_STATE.subscribed_tokens:
-            try: ws.send(json.dumps({"type": "Market", "assets_ids": list(GLOBAL_STATE.subscribed_tokens)}))
+            try: ws.send(json.dumps({"type": "market", "assets_ids": list(GLOBAL_STATE.subscribed_tokens)}))
             except Exception: pass
 
     while GLOBAL_STATE.running:
@@ -828,27 +392,194 @@ def polymarket_ws_thread():
             GLOBAL_STATE.ws_handle = ws
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception: pass
-        GLOBAL_STATE.ws_handle = None
-        GLOBAL_STATE.ws_connected = False
+        GLOBAL_STATE.ws_handle, GLOBAL_STATE.ws_connected = None, False
         time.sleep(2)
+
+# ─── DASHBOARD HTML & SERVER ───
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BSS Maker Analysis Dashboard v6.2</title>
+<style>
+    :root { --bg-main: #0B1120; --bg-panel: #1E293B; --header-bg: #0F172A; --header-text: #F8FAFC; --sub-header-bg: #0F172A; --text-navy: #F8FAFC; --text-light: #94A3B8; --border-color: #334155; --val-green: #34D399; --val-red: #F87171; --val-yellow: #FCD34D; --val-pink: #F472B6; --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
+    .header-panel { background: var(--header-bg); border: 1px solid var(--border-color); display: flex; flex-direction: column; text-align: center; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border-radius: 6px; overflow: hidden; }
+    .brand-title { font-size: 22px; font-weight: bold; color: var(--header-text); padding: 14px 0; border-bottom: 1px solid var(--border-color); }
+    .status-tags { font-size: 12px; font-weight: normal; margin-left: 15px; color: var(--text-light); }
+    .vitals-row { display: flex; background: var(--sub-header-bg); }
+    .vital-box { flex: 1; padding: 15px; border-right: 1px solid var(--border-color); text-align: center; }
+    .vital-box:last-child { border-right: none; }
+    .vital-label { font-size: 12px; font-weight: 700; text-transform: uppercase; margin-bottom: 8px; color: var(--text-light); letter-spacing: 0.5px; }
+    .vital-value { background: var(--bg-panel); font-size: 24px; font-weight: 800; padding: 8px; border-radius: 4px; border: 1px solid var(--border-color); font-family: monospace; }
+    .vital-value.green { color: var(--val-green); border-color: #064E3B; background: #065F46;}
+    .vital-value.red { color: var(--val-red); border-color: #7F1D1D; background: #991B1B;}
+    .sec-title { background: var(--header-bg); font-size: 15px; font-weight: bold; text-align: center; padding: 12px; margin-bottom: 15px; border-radius: 6px; border: 1px solid var(--border-color);}
+    .grid { display: grid; grid-template-columns: 1fr; gap: 20px; margin-bottom: 35px; }
+    .card { background: var(--bg-panel); border: 1px solid var(--border-color); box-shadow: 0 4px 6px rgba(0,0,0,0.3); border-radius: 6px; overflow: hidden;}
+    .card-header { background: var(--sub-header-bg); padding: 12px 20px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; font-weight: 800; font-size: 15px;}
+    .leg-container { display: flex; width: 100%; }
+    .leg-col { flex: 1; padding: 20px; border-right: 1px solid var(--border-color); }
+    .leg-col:last-child { border-right: none; }
+    .leg-title { font-size: 13px; font-weight: 800; text-align: center; margin-bottom: 15px; color: var(--text-light); }
+    .data-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; color: var(--text-light); }
+    .data-row b { color: var(--text-navy); font-family: monospace; font-size: 15px;}
+    .table-container { background: var(--bg-panel); border: 1px solid var(--border-color); margin-bottom: 35px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border-radius: 6px; overflow: hidden; }
+    table { width: 100%; border-collapse: collapse; text-align: left; }
+    th { background: var(--sub-header-bg); color: var(--text-light); font-size: 11px; font-weight: 800; text-transform: uppercase; padding: 12px; border-bottom: 1px solid var(--border-color); text-align: center;}
+    td { padding: 12px 10px; border-bottom: 1px solid var(--border-color); text-align: center; font-size: 13px; font-family: monospace; }
+    .queue-container { background: var(--bg-panel); border: 1px solid var(--border-color); padding: 20px; font-family: monospace; font-size: 13px; color: var(--text-light); line-height: 1.8; border-radius: 6px; }
+    .vault { display: flex; gap: 15px; background: var(--sub-header-bg); padding: 15px; border: 1px solid var(--border-color); align-items: center; justify-content: center; margin-bottom: 25px; border-radius: 6px;}
+    .btn-action { background: #1E293B; color: var(--text-navy); border: 1px solid var(--border-color); padding: 8px 18px; cursor: pointer; font-weight: 700; border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<div class="header-panel">
+    <div class="brand-title">BSS Maker Analysis Dashboard v6.2
+        <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
+        <span class="status-tags" id="ws-status">[WS: Checking...]</span>
+    </div>
+    <div class="vitals-row">
+        <div class="vital-box"><div class="vital-label">Total Realized P&L</div><div class="vital-value" id="v-pnl">$0.00</div></div>
+        <div class="vital-box"><div class="vital-label">Completed Trades</div><div class="vital-value" id="v-trades">0</div></div>
+        <div class="vital-box"><div class="vital-label">Active Slots</div><div class="vital-value" id="v-active">0</div></div>
+    </div>
+</div>
+
+<div class="sec-title">Active Market Dual-Leg Monitoring</div>
+<div class="grid" id="active-cards"><div style="text-align:center; padding:30px; color:var(--text-light); font-weight: bold;">Awaiting Entry Criteria...</div></div>
+
+<div class="sec-title">Consolidated Trade Lifecycle History</div>
+<div class="table-container">
+    <table>
+        <thead><tr><th>Time Closed</th><th>Market Slug</th><th>YES Entry</th><th>NO Entry</th><th>T1 Exit</th><th>T2 Exit</th><th>Net P&L</th></tr></thead>
+        <tbody id="log-body"><tr><td colspan="7" style="color: var(--text-light); padding: 20px;">No historical data available.</td></tr></tbody>
+    </table>
+</div>
+
+<div class="vault">
+    <span style="font-weight: 800; margin-right: 15px; color: var(--text-navy);">Data Vault:</span>
+    <button class="btn-action" onclick="window.location.href='/api/dl_trades'">Download Trades</button>
+    <button class="btn-action" onclick="window.location.href='/api/dl_snaps'">Download Snapshots</button>
+    <button class="btn-action" style="color: #FCD34D;" onclick="window.location.href='/api/dl_telemetry'">Download Telemetry</button>
+</div>
+
+<div class="sec-title">Observation Queue (Scouting & Maker Waiting)</div>
+<div class="queue-container" id="obs-queue">Scanning...</div>
+
+<script>
+setInterval(async () => {
+    try {
+        const r = await fetch('/api/status');
+        const s = await r.json();
+        
+        let up = s.uptime_s;
+        document.getElementById('bot-uptime').textContent = `[Uptime: ${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s]`;
+        document.getElementById('ws-status').textContent = s.ws_connected ? "[WS: CONNECTED]" : "[WS: DROPPED / REST FALLBACK]";
+        document.getElementById('ws-status').style.color = s.ws_connected ? "#34d399" : "#f87171";
+        
+        const pnlBox = document.getElementById('v-pnl');
+        pnlBox.textContent = (s.pnl >= 0 ? '+' : '') + '$' + s.pnl.toFixed(2);
+        pnlBox.className = "vital-value " + (s.pnl > 0 ? "green" : (s.pnl < 0 ? "red" : ""));
+        document.getElementById('v-trades').textContent = s.total_trades_count;
+        
+        let activeCount = 0; let htmlCards = ''; let htmlQueue = '';
+        s.markets.forEach(m => {
+            if (['WATCH', 'WAITING_NO', 'WAITING_YES', 'PENDING_MAKER'].includes(m.state)) {
+                htmlQueue += `[TTR: ${m.ttr_s}s] | ${m.slug} | Target: $${m.target_price.toFixed(2)} | YES Ask: $${m.yes_ask.toFixed(3)} | NO Ask: $${m.no_ask.toFixed(3)} | Status: ${m.state}<br>`;
+                return;
+            }
+            if (m.state === 'CLOSED') return;
+            activeCount++;
+            htmlCards += `<div class="card">
+                <div class="card-header"><span>${m.slug}</span><span>TTR: ${m.ttr_s}s</span></div>
+                <div class="leg-container">
+                    <div class="leg-col">
+                        <div class="leg-title">YES LEG</div>
+                        <div class="data-row"><span>Entry:</span> <b>$${m.yes_entry.toFixed(3)}</b></div>
+                        <div class="data-row"><span>Live Ask:</span> <b>$${m.yes_ask.toFixed(3)}</b></div>
+                    </div>
+                    <div class="leg-col">
+                        <div class="leg-title">NO LEG</div>
+                        <div class="data-row"><span>Entry:</span> <b>$${m.no_entry.toFixed(3)}</b></div>
+                        <div class="data-row"><span>Live Ask:</span> <b>$${m.no_ask.toFixed(3)}</b></div>
+                    </div>
+                </div>
+            </div>`;
+        });
+        
+        document.getElementById('v-active').textContent = activeCount;
+        if(htmlCards) document.getElementById('active-cards').innerHTML = htmlCards;
+        else document.getElementById('active-cards').innerHTML = '<div style="text-align:center; padding:30px; color:var(--text-light); font-weight: bold;">No Active Positions</div>';
+        document.getElementById('obs-queue').innerHTML = htmlQueue || 'No upcoming markets in window.';
+
+        let logHtml = '';
+        s.history.reverse().forEach(h => {
+            logHtml += `<tr>
+                <td style="color:var(--text-light);">${h.time}</td><td>${h.slug}</td>
+                <td>${h.yes_entry > 0 ? '$'+h.yes_entry.toFixed(3) : '--'}</td>
+                <td>${h.no_entry > 0 ? '$'+h.no_entry.toFixed(3) : '--'}</td>
+                <td>${h.t1_price > 0 ? h.t1_side + ' @ ' + h.t1_price.toFixed(3) : '--'}</td>
+                <td>${h.t2_price > 0 ? h.t2_side + ' @ ' + h.t2_price.toFixed(3) : '--'}</td>
+                <td style="color:${h.pnl>0?'var(--val-green)':'var(--val-red)'}">${h.pnl.toFixed(2)}</td>
+            </tr>`;
+        });
+        if(logHtml) document.getElementById('log-body').innerHTML = logHtml;
+
+    } catch(e) {}
+}, 500); 
+</script>
+</body></html>
+"""
+
+class EmbeddedDashboard(http.server.BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(200); self.end_headers()
+    def do_GET(self):
+        if self.path in ["/health", "/ping"]: self.send_response(200); self.end_headers(); self.wfile.write(b"OK"); return
+        if self.path == "/favicon.ico": self.send_response(200); self.end_headers(); return
+        if self.path == "/api/status":
+            now = get_synced_time()
+            m_data, history_data = [], []
+            for m in sorted(GLOBAL_STATE.markets.values(), key=lambda x: x.end_ts):
+                ttr = int(m.end_ts - now)
+                if m.state == MarketState.CLOSED and m.close_time != "":
+                    history_data.append({
+                        "time": m.close_time, "slug": m.slug, "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price, "pnl": m.realized_pnl,
+                        "t1_side": m.t1_side, "t1_price": m.t1_price, "t2_side": m.t2_side, "t2_price": m.t2_price
+                    })
+                else:
+                    yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
+                    m_data.append({
+                        "slug": m.slug, "state": m.state, "ttr_s": ttr, "target_price": m.pending_target_price,
+                        "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price,
+                        "yes_ask": yb.ask if yb else 0.0, "no_ask": nb.ask if nb else 0.0,
+                    })
+            self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers()
+            self.wfile.write(json.dumps({"uptime_s": int(time.time() - SYSTEM_BOOT_TIME), "ws_connected": GLOBAL_STATE.ws_connected, "pnl": GLOBAL_STATE.total_pnl, "total_trades_count": GLOBAL_STATE.total_trades, "markets": m_data, "history": history_data[-15:]}).encode())
+            return
+        if self.path in ["/api/dl_trades", "/api/dl_snaps", "/api/dl_telemetry"]:
+            fn = "trades_full.csv" if self.path == "/api/dl_trades" else ("snapshot_live.csv" if self.path == "/api/dl_snaps" else "telemetry_shadow.csv")
+            self.send_response(200); self.send_header('Content-Disposition', f'attachment; filename="{fn}"'); self.send_header('Content-Type', 'text/csv'); self.end_headers()
+            try:
+                with open(fn, "rb") as f: self.wfile.write(f.read())
+            except Exception: pass
+            return
+        self.send_response(200); self.send_header('Content-Type', 'text/html'); self.end_headers(); self.wfile.write(DASHBOARD_HTML.encode())
+    def log_message(self, format, *args): pass
+
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer): daemon_threads, allow_reuse_address = True, True
 
 if __name__ == "__main__":
     init_csv()
-    sync_time_with_api()
-    
-    # ⚠ ALL BACKGROUND THREADS RESTORED
     threading.Thread(target=discovery_thread, daemon=True).start()
     threading.Thread(target=polymarket_ws_thread, daemon=True).start()
+    threading.Thread(target=hybrid_rest_fallback, daemon=True).start()
     threading.Thread(target=tick_loop, daemon=True).start()
     threading.Thread(target=snapshot_loop, daemon=True).start()
     threading.Thread(target=telemetry_loop, daemon=True).start()
-    
-    # ⚠ EXPLICIT BIND TO 0.0.0.0 FOR CLOUD DEPLOYMENTS
     server = ThreadedHTTPServer(("0.0.0.0", PORT), EmbeddedDashboard)
-    print(f"[System Engine] High-fidelity runner listening on 0.0.0.0:{PORT}", flush=True)
-    print("[inf] All systems online.", flush=True)
-    
-    try: 
-        server.serve_forever()
-    except KeyboardInterrupt: 
-        GLOBAL_STATE.running = False
+    print(f"[System Engine] Listening on 0.0.0.0:{PORT}", flush=True)
+    try: server.serve_forever()
+    except KeyboardInterrupt: GLOBAL_STATE.running = False
