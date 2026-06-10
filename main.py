@@ -1,5 +1,5 @@
 """
-main.py — BSS Bot v6.3 (Mechanical Baseline)
+main.py — BSS Bot v6.4 (Mechanical Baseline + Live Spot Oracle)
 FULL PRODUCTION BUILD
 """
 import os
@@ -7,9 +7,8 @@ import sys
 import time
 import json
 import threading
-import signal
-import http.server
 import socketserver
+import http.server
 import requests
 import websocket
 import csv
@@ -85,6 +84,7 @@ class MarketData:
         self.close_reason = ""
         self.expired_processed = False
         
+        self.strike_price = 0.0
         self.guard_active_yes = False
         self.guard_active_no = False
         
@@ -128,10 +128,11 @@ class BotState:
         self.sold_losers = 0
         self.catastrophes = 0
         self.time_offset = 0.0
+        self.btc_live = 0.0
 
 GLOBAL_STATE = BotState()
 
-# ─── TIME SYNC (NTP) ───
+# ─── TIME & ORACLES ───
 def sync_time_with_api():
     try:
         start_ping = time.time()
@@ -149,6 +150,16 @@ def sync_time_with_api():
 
 def get_synced_time() -> float:
     return time.time() + GLOBAL_STATE.time_offset
+
+def btc_oracle_loop():
+    print("[inf] BTC Spot Oracle Active", flush=True)
+    while GLOBAL_STATE.running:
+        try:
+            res = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=3)
+            if res.status_code == 200:
+                GLOBAL_STATE.btc_live = float(res.json()["price"])
+        except Exception: pass
+        time.sleep(2)
 
 # ─── ASYNC CSV LOGGING SYSTEM ───
 def init_csv():
@@ -174,7 +185,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>BSS Analysis Dashboard v6.3</title>
+<title>BSS Analysis Dashboard v6.4</title>
 <style>
     :root { --bg-main: #0B1120; --bg-panel: #1E293B; --header-bg: #0F172A; --header-text: #F8FAFC; --sub-header-bg: #0F172A; --text-navy: #F8FAFC; --text-light: #94A3B8; --border-color: #334155; --val-green: #34D399; --val-red: #F87171; --val-yellow: #FCD34D; --val-pink: #F472B6; --font-sans: system-ui, -apple-system, sans-serif; }
     body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
@@ -189,15 +200,17 @@ DASHBOARD_HTML = r"""<!doctype html>
     .vital-value.green { color: var(--val-green); border-color: #064E3B; background: #065F46;}
     .vital-value.red { color: var(--val-red); border-color: #7F1D1D; background: #991B1B;}
     .sec-title { background: var(--header-bg); color: var(--header-text); font-size: 15px; font-weight: bold; text-align: center; padding: 12px; margin-bottom: 15px; border-radius: 6px; border: 1px solid var(--border-color);}
-    .grid { display: grid; grid-template-columns: 1fr; gap: 20px; margin-bottom: 35px; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 20px; margin-bottom: 15px; }
     .card { background: var(--bg-panel); border: 1px solid var(--border-color); display: flex; flex-direction: column; border-radius: 6px; overflow: hidden;}
     .card-header { background: var(--sub-header-bg); padding: 12px 20px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; font-weight: 800; font-size: 15px; align-items: center;}
+    .ref-bar { background:#0F172A; border-bottom:1px solid var(--border-color); padding:10px 20px; display:flex; justify-content:space-between; font-family:monospace; font-size:13px; }
     .leg-container { display: flex; width: 100%; }
     .leg-col { flex: 1; padding: 20px; border-right: 1px solid var(--border-color); }
     .leg-col:last-child { border-right: none; }
     .leg-title { font-size: 13px; font-weight: 800; text-align: center; margin-bottom: 15px; color: var(--text-light); text-transform: uppercase; }
     .data-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; color: var(--text-light); align-items: center;}
     .data-row b { color: var(--text-navy); font-family: monospace; font-size: 15px;}
+    .svg-container { height: 50px; margin-top: 15px; background: #0F172A; border: 1px solid var(--border-color); border-radius: 4px;}
     .val-green { color: var(--val-green); font-weight: 800; font-family: monospace; }
     .val-red { color: var(--val-red); font-weight: 800; font-family: monospace; }
     .val-gold { color: var(--val-yellow); font-weight: 800; font-family: monospace; }
@@ -206,18 +219,20 @@ DASHBOARD_HTML = r"""<!doctype html>
     table { width: 100%; border-collapse: collapse; text-align: left; }
     th { background: var(--sub-header-bg); color: var(--text-light); font-size: 11px; font-weight: 800; text-transform: uppercase; padding: 12px; border-bottom: 1px solid var(--border-color); text-align: center;}
     td { padding: 12px 10px; border-bottom: 1px solid var(--border-color); text-align: center; font-size: 13px; font-family: monospace; color: var(--text-navy);}
-    .queue-container { background: var(--bg-panel); border: 1px solid var(--border-color); padding: 20px; font-family: monospace; font-size: 13px; color: var(--text-light); line-height: 1.8; border-radius: 6px; }
+    .queue-container { background: var(--bg-panel); border: 1px solid var(--border-color); padding: 15px 20px; font-family: monospace; font-size: 13px; color: var(--text-light); line-height: 1.8; border-radius: 6px; margin-bottom:35px;}
     .vault { display: flex; gap: 15px; background: var(--sub-header-bg); padding: 15px; border: 1px solid var(--border-color); align-items: center; justify-content: center; margin-bottom: 25px; border-radius: 6px;}
     .btn-action { background: #1E293B; color: var(--text-navy); border: 1px solid var(--border-color); padding: 8px 18px; cursor: pointer; font-weight: 700; border-radius: 4px; transition: all 0.2s;}
     .btn-action:hover { background: #334155; }
     .btn-verify { color: #60A5FA; text-decoration: none; font-weight: 800; font-size: 12px;}
     .guard-static { background: #1E3A8A; color: #DBEAFE; padding: 3px 6px; border-radius: 3px; font-size: 11px; font-weight: 800; border: 1px solid #3B82F6;}
+    .bg-market-row { display: flex; justify-content: space-between; padding: 8px 15px; border-bottom: 1px solid var(--border-color); font-family: monospace; }
+    .bg-market-row:last-child { border-bottom: none; }
 </style>
 </head>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v6.3
+    <div class="brand-title">BSS Bot Analysis Dashboard v6.4
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
@@ -228,8 +243,11 @@ DASHBOARD_HTML = r"""<!doctype html>
     </div>
 </div>
 
-<div class="sec-title">Active Market Dual-Leg Monitoring</div>
+<div class="sec-title">Execution Focus (Primary Market)</div>
 <div class="grid" id="active-cards"><div style="text-align:center; padding:30px; color:var(--text-light);">Awaiting Data...</div></div>
+
+<div class="sec-title">Background Active & Scouting Queue</div>
+<div class="queue-container" id="obs-queue">Scanning...</div>
 
 <div class="sec-title">Consolidated Trade Lifecycle History</div>
 <div class="table-container">
@@ -247,10 +265,32 @@ DASHBOARD_HTML = r"""<!doctype html>
     <button class="btn-action" style="color: #FCA5A5; margin-left: auto; border-color: #7F1D1D;" onclick="deleteFiles()">⚠ Wipe Logs</button>
 </div>
 
-<div class="sec-title">Observation Queue</div>
-<div class="queue-container" id="obs-queue">Scanning...</div>
-
 <script>
+function renderSparkline(history, color, t1_price, t2_price) {
+    if(!history || history.length < 2) return '';
+    const min = Math.min(...history), max = Math.max(...history);
+    const range = (max - min) || 0.01;
+    const pts = history.map((val, i) => {
+        const x = (i / (history.length - 1)) * 100;
+        const y = 100 - (((val - min) / range) * 100);
+        return `${x},${y}`;
+    }).join(' ');
+    
+    let svg = `<polyline fill="none" stroke="${color}" stroke-width="2.5" points="${pts}" />`;
+    if (t1_price > 0) {
+        let yT1 = 100 - (((t1_price - min) / range) * 100);
+        yT1 = Math.max(5, Math.min(95, yT1)); 
+        svg += `<circle cx="80" cy="${yT1}" r="4" fill="var(--val-yellow)" stroke="#0B1120" stroke-width="1.5" />`;
+    }
+    return `<svg width="100%" height="100%" viewBox="0 -10 100 120" preserveAspectRatio="none">${svg}</svg>`;
+}
+
+function getImbalanceBadge(bidV, askV) {
+    if (askV > 0 && bidV >= askV * 2.5) return `<span style="background:var(--val-green); color:#064E3B; padding:2px 6px; border-radius:3px; font-size:10px; font-weight:800; margin-left:8px;">⚠ BID WALL</span>`;
+    else if (bidV > 0 && askV >= bidV * 2.5) return `<span style="background:var(--val-red); color:#fff; padding:2px 6px; border-radius:3px; font-size:10px; font-weight:800; margin-left:8px;">⚠ ASK WALL</span>`;
+    return '';
+}
+
 async function deleteFiles() {
     if(confirm("WARNING: This will permanently delete all logged CSV data on Railway. Continue?")) {
         await fetch('/api/delete_logs', {method: 'POST'});
@@ -272,61 +312,104 @@ setInterval(async () => {
         pnlBox.textContent = (s.pnl >= 0 ? '+' : '') + '$' + s.pnl.toFixed(2);
         pnlBox.className = "vital-value " + (s.pnl > 0 ? "green" : (s.pnl < 0 ? "red" : ""));
         
-        document.getElementById('v-trades').textContent = s.total_trades_count;
+        let activeMarkets = s.markets.filter(m => m.state === 'BOTH' && m.ttr_s > 0);
+        let otherMarkets = s.markets.filter(m => m.state !== 'BOTH' && m.state !== 'CLOSED' && m.ttr_s > 0);
         
-        let activeCount = 0;
+        document.getElementById('v-trades').textContent = s.total_trades_count;
+        document.getElementById('v-active').textContent = activeMarkets.length;
+        
         let htmlCards = '';
         let htmlQueue = '';
         
-        s.markets.forEach(m => {
-            if (m.state === 'WATCH' || m.state === 'WAITING_NO' || m.state === 'WAITING_YES') {
-                htmlQueue += `[TTR: ${m.ttr_s}s] | ${m.slug} | YES: $${m.yes_ask.toFixed(3)} | NO: $${m.no_ask.toFixed(3)} | State: ${m.state}<br>`;
-                return;
-            }
-            if (m.state === 'CLOSED' && m.ttr_s <= 0) return;
-            activeCount++;
+        if (activeMarkets.length > 0) {
+            // SINGLE MARKET FOCUS: Only render the primary card for the closest expiration
+            let primary = activeMarkets[0]; 
             
-            let valYes = m.yes_shares * m.yes_ask;
-            let valNo = m.no_shares * m.no_ask;
+            let valYes = primary.yes_shares * primary.yes_ask;
+            let valNo = primary.no_shares * primary.no_ask;
+            let yesBadge = getImbalanceBadge(primary.yes_b_vol, primary.yes_a_vol);
+            let noBadge = getImbalanceBadge(primary.no_b_vol, primary.no_a_vol);
 
-            htmlCards += `<div class="card">
+            let strikeText = primary.strike > 0 ? '$' + primary.strike.toFixed(2) : 'Awaiting 5m Mark';
+            let liveText = primary.live_btc > 0 ? '$' + primary.live_btc.toFixed(2) : 'Loading...';
+            let spotDeltaStr = '<span style="color:var(--text-light)">--</span>';
+            if (primary.strike > 0 && primary.live_btc > 0) {
+                let diff = primary.live_btc - primary.strike;
+                let colorClass = diff >= 0 ? 'val-green' : 'val-red';
+                let sign = diff >= 0 ? '+$' : '-$';
+                spotDeltaStr = `<span class="${colorClass}">${sign}${Math.abs(diff).toFixed(2)}</span>`;
+            }
+
+            htmlCards = `<div class="card">
                 <div class="card-header">
-                    <span>${m.slug}</span>
-                    <span style="color:var(--text-light);">TTR: <span style="color:var(--text-navy);">${m.ttr_s}s</span></span>
+                    <span>${primary.slug}</span>
+                    <span style="color:var(--text-light);">TTR: <span style="color:var(--text-navy);">${primary.ttr_s}s</span></span>
+                </div>
+                <div class="ref-bar">
+                    <div><span style="color:var(--text-light)">Ref Strike:</span> <b style="color:var(--text-navy)">${strikeText}</b></div>
+                    <div><span style="color:var(--text-light)">Live Spot:</span> <b style="color:var(--text-navy)">${liveText}</b></div>
+                    <div><span style="color:var(--text-light)">Distance:</span> <b>${spotDeltaStr}</b></div>
                 </div>
                 <div class="leg-container">
                     <div class="leg-col">
                         <div class="leg-title">YES LEG</div>
-                        <div class="data-row"><span>Shares:</span> <b>${m.yes_shares.toFixed(2)}</b></div>
-                        <div class="data-row"><span>Entry:</span> <b>$${m.yes_entry > 0 ? m.yes_entry.toFixed(3) : '0.000'}</b></div>
-                        <div class="data-row"><span>Live Ask:</span> <b>$${m.yes_ask.toFixed(3)}</b></div>
+                        <div class="data-row"><span>Shares:</span> <b>${primary.yes_shares.toFixed(2)}</b></div>
+                        <div class="data-row"><span>Entry:</span> <b>$${primary.yes_entry > 0 ? primary.yes_entry.toFixed(3) : '0.000'}</b></div>
+                        <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;">
+                            <span>Live Ask: ${yesBadge}</span> <b>$${primary.yes_ask.toFixed(3)}</b>
+                        </div>
                         <div class="data-row"><span>Value:</span> <b class="val-gold">$${valYes.toFixed(2)}</b></div>
+                        <div class="svg-container">${renderSparkline(primary.history_yes, '#38BDF8', primary.t1_price, 0)}</div>
                     </div>
                     <div class="leg-col">
                         <div class="leg-title">NO LEG</div>
-                        <div class="data-row"><span>Shares:</span> <b>${m.no_shares.toFixed(2)}</b></div>
-                        <div class="data-row"><span>Entry:</span> <b>$${m.no_entry > 0 ? m.no_entry.toFixed(3) : '0.000'}</b></div>
-                        <div class="data-row"><span>Live Ask:</span> <b>$${m.no_ask.toFixed(3)}</b></div>
+                        <div class="data-row"><span>Shares:</span> <b>${primary.no_shares.toFixed(2)}</b></div>
+                        <div class="data-row"><span>Entry:</span> <b>$${primary.no_entry > 0 ? primary.no_entry.toFixed(3) : '0.000'}</b></div>
+                        <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;">
+                            <span>Live Ask: ${noBadge}</span> <b>$${primary.no_ask.toFixed(3)}</b>
+                        </div>
                         <div class="data-row"><span>Value:</span> <b class="val-gold">$${valNo.toFixed(2)}</b></div>
+                        <div class="svg-container">${renderSparkline(primary.history_no, '#94A3B8', primary.t1_price, 0)}</div>
                     </div>
                 </div>
             </div>`;
-        });
-        
-        document.getElementById('v-active').textContent = activeCount;
-        if(htmlCards) document.getElementById('active-cards').innerHTML = htmlCards;
-        else document.getElementById('active-cards').innerHTML = '<div style="text-align:center; padding:30px; color:var(--text-light); font-weight: bold;">No Active Positions...</div>';
-        
+
+            // List the rest as background rows
+            if (activeMarkets.length > 1) {
+                htmlQueue += `<div style="font-weight:bold; color:var(--text-navy); margin-bottom:10px;">BACKGROUND LOCKED POSITIONS</div>`;
+                for(let i=1; i<activeMarkets.length; i++) {
+                    let m = activeMarkets[i];
+                    htmlQueue += `<div class="bg-market-row">
+                        <span>${m.slug}</span>
+                        <span>TTR: <b class="val-gold">${m.ttr_s}s</b></span>
+                    </div>`;
+                }
+                htmlQueue += `<div style="margin-bottom:15px; border-bottom:1px solid var(--border-color); padding-bottom:5px;"></div>`;
+            }
+        } else {
+            htmlCards = '<div style="text-align:center; padding:30px; color:var(--text-light);">No active locked positions...</div>';
+        }
+
+        if(otherMarkets.length > 0) {
+            htmlQueue += `<div style="font-weight:bold; color:var(--text-light); margin-bottom:10px;">SCOUTING / GATHERING LEGS</div>`;
+            otherMarkets.forEach(m => {
+                let status = m.state === 'WATCH' ? 'Scouting' : 'Filling Dual Leg';
+                htmlQueue += `<div class="bg-market-row" style="color:var(--text-light);">
+                    <span>${m.slug} | Status: ${status}</span>
+                    <span>TTR: ${m.ttr_s}s</span>
+                </div>`;
+            });
+        }
+
+        document.getElementById('active-cards').innerHTML = htmlCards;
         document.getElementById('obs-queue').innerHTML = htmlQueue || 'No upcoming markets in window.';
 
         let logHtml = '';
         s.history.reverse().forEach(h => {
             const pnlStr = h.pnl !== 0.0 ? (h.pnl > 0 ? `+${h.pnl.toFixed(2)}` : h.pnl.toFixed(2)) : '--';
-            
             let t1Str = '--';
             if (h.t1_side && h.t1_side !== "") t1Str = `<span class="val-gold">${h.t1_side}</span> @ $${h.t1_price.toFixed(3)}`;
             else if (h.t1_guarded) t1Str = `<span class="guard-static">🛡 GUARDED</span>`;
-
             let t2Str = '--';
             if (h.t2_side && h.t2_side !== "") t2Str = `<span class="val-pink">${h.t2_side}</span> @ $${h.t2_price.toFixed(3)}`;
             
@@ -373,11 +456,20 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     })
                 else:
                     yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
+                    y_b_v = yb.get_local_vols(yb.bid, "bid", 0.10) if yb else 0
+                    y_a_v = yb.get_local_vols(yb.ask, "ask", 0.10) if yb else 0
+                    n_b_v = nb.get_local_vols(nb.bid, "bid", 0.10) if nb else 0
+                    n_a_v = nb.get_local_vols(nb.ask, "ask", 0.10) if nb else 0
                     m_data.append({
                         "slug": m.slug, "state": m.state, "ttr_s": ttr,
                         "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price,
                         "yes_shares": m.yes_shares, "no_shares": m.no_shares,
                         "yes_ask": yb.ask if yb else 0.0, "no_ask": nb.ask if nb else 0.0,
+                        "yes_b_vol": y_b_v, "yes_a_vol": y_a_v,
+                        "no_b_vol": n_b_v, "no_a_vol": n_a_v,
+                        "strike": m.strike_price, "live_btc": GLOBAL_STATE.btc_live,
+                        "history_yes": m.history_yes[-30:], "history_no": m.history_no[-30:],
+                        "t1_price": m.t1_price
                     })
             payload = {
                 "uptime_s": int(time.time() - SYSTEM_BOOT_TIME),
@@ -470,9 +562,13 @@ def evaluate_market(mdm: MarketData, now: float):
         mdm.state = MarketState.CLOSED
         return
 
+    # Lock in the Strike Price exactly when the 5-minute bucket begins
+    if 0 < ttr <= 300 and mdm.strike_price == 0.0 and GLOBAL_STATE.btc_live > 0:
+        mdm.strike_price = GLOBAL_STATE.btc_live
+
     yb, nb = GLOBAL_STATE.books.get(mdm.yes_token), GLOBAL_STATE.books.get(mdm.no_token)
     
-    # ─── THE BUZZER (Phantom Capital Fix applied) ───
+    # ─── THE BUZZER ───
     if ttr <= 1:
         mdm.expired_processed = True
         if mdm.state != MarketState.CLOSED:
@@ -480,7 +576,6 @@ def evaluate_market(mdm: MarketData, now: float):
             if not yb or not nb: return
             winner_side = "YES" if yb.bid > nb.bid else "NO"
             
-            # Correct cost basis so untouched markets report $0.00 PnL
             cost_basis = mdm.total_fees_paid
             if mdm.yes_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
             if mdm.no_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
@@ -494,7 +589,6 @@ def evaluate_market(mdm: MarketData, now: float):
     
     # ─── TWO-WINDOW GUARANTEED ENTRY PIPELINE ───
     if mdm.state == MarketState.WATCH:
-        # Window 1 (TTR > 600) & Window 2 (600 >= TTR > 320)
         if ttr > HEDGE_DEADLINE_TTR:
             target = T_WINDOW_1 if ttr > 600 else T_WINDOW_2
             if 0 < yb.ask <= target:
@@ -512,7 +606,6 @@ def evaluate_market(mdm: MarketData, now: float):
                 mdm.total_fees_paid += fee
                 execute_trade(mdm, "NO", nb.ask, "MAKER_FILL_LEG_1", mdm.no_shares, fee, ttr)
         
-        # Window 3 (Force Taker Fill) - Late Wake-up Failsafe Active
         elif ENTRY_CUTOFF_TTR < ttr <= HEDGE_DEADLINE_TTR:
             if yb.ask > 0 and nb.ask > 0:
                 mdm.state = MarketState.BOTH
@@ -619,6 +712,10 @@ def snapshot_loop():
                         ya, ybd = yb.ask if yb else 0, yb.bid if yb else 0
                         na, nbd = nb.ask if nb else 0, nb.bid if nb else 0
                         writer.writerow([ts, m.slug, m.state, f"{ya:.3f}", f"{ybd:.3f}", f"{na:.3f}", f"{nbd:.3f}"])
+                        m.history_yes.append(ya)
+                        m.history_no.append(na)
+                        if len(m.history_yes) > 30: m.history_yes.pop(0)
+                        if len(m.history_no) > 30: m.history_no.pop(0)
         except Exception: pass
         time.sleep(30)
 
@@ -648,11 +745,6 @@ def telemetry_loop():
                         elif r_n_inv >= 2.0: writer.writerow([ts, m.slug, "NO", ttr, f"{nb.ask:.3f}", f"{n_b_vol:.0f}", f"{n_a_vol:.0f}", f"{r_n_inv:.1f}", "ASK_WALL"])
         except Exception: pass
         time.sleep(5)
-
-def oracle_observation_loop():
-    # Deferred for Post-Mechanical Validation
-    while GLOBAL_STATE.running:
-        time.sleep(10)
 
 def discovery_thread():
     print("[inf] Discovery Loop Active", flush=True)
@@ -732,12 +824,12 @@ if __name__ == "__main__":
     init_csv()
     sync_time_with_api()
     threading.Thread(target=run_server, daemon=True).start()
+    threading.Thread(target=btc_oracle_loop, daemon=True).start()
     threading.Thread(target=discovery_thread, daemon=True).start()
     threading.Thread(target=polymarket_ws_thread, daemon=True).start()
     threading.Thread(target=tick_loop, daemon=True).start()
     threading.Thread(target=snapshot_loop, daemon=True).start()
     threading.Thread(target=telemetry_loop, daemon=True).start()
-    threading.Thread(target=oracle_observation_loop, daemon=True).start()
     
     print("[inf] All systems online. Awaiting execution horizons...", flush=True)
     while GLOBAL_STATE.running:
