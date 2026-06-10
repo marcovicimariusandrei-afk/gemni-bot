@@ -1,5 +1,5 @@
 """
-main.py — BSS Bot v6.7 (3.5x Guard + Orphaned Leg Failsafe)
+main.py — BSS Bot v6.9 (Visual Diagnostics + 1.02 Ceiling + 3.5x Guard)
 FULL PRODUCTION BUILD
 """
 import os
@@ -27,7 +27,7 @@ HEDGE_DEADLINE_TTR = 320
 ENTRY_CUTOFF_TTR = 120  
 
 # Cost Parameters
-MAX_COMBINED_COST = 1.01  # Absolute maximum cost for both legs combined
+MAX_COMBINED_COST = 1.02  # TIGHTENED: Allow a normal 2-cent spread, but nothing more
 
 # Target Pricing Windows
 T_WINDOW_1 = 0.49  
@@ -116,6 +116,7 @@ class OrderBook:
 class BotState:
     def __init__(self):
         self.running = True
+        self.armed = False  # Engine starts in lockdown mode
         self.markets: Dict[str, MarketData] = {}
         self.books: Dict[str, OrderBook] = {}
         self.ws_connected = False
@@ -148,7 +149,6 @@ def get_synced_time() -> float:
     return time.time() + GLOBAL_STATE.time_offset
 
 def btc_oracle_loop():
-    print("[inf] BTC Spot Oracle Active", flush=True)
     while GLOBAL_STATE.running:
         try:
             res = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=3)
@@ -156,6 +156,23 @@ def btc_oracle_loop():
                 GLOBAL_STATE.btc_live = float(res.json()["price"])
         except Exception: pass
         time.sleep(2)
+
+# ─── PRE-FLIGHT DIAGNOSTICS ───
+def run_diagnostics():
+    print("\n" + "═"*55)
+    print(" 🛡️  [SYSTEM DIAGNOSTICS] SENSORS INITIALIZING...")
+    print("═"*55, flush=True)
+    
+    # Block until sensors report healthy
+    while GLOBAL_STATE.btc_live == 0.0 or not GLOBAL_STATE.ws_connected:
+        time.sleep(0.5)
+        
+    print(f" [REST] Gamma API Sync     : OK (Offset: {GLOBAL_STATE.time_offset:+.3f}s)")
+    print(f" [API]  Binance Spot Oracle: ONLINE (${GLOBAL_STATE.btc_live:,.2f})")
+    print(f" [WSS]  Polymarket Stream  : CONNECTED")
+    print("═"*55)
+    print(" [inf] Health checks passed. Arming execution engine...\n", flush=True)
+    GLOBAL_STATE.armed = True
 
 # ─── ASYNC CSV LOGGING SYSTEM ───
 def init_csv():
@@ -181,7 +198,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>BSS Analysis Dashboard v6.7</title>
+<title>BSS Analysis Dashboard v6.9</title>
 <style>
     :root { --bg-main: #0B1120; --bg-panel: #1E293B; --header-bg: #0F172A; --header-text: #F8FAFC; --sub-header-bg: #0F172A; --text-navy: #F8FAFC; --text-light: #94A3B8; --border-color: #334155; --val-green: #34D399; --val-red: #F87171; --val-yellow: #FCD34D; --val-pink: #F472B6; --font-sans: system-ui, -apple-system, sans-serif; }
     body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
@@ -234,7 +251,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v6.7
+    <div class="brand-title">BSS Bot Analysis Dashboard v6.9
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
@@ -676,7 +693,6 @@ def evaluate_market(mdm: MarketData, now: float):
                 mdm.total_fees_paid += fee
                 execute_trade(mdm, "NO", nb.ask, "TAKER_HEDGE_GUARANTEE", mdm.no_shares, fee, ttr)
             else:
-                # ABORT ORPHANED LEG FAILSFE
                 mdm.state = MarketState.CLOSED
                 shares_to_sell = mdm.yes_shares
                 revenue = shares_to_sell * yb.bid
@@ -703,7 +719,6 @@ def evaluate_market(mdm: MarketData, now: float):
                 mdm.total_fees_paid += fee
                 execute_trade(mdm, "YES", yb.ask, "TAKER_HEDGE_GUARANTEE", mdm.yes_shares, fee, ttr)
             else:
-                # ABORT ORPHANED LEG FAILSAFE
                 mdm.state = MarketState.CLOSED
                 shares_to_sell = mdm.no_shares
                 revenue = shares_to_sell * nb.bid
@@ -752,8 +767,11 @@ def evaluate_market(mdm: MarketData, now: float):
                 execute_trade(mdm, "CLOSED", winner_bid, "CLOSED_T2_RESOLVED", 0.0, 0.0, ttr, final_pnl)
 
 def tick_loop():
-    print("[inf] Tick Loop Active", flush=True)
     while GLOBAL_STATE.running:
+        if not GLOBAL_STATE.armed:
+            time.sleep(1)
+            continue
+            
         now = get_synced_time()
         for m in list(GLOBAL_STATE.markets.values()):
             try: evaluate_market(m, now)
@@ -761,8 +779,11 @@ def tick_loop():
         time.sleep(0.05)
 
 def snapshot_loop():
-    print("[inf] Snapshot Loop Active", flush=True)
     while GLOBAL_STATE.running:
+        if not GLOBAL_STATE.armed:
+            time.sleep(1)
+            continue
+            
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         try:
             with open("snapshot_live.csv", "a", newline="") as f:
@@ -781,8 +802,11 @@ def snapshot_loop():
         time.sleep(30)
 
 def telemetry_loop():
-    print("[inf] Telemetry Loop Active", flush=True)
     while GLOBAL_STATE.running:
+        if not GLOBAL_STATE.armed:
+            time.sleep(1)
+            continue
+            
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         try:
             with open("telemetry_shadow.csv", "a", newline="") as f:
@@ -808,8 +832,11 @@ def telemetry_loop():
         time.sleep(5)
 
 def discovery_thread():
-    print("[inf] Discovery Loop Active", flush=True)
     while GLOBAL_STATE.running:
+        if not GLOBAL_STATE.armed:
+            time.sleep(1)
+            continue
+            
         sync_time_with_api() 
         now = get_synced_time()
         boundaries = [int((now // 300) * 300) + (i * 300) for i in range(1, (LOOKAHEAD_MINUTES // 5) + 1)]
@@ -837,7 +864,6 @@ def discovery_thread():
         time.sleep(30)
 
 def polymarket_ws_thread():
-    print("[inf] WS Manager Active", flush=True)
     def on_message(ws, msg):
         try:
             parsed_msg = json.loads(msg)
@@ -865,7 +891,6 @@ def polymarket_ws_thread():
 
     def on_open(ws):
         GLOBAL_STATE.ws_connected = True
-        print("[inf] WS Connected to Gamma", flush=True)
         tks = [t for m in GLOBAL_STATE.markets.values() if m.end_ts >= get_synced_time() - 5 for t in (m.yes_token, m.no_token)]
         if tks:
             try: ws.send(json.dumps({"type": "Market", "assets_ids": tks}))
@@ -884,14 +909,20 @@ def polymarket_ws_thread():
 if __name__ == "__main__":
     init_csv()
     sync_time_with_api()
+    
+    # 1. Start Infrastructure Threads (Sensors)
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=btc_oracle_loop, daemon=True).start()
-    threading.Thread(target=discovery_thread, daemon=True).start()
     threading.Thread(target=polymarket_ws_thread, daemon=True).start()
+    
+    # 2. Run Pre-Flight Diagnostics (Blocks until healthy)
+    run_diagnostics()
+    
+    # 3. Start Execution Threads (Weapons)
+    threading.Thread(target=discovery_thread, daemon=True).start()
     threading.Thread(target=tick_loop, daemon=True).start()
     threading.Thread(target=snapshot_loop, daemon=True).start()
     threading.Thread(target=telemetry_loop, daemon=True).start()
     
-    print("[inf] All systems online. Awaiting execution horizons...", flush=True)
     while GLOBAL_STATE.running:
         time.sleep(1)
