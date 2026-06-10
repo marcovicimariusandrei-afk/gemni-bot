@@ -1,5 +1,5 @@
 """
-main.py — BSS Bot v6.4 (Mechanical Baseline + Live Spot Oracle)
+main.py — BSS Bot v6.5 (Mechanical Baseline + Advanced Visual UI)
 FULL PRODUCTION BUILD
 """
 import os
@@ -185,7 +185,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>BSS Analysis Dashboard v6.4</title>
+<title>BSS Analysis Dashboard v6.5</title>
 <style>
     :root { --bg-main: #0B1120; --bg-panel: #1E293B; --header-bg: #0F172A; --header-text: #F8FAFC; --sub-header-bg: #0F172A; --text-navy: #F8FAFC; --text-light: #94A3B8; --border-color: #334155; --val-green: #34D399; --val-red: #F87171; --val-yellow: #FCD34D; --val-pink: #F472B6; --font-sans: system-ui, -apple-system, sans-serif; }
     body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
@@ -211,6 +211,15 @@ DASHBOARD_HTML = r"""<!doctype html>
     .data-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; color: var(--text-light); align-items: center;}
     .data-row b { color: var(--text-navy); font-family: monospace; font-size: 15px;}
     .svg-container { height: 50px; margin-top: 15px; background: #0F172A; border: 1px solid var(--border-color); border-radius: 4px;}
+    
+    /* Conviction Bar Restored CSS */
+    .conviction-bar { height: 6px; background: #0F172A; border: 1px solid #334155; border-radius: 4px; position: relative; margin-top: 6px; margin-bottom: 10px; width: 100%; }
+    .conviction-fill { height: 100%; border-radius: 3px; transition: width 0.3s ease; }
+    .conviction-fill.yes { background: #38BDF8; }
+    .conviction-fill.no { background: #94A3B8; }
+    .marker { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--val-yellow); z-index: 5; }
+    .marker.t2 { background: var(--val-pink); }
+    
     .val-green { color: var(--val-green); font-weight: 800; font-family: monospace; }
     .val-red { color: var(--val-red); font-weight: 800; font-family: monospace; }
     .val-gold { color: var(--val-yellow); font-weight: 800; font-family: monospace; }
@@ -232,7 +241,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v6.4
+    <div class="brand-title">BSS Bot Analysis Dashboard v6.5
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
@@ -266,6 +275,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 </div>
 
 <script>
+// Sparkline Rendering Restored with T1/T2 Execution Dots
 function renderSparkline(history, color, t1_price, t2_price) {
     if(!history || history.length < 2) return '';
     const min = Math.min(...history), max = Math.max(...history);
@@ -282,6 +292,11 @@ function renderSparkline(history, color, t1_price, t2_price) {
         yT1 = Math.max(5, Math.min(95, yT1)); 
         svg += `<circle cx="80" cy="${yT1}" r="4" fill="var(--val-yellow)" stroke="#0B1120" stroke-width="1.5" />`;
     }
+    if (t2_price > 0) {
+        let yT2 = 100 - (((t2_price - min) / range) * 100);
+        yT2 = Math.max(5, Math.min(95, yT2)); 
+        svg += `<circle cx="92" cy="${yT2}" r="4" fill="var(--val-pink)" stroke="#0B1120" stroke-width="1.5" />`;
+    }
     return `<svg width="100%" height="100%" viewBox="0 -10 100 120" preserveAspectRatio="none">${svg}</svg>`;
 }
 
@@ -289,6 +304,18 @@ function getImbalanceBadge(bidV, askV) {
     if (askV > 0 && bidV >= askV * 2.5) return `<span style="background:var(--val-green); color:#064E3B; padding:2px 6px; border-radius:3px; font-size:10px; font-weight:800; margin-left:8px;">⚠ BID WALL</span>`;
     else if (bidV > 0 && askV >= bidV * 2.5) return `<span style="background:var(--val-red); color:#fff; padding:2px 6px; border-radius:3px; font-size:10px; font-weight:800; margin-left:8px;">⚠ ASK WALL</span>`;
     return '';
+}
+
+// Conviction Bar Tracker Restored
+function getConvictionHtml(ask) {
+    let fillPct = Math.min(100, Math.max(0, ask * 100));
+    let distT1 = Math.round((ask - 0.86) * 100);
+    let distT2 = Math.round((ask - 0.95) * 100);
+    let trackerText = "";
+    if (ask >= 0.95) trackerText = `<span class="val-pink">T2 REACHED (+${distT2}¢)</span>`;
+    else if (ask >= 0.86) trackerText = `<span class="val-gold">T1 REACHED (+${distT1}¢)</span> | <span style="color:var(--text-light)">${Math.abs(distT2)}¢ to T2</span>`;
+    else trackerText = `<span style="color:var(--text-light)">${Math.abs(distT1)}¢ to T1 | ${Math.abs(distT2)}¢ to T2</span>`;
+    return { pct: fillPct, text: trackerText };
 }
 
 async function deleteFiles() {
@@ -322,7 +349,6 @@ setInterval(async () => {
         let htmlQueue = '';
         
         if (activeMarkets.length > 0) {
-            // SINGLE MARKET FOCUS: Only render the primary card for the closest expiration
             let primary = activeMarkets[0]; 
             
             let valYes = primary.yes_shares * primary.yes_ask;
@@ -339,6 +365,9 @@ setInterval(async () => {
                 let sign = diff >= 0 ? '+$' : '-$';
                 spotDeltaStr = `<span class="${colorClass}">${sign}${Math.abs(diff).toFixed(2)}</span>`;
             }
+
+            let cYesData = getConvictionHtml(primary.yes_ask);
+            let cNoData = getConvictionHtml(primary.no_ask);
 
             htmlCards = `<div class="card">
                 <div class="card-header">
@@ -359,7 +388,15 @@ setInterval(async () => {
                             <span>Live Ask: ${yesBadge}</span> <b>$${primary.yes_ask.toFixed(3)}</b>
                         </div>
                         <div class="data-row"><span>Value:</span> <b class="val-gold">$${valYes.toFixed(2)}</b></div>
-                        <div class="svg-container">${renderSparkline(primary.history_yes, '#38BDF8', primary.t1_price, 0)}</div>
+                        
+                        <div class="data-row" style="margin-top:12px; font-size:12px;"><span>Proximity:</span> <b>${cYesData.text}</b></div>
+                        <div class="conviction-bar">
+                            <div class="conviction-fill yes" style="width: ${cYesData.pct}%"></div>
+                            <div class="marker" style="left: 86%" title="Tier 1 (0.86)"></div>
+                            <div class="marker t2" style="left: 95%" title="Tier 2 (0.95)"></div>
+                        </div>
+
+                        <div class="svg-container">${renderSparkline(primary.history_yes, '#38BDF8', primary.t1_price, primary.t2_price)}</div>
                     </div>
                     <div class="leg-col">
                         <div class="leg-title">NO LEG</div>
@@ -369,12 +406,19 @@ setInterval(async () => {
                             <span>Live Ask: ${noBadge}</span> <b>$${primary.no_ask.toFixed(3)}</b>
                         </div>
                         <div class="data-row"><span>Value:</span> <b class="val-gold">$${valNo.toFixed(2)}</b></div>
-                        <div class="svg-container">${renderSparkline(primary.history_no, '#94A3B8', primary.t1_price, 0)}</div>
+                        
+                        <div class="data-row" style="margin-top:12px; font-size:12px;"><span>Proximity:</span> <b>${cNoData.text}</b></div>
+                        <div class="conviction-bar">
+                            <div class="conviction-fill no" style="width: ${cNoData.pct}%"></div>
+                            <div class="marker" style="left: 86%" title="Tier 1 (0.86)"></div>
+                            <div class="marker t2" style="left: 95%" title="Tier 2 (0.95)"></div>
+                        </div>
+
+                        <div class="svg-container">${renderSparkline(primary.history_no, '#94A3B8', primary.t1_price, primary.t2_price)}</div>
                     </div>
                 </div>
             </div>`;
 
-            // List the rest as background rows
             if (activeMarkets.length > 1) {
                 htmlQueue += `<div style="font-weight:bold; color:var(--text-navy); margin-bottom:10px;">BACKGROUND LOCKED POSITIONS</div>`;
                 for(let i=1; i<activeMarkets.length; i++) {
@@ -469,7 +513,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         "no_b_vol": n_b_v, "no_a_vol": n_a_v,
                         "strike": m.strike_price, "live_btc": GLOBAL_STATE.btc_live,
                         "history_yes": m.history_yes[-30:], "history_no": m.history_no[-30:],
-                        "t1_price": m.t1_price
+                        "t1_price": m.t1_price, "t2_price": m.t2_price
                     })
             payload = {
                 "uptime_s": int(time.time() - SYSTEM_BOOT_TIME),
