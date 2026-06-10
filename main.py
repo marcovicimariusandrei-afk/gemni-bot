@@ -1,5 +1,5 @@
 """
-main.py — BSS Bot v6.5 (Mechanical Baseline + Advanced Visual UI)
+main.py — BSS Bot v6.6 (The 3.5x Measured Baseline)
 FULL PRODUCTION BUILD
 """
 import os
@@ -27,16 +27,16 @@ HEDGE_DEADLINE_TTR = 320
 ENTRY_CUTOFF_TTR = 120  
 
 # Target Pricing Windows
-T_WINDOW_1 = 0.49  # TTR > 600
-T_WINDOW_2 = 0.50  # 600 >= TTR > 320
+T_WINDOW_1 = 0.49  
+T_WINDOW_2 = 0.50  
 
 # Exit Parameters
 SELL_LOSER_T1_THRESH = 0.86
 SELL_LOSER_T1_TTR_MAX = 60
 SELL_LOSER_T2_THRESH = 0.95
 
-# Defense Guard
-GUARD_IMBALANCE_THRESHOLD = 2.5
+# ─── DEFENSE PARAMETERS ───
+GUARD_IMBALANCE_THRESHOLD = 3.5   # Measured step up to eliminate micro-noise
 
 PORT = int(os.getenv("PORT", "8080"))
 SYSTEM_BOOT_TIME = time.time()
@@ -85,8 +85,6 @@ class MarketData:
         self.expired_processed = False
         
         self.strike_price = 0.0
-        self.guard_active_yes = False
-        self.guard_active_no = False
         
         self.history_yes: List[float] = []
         self.history_no: List[float] = []
@@ -97,23 +95,19 @@ class OrderBook:
         self.asks: Dict[float, float] = {}
 
     @property
-    def bid(self):
-        return max(self.bids.keys()) if self.bids else 0.0
+    def bid(self): return max(self.bids.keys()) if self.bids else 0.0
 
     @property
-    def ask(self):
-        return min(self.asks.keys()) if self.asks else 0.0
+    def ask(self): return min(self.asks.keys()) if self.asks else 0.0
 
     def get_local_vols(self, current_price: float, side: str, depth: float = 0.10) -> float:
         vol = 0.0
         if side == "bid":
             for p, s in self.bids.items():
-                if p >= current_price - depth:
-                    vol += s
+                if p >= current_price - depth: vol += s
         else:
             for p, s in self.asks.items():
-                if p <= current_price + depth:
-                    vol += s
+                if p <= current_price + depth: vol += s
         return vol
 
 class BotState:
@@ -126,7 +120,6 @@ class BotState:
         self.total_pnl = 0.0
         self.total_trades = 0 
         self.sold_losers = 0
-        self.catastrophes = 0
         self.time_offset = 0.0
         self.btc_live = 0.0
 
@@ -185,7 +178,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>BSS Analysis Dashboard v6.5</title>
+<title>BSS Analysis Dashboard v6.6</title>
 <style>
     :root { --bg-main: #0B1120; --bg-panel: #1E293B; --header-bg: #0F172A; --header-text: #F8FAFC; --sub-header-bg: #0F172A; --text-navy: #F8FAFC; --text-light: #94A3B8; --border-color: #334155; --val-green: #34D399; --val-red: #F87171; --val-yellow: #FCD34D; --val-pink: #F472B6; --font-sans: system-ui, -apple-system, sans-serif; }
     body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
@@ -211,15 +204,12 @@ DASHBOARD_HTML = r"""<!doctype html>
     .data-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; color: var(--text-light); align-items: center;}
     .data-row b { color: var(--text-navy); font-family: monospace; font-size: 15px;}
     .svg-container { height: 50px; margin-top: 15px; background: #0F172A; border: 1px solid var(--border-color); border-radius: 4px;}
-    
-    /* Conviction Bar Restored CSS */
     .conviction-bar { height: 6px; background: #0F172A; border: 1px solid #334155; border-radius: 4px; position: relative; margin-top: 6px; margin-bottom: 10px; width: 100%; }
     .conviction-fill { height: 100%; border-radius: 3px; transition: width 0.3s ease; }
     .conviction-fill.yes { background: #38BDF8; }
     .conviction-fill.no { background: #94A3B8; }
     .marker { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--val-yellow); z-index: 5; }
     .marker.t2 { background: var(--val-pink); }
-    
     .val-green { color: var(--val-green); font-weight: 800; font-family: monospace; }
     .val-red { color: var(--val-red); font-weight: 800; font-family: monospace; }
     .val-gold { color: var(--val-yellow); font-weight: 800; font-family: monospace; }
@@ -241,7 +231,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v6.5
+    <div class="brand-title">BSS Bot Analysis Dashboard v6.6
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
@@ -275,7 +265,6 @@ DASHBOARD_HTML = r"""<!doctype html>
 </div>
 
 <script>
-// Sparkline Rendering Restored with T1/T2 Execution Dots
 function renderSparkline(history, color, t1_price, t2_price) {
     if(!history || history.length < 2) return '';
     const min = Math.min(...history), max = Math.max(...history);
@@ -301,12 +290,11 @@ function renderSparkline(history, color, t1_price, t2_price) {
 }
 
 function getImbalanceBadge(bidV, askV) {
-    if (askV > 0 && bidV >= askV * 2.5) return `<span style="background:var(--val-green); color:#064E3B; padding:2px 6px; border-radius:3px; font-size:10px; font-weight:800; margin-left:8px;">⚠ BID WALL</span>`;
-    else if (bidV > 0 && askV >= bidV * 2.5) return `<span style="background:var(--val-red); color:#fff; padding:2px 6px; border-radius:3px; font-size:10px; font-weight:800; margin-left:8px;">⚠ ASK WALL</span>`;
+    if (askV > 0 && bidV >= askV * 3.5) return `<span style="background:var(--val-green); color:#064E3B; padding:2px 6px; border-radius:3px; font-size:10px; font-weight:800; margin-left:8px;">⚠ BID WALL</span>`;
+    else if (bidV > 0 && askV >= bidV * 3.5) return `<span style="background:var(--val-red); color:#fff; padding:2px 6px; border-radius:3px; font-size:10px; font-weight:800; margin-left:8px;">⚠ ASK WALL</span>`;
     return '';
 }
 
-// Conviction Bar Tracker Restored
 function getConvictionHtml(ask) {
     let fillPct = Math.min(100, Math.max(0, ask * 100));
     let distT1 = Math.round((ask - 0.86) * 100);
@@ -452,8 +440,10 @@ setInterval(async () => {
         s.history.reverse().forEach(h => {
             const pnlStr = h.pnl !== 0.0 ? (h.pnl > 0 ? `+${h.pnl.toFixed(2)}` : h.pnl.toFixed(2)) : '--';
             let t1Str = '--';
-            if (h.t1_side && h.t1_side !== "") t1Str = `<span class="val-gold">${h.t1_side}</span> @ $${h.t1_price.toFixed(3)}`;
+            
+            if (h.t1_side && h.t1_side !== "" && h.t1_price > 0) t1Str = `<span class="val-gold">${h.t1_side}</span> @ $${h.t1_price.toFixed(3)}`;
             else if (h.t1_guarded) t1Str = `<span class="guard-static">🛡 GUARDED</span>`;
+            
             let t2Str = '--';
             if (h.t2_side && h.t2_side !== "") t2Str = `<span class="val-pink">${h.t2_side}</span> @ $${h.t2_price.toFixed(3)}`;
             
@@ -581,6 +571,7 @@ def check_guard_imbalance(book: OrderBook) -> Tuple[float, str]:
 def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares: float, fees: float, ttr: int, pnl: float = 0.0):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[{ts}] [{action}] {mdm.slug} | {side} @ {price:.3f} | Shares: {shares:.2f}", flush=True)
+    
     if action == "SELL_LOSER_T1":
         GLOBAL_STATE.sold_losers += 1
         mdm.salvage_revenue += (shares * price)
@@ -606,13 +597,11 @@ def evaluate_market(mdm: MarketData, now: float):
         mdm.state = MarketState.CLOSED
         return
 
-    # Lock in the Strike Price exactly when the 5-minute bucket begins
     if 0 < ttr <= 300 and mdm.strike_price == 0.0 and GLOBAL_STATE.btc_live > 0:
         mdm.strike_price = GLOBAL_STATE.btc_live
 
     yb, nb = GLOBAL_STATE.books.get(mdm.yes_token), GLOBAL_STATE.books.get(mdm.no_token)
     
-    # ─── THE BUZZER ───
     if ttr <= 1:
         mdm.expired_processed = True
         if mdm.state != MarketState.CLOSED:
@@ -631,7 +620,6 @@ def evaluate_market(mdm: MarketData, now: float):
     if not yb or not nb: return
     if mdm.state == MarketState.CLOSED: return
     
-    # ─── TWO-WINDOW GUARANTEED ENTRY PIPELINE ───
     if mdm.state == MarketState.WATCH:
         if ttr > HEDGE_DEADLINE_TTR:
             target = T_WINDOW_1 if ttr > 600 else T_WINDOW_2
@@ -699,7 +687,6 @@ def evaluate_market(mdm: MarketData, now: float):
         if yb.bid > nb.bid: winner_bid, loser_side, loser_bid, loser_shares, loser_book = yb.bid, "NO", nb.bid, mdm.no_shares, nb
         else: winner_bid, loser_side, loser_bid, loser_shares, loser_book = nb.bid, "YES", yb.bid, mdm.yes_shares, yb
             
-        # ─── HARD TTR 60 EXIT LOCK ───
         if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
             guard_ratio, wall_type = check_guard_imbalance(loser_book)
             if guard_ratio >= GUARD_IMBALANCE_THRESHOLD:
