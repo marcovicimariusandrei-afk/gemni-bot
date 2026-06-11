@@ -1,5 +1,5 @@
 """
-main.py — BSS Bot v6.11 (Instant Arbitrage + OFA Shadow Mode)
+main.py — BSS Bot v6.12 (Mid-Price Enforcement + UI Dual Display)
 FULL PRODUCTION BUILD
 """
 import os
@@ -35,7 +35,7 @@ T_WINDOW_2 = 0.50
 
 # Exit Parameters
 SELL_LOSER_T1_THRESH = 0.86
-SELL_LOSER_T1_TTR_MAX = 60
+SELL_LOSER_T1_TTR_MAX = 60  # STRICT LAW: Only act in the final 60 seconds
 SELL_LOSER_T2_THRESH = 0.95
 
 # ─── DEFENSE PARAMETERS ───
@@ -188,7 +188,6 @@ def init_csv():
             csv.writer(f).writerow(["Timestamp", "Slug", "State", "Yes_Ask", "Yes_Bid", "No_Ask", "No_Bid"])
     if not os.path.exists("telemetry_shadow.csv"):
         with open("telemetry_shadow.csv", "w", newline="") as f:
-            # Added OFA data hooks for backtesting
             csv.writer(f).writerow(["Timestamp", "Slug", "Token", "TTR", "Ticker_Price", "Local_Bid_Vol", "Local_Ask_Vol", "Imbalance_Ratio", "Signal", "Vel_Pct", "Vel_Flat", "OFA_Signal"])
 
 def log_trade_csv_worker(ts, slug, action, side, price, shares, fees, ttr, pnl):
@@ -203,7 +202,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>BSS Dashboard v6.11 (Shadow OFA)</title>
+<title>BSS Dashboard v6.12 (Mid-Price Engine)</title>
 <style>
     :root { --bg-main: #0B1120; --bg-panel: #1E293B; --header-bg: #0F172A; --header-text: #F8FAFC; --sub-header-bg: #0F172A; --text-navy: #F8FAFC; --text-light: #94A3B8; --border-color: #334155; --val-green: #34D399; --val-red: #F87171; --val-yellow: #FCD34D; --val-pink: #F472B6; --font-sans: system-ui, -apple-system, sans-serif; }
     body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
@@ -257,7 +256,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Analysis Dashboard v6.11 (Shadow OFA)
+    <div class="brand-title">BSS Dashboard v6.12 (Mid-Price Engine)
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
@@ -365,8 +364,8 @@ setInterval(async () => {
         if (activeMarkets.length > 0) {
             let primary = activeMarkets[0]; 
             
-            let valYes = primary.yes_shares * primary.yes_ask;
-            let valNo = primary.no_shares * primary.no_ask;
+            let valYes = primary.yes_shares * primary.yes_bid;
+            let valNo = primary.no_shares * primary.no_bid;
             let yesBadge = getImbalanceBadge(primary.yes_b_vol, primary.yes_a_vol);
             let noBadge = getImbalanceBadge(primary.no_b_vol, primary.no_a_vol);
 
@@ -380,8 +379,9 @@ setInterval(async () => {
                 spotDeltaStr = `<span class="${colorClass}">${sign}${Math.abs(diff).toFixed(2)}</span>`;
             }
 
-            let cYesData = getConvictionHtml(primary.yes_ask);
-            let cNoData = getConvictionHtml(primary.no_ask);
+            // Using MID price for Conviction Tracking
+            let cYesData = getConvictionHtml(primary.yes_mid);
+            let cNoData = getConvictionHtml(primary.no_mid);
 
             htmlCards = `<div class="card">
                 <div class="card-header">
@@ -399,9 +399,15 @@ setInterval(async () => {
                         <div class="data-row"><span>Shares:</span> <b>${primary.yes_shares.toFixed(2)}</b></div>
                         <div class="data-row"><span>Entry:</span> <b>$${primary.yes_entry > 0 ? primary.yes_entry.toFixed(3) : '0.000'}</b></div>
                         <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;">
-                            <span>Live Ask: ${yesBadge}</span> <b>$${primary.yes_ask.toFixed(3)}</b>
+                            <span>Ask:</span> <b>$${primary.yes_ask.toFixed(3)}</b>
                         </div>
-                        <div class="data-row"><span>Value:</span> <b class="val-gold">$${valYes.toFixed(2)}</b></div>
+                        <div class="data-row">
+                            <span>Bid: ${yesBadge}</span> <b>$${primary.yes_bid.toFixed(3)}</b>
+                        </div>
+                        <div class="data-row" style="background: rgba(252, 211, 77, 0.1); padding: 4px 8px; border-radius: 4px; margin-top: 4px;">
+                            <span style="color:var(--text-navy)">Mid (Trigger):</span> <b class="val-gold">$${primary.yes_mid.toFixed(3)}</b>
+                        </div>
+                        <div class="data-row" style="margin-top:8px;"><span>Bid Value:</span> <b class="val-green">$${valYes.toFixed(2)}</b></div>
                         
                         <div class="data-row" style="margin-top:12px; font-size:12px;"><span>Proximity:</span> <b>${cYesData.text}</b></div>
                         <div class="conviction-bar">
@@ -417,9 +423,15 @@ setInterval(async () => {
                         <div class="data-row"><span>Shares:</span> <b>${primary.no_shares.toFixed(2)}</b></div>
                         <div class="data-row"><span>Entry:</span> <b>$${primary.no_entry > 0 ? primary.no_entry.toFixed(3) : '0.000'}</b></div>
                         <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;">
-                            <span>Live Ask: ${noBadge}</span> <b>$${primary.no_ask.toFixed(3)}</b>
+                            <span>Ask:</span> <b>$${primary.no_ask.toFixed(3)}</b>
                         </div>
-                        <div class="data-row"><span>Value:</span> <b class="val-gold">$${valNo.toFixed(2)}</b></div>
+                        <div class="data-row">
+                            <span>Bid: ${noBadge}</span> <b>$${primary.no_bid.toFixed(3)}</b>
+                        </div>
+                        <div class="data-row" style="background: rgba(252, 211, 77, 0.1); padding: 4px 8px; border-radius: 4px; margin-top: 4px;">
+                            <span style="color:var(--text-navy)">Mid (Trigger):</span> <b class="val-gold">$${primary.no_mid.toFixed(3)}</b>
+                        </div>
+                        <div class="data-row" style="margin-top:8px;"><span>Bid Value:</span> <b class="val-green">$${valNo.toFixed(2)}</b></div>
                         
                         <div class="data-row" style="margin-top:12px; font-size:12px;"><span>Proximity:</span> <b>${cNoData.text}</b></div>
                         <div class="conviction-bar">
@@ -526,6 +538,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price,
                         "yes_shares": m.yes_shares, "no_shares": m.no_shares,
                         "yes_ask": yb.ask if yb else 0.0, "no_ask": nb.ask if nb else 0.0,
+                        "yes_bid": yb.bid if yb else 0.0, "no_bid": nb.bid if nb else 0.0,
+                        "yes_mid": ((yb.bid + yb.ask) / 2.0) if (yb and yb.bid > 0 and yb.ask > 0) else (yb.bid if yb else 0.0),
+                        "no_mid": ((nb.bid + nb.ask) / 2.0) if (nb and nb.bid > 0 and nb.ask > 0) else (nb.bid if nb else 0.0),
                         "yes_b_vol": y_b_v, "yes_a_vol": y_a_v,
                         "no_b_vol": n_b_v, "no_a_vol": n_a_v,
                         "strike": m.strike_price, "live_btc": GLOBAL_STATE.btc_live,
@@ -671,7 +686,6 @@ def evaluate_market(mdm: MarketData, now: float):
     if not yb or not nb: return
     if mdm.state == MarketState.CLOSED: return
     
-    # ─── OVERHAULED ENTRY PIPELINE (Instant Auto-Buy) ───
     if mdm.state == MarketState.WATCH:
         target = T_WINDOW_1 if ttr > 600 else T_WINDOW_2
         if 0 < yb.ask <= target:
@@ -736,10 +750,19 @@ def evaluate_market(mdm: MarketData, now: float):
             execute_trade(mdm, "CLOSED", 0.00, "CLOSED_ABORTED", 0.0, 0.0, ttr, calc_pnl)
             
     elif mdm.state == MarketState.BOTH:
-        if yb.bid > nb.bid: winner_bid, loser_side, loser_bid, loser_shares, loser_book = yb.bid, "NO", nb.bid, mdm.no_shares, nb
-        else: winner_bid, loser_side, loser_bid, loser_shares, loser_book = nb.bid, "YES", yb.bid, mdm.yes_shares, yb
+        # Calculate Mid-Prices to bypass Market Maker "Bid Vacuums"
+        y_mid = (yb.bid + yb.ask) / 2.0 if (yb.bid > 0 and yb.ask > 0) else yb.bid
+        n_mid = (nb.bid + nb.ask) / 2.0 if (nb.bid > 0 and nb.ask > 0) else nb.bid
+        
+        if y_mid > n_mid: 
+            winner_mid, loser_side, loser_bid, loser_shares, loser_book = y_mid, "NO", nb.bid, mdm.no_shares, nb
+            winner_side = "YES"
+        else: 
+            winner_mid, loser_side, loser_bid, loser_shares, loser_book = n_mid, "YES", yb.bid, mdm.yes_shares, yb
+            winner_side = "NO"
             
-        if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
+        # STRICT 60 SECOND LAW enforced, but logic evaluates Mid-Price
+        if not mdm.t1_executed and winner_mid >= SELL_LOSER_T1_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
             guard_ratio, wall_type, shadow_vel, v_pct, v_flat = check_guard_and_velocity(mdm, loser_book, winner_side, now)
             
             # Log OFA Shadow Data
@@ -758,14 +781,14 @@ def evaluate_market(mdm: MarketData, now: float):
                     mdm.t1_guarded = True
                     mdm.t1_guard_ratio = guard_ratio
                     execute_trade(mdm, loser_side, loser_bid, f"BLOCKED_{wall_type}", 0.0, 0.0, ttr)
-            else:
+            elif loser_bid > 0.0:  # Ensures we don't execute a cash-sale at $0.00
                 mdm.t1_executed = True
                 shares_to_sell = loser_shares * 0.50
                 fee = (shares_to_sell * loser_bid) * 0.001 
                 mdm.total_fees_paid += fee
                 execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T1", shares_to_sell, fee, ttr)
             
-        elif winner_bid >= SELL_LOSER_T2_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
+        elif winner_mid >= SELL_LOSER_T2_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
             guard_ratio, wall_type, shadow_vel, v_pct, v_flat = check_guard_and_velocity(mdm, loser_book, winner_side, now)
             
             if guard_ratio >= GUARD_IMBALANCE_THRESHOLD:
@@ -773,7 +796,7 @@ def evaluate_market(mdm: MarketData, now: float):
                     mdm.t2_guarded = True
                     mdm.t2_guard_ratio = guard_ratio
                     execute_trade(mdm, loser_side, loser_bid, f"BLOCKED_{wall_type}", 0.0, 0.0, ttr)
-            else:
+            elif loser_bid > 0.0:
                 mdm.state = MarketState.CLOSED
                 shares_to_sell = loser_shares * 0.99 
                 fee = (shares_to_sell * loser_bid) * 0.001 
@@ -782,7 +805,7 @@ def evaluate_market(mdm: MarketData, now: float):
                 cost_basis = (BASE_CAPITAL_PER_LEG * 2) + mdm.total_fees_paid
                 winner_shares = mdm.yes_shares if loser_side == "NO" else mdm.no_shares
                 final_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
-                execute_trade(mdm, "CLOSED", winner_bid, "CLOSED_T2_RESOLVED", 0.0, 0.0, ttr, final_pnl)
+                execute_trade(mdm, "CLOSED", winner_mid, "CLOSED_T2_RESOLVED", 0.0, 0.0, ttr, final_pnl)
 
 def tick_loop():
     while GLOBAL_STATE.running:
