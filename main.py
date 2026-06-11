@@ -1,5 +1,5 @@
 """
-main.py — BSS Bot v6.9 (Visual Diagnostics + 1.02 Ceiling + 3.5x Guard)
+main.py — BSS Bot v6.10 (OFA Engine + Instant Arbitrage Lock)
 FULL PRODUCTION BUILD
 """
 import os
@@ -22,12 +22,12 @@ BASE_CAPITAL_PER_LEG = 5.10
 TAKER_FEE_RATE = 0.018 
 
 # Timeline Parameters
-LOOKAHEAD_MINUTES = 15
+LOOKAHEAD_MINUTES = 25  # EXTENDED: Scout early, grab cheap inventory
 HEDGE_DEADLINE_TTR = 320
 ENTRY_CUTOFF_TTR = 120  
 
 # Cost Parameters
-MAX_COMBINED_COST = 1.02  # TIGHTENED: Allow a normal 2-cent spread, but nothing more
+MAX_COMBINED_COST = 1.03  # CEILING: Safely absorb spread for instant lock
 
 # Target Pricing Windows
 T_WINDOW_1 = 0.49  
@@ -39,7 +39,7 @@ SELL_LOSER_T1_TTR_MAX = 60
 SELL_LOSER_T2_THRESH = 0.95
 
 # ─── DEFENSE PARAMETERS ───
-GUARD_IMBALANCE_THRESHOLD = 3.5   # Measured step up to eliminate micro-noise
+GUARD_IMBALANCE_THRESHOLD = 3.5   
 
 PORT = int(os.getenv("PORT", "8080"))
 SYSTEM_BOOT_TIME = time.time()
@@ -88,9 +88,14 @@ class MarketData:
         self.expired_processed = False
         
         self.strike_price = 0.0
+        self.ofa_override = False
         
         self.history_yes: List[float] = []
         self.history_no: List[float] = []
+        
+        # OFA Velocity Trackers (timestamp, bid_vol, ask_vol)
+        self.history_vol_yes: List[Tuple[float, float, float]] = []
+        self.history_vol_no: List[Tuple[float, float, float]] = []
 
 class OrderBook:
     def __init__(self):
@@ -116,7 +121,7 @@ class OrderBook:
 class BotState:
     def __init__(self):
         self.running = True
-        self.armed = False  # Engine starts in lockdown mode
+        self.armed = False  
         self.markets: Dict[str, MarketData] = {}
         self.books: Dict[str, OrderBook] = {}
         self.ws_connected = False
@@ -163,7 +168,6 @@ def run_diagnostics():
     print(" 🛡️  [SYSTEM DIAGNOSTICS] SENSORS INITIALIZING...")
     print("═"*55, flush=True)
     
-    # Block until sensors report healthy
     while GLOBAL_STATE.btc_live == 0.0 or not GLOBAL_STATE.ws_connected:
         time.sleep(0.5)
         
@@ -198,7 +202,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>BSS Analysis Dashboard v6.9</title>
+<title>BSS Analysis Dashboard v6.10 (OFA Engine)</title>
 <style>
     :root { --bg-main: #0B1120; --bg-panel: #1E293B; --header-bg: #0F172A; --header-text: #F8FAFC; --sub-header-bg: #0F172A; --text-navy: #F8FAFC; --text-light: #94A3B8; --border-color: #334155; --val-green: #34D399; --val-red: #F87171; --val-yellow: #FCD34D; --val-pink: #F472B6; --font-sans: system-ui, -apple-system, sans-serif; }
     body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
@@ -244,6 +248,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     .btn-action:hover { background: #334155; }
     .btn-verify { color: #60A5FA; text-decoration: none; font-weight: 800; font-size: 12px;}
     .guard-static { background: #1E3A8A; color: #DBEAFE; padding: 3px 6px; border-radius: 3px; font-size: 11px; font-weight: 800; border: 1px solid #3B82F6;}
+    .ofa-static { background: #064E3B; color: #D1FAE5; padding: 3px 6px; border-radius: 3px; font-size: 11px; font-weight: 800; border: 1px solid #10B981;}
     .bg-market-row { display: flex; justify-content: space-between; padding: 8px 15px; border-bottom: 1px solid var(--border-color); font-family: monospace; }
     .bg-market-row:last-child { border-bottom: none; }
 </style>
@@ -251,7 +256,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Bot Analysis Dashboard v6.9
+    <div class="brand-title">BSS Analysis Dashboard v6.10 (OFA Engine)
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
@@ -462,6 +467,7 @@ setInterval(async () => {
             let t1Str = '--';
             
             if (h.t1_side && h.t1_side !== "" && h.t1_price > 0) t1Str = `<span class="val-gold">${h.t1_side}</span> @ $${h.t1_price.toFixed(3)}`;
+            else if (h.t1_override) t1Str = `<span class="ofa-static">OFA_OVERRIDE</span>`;
             else if (h.t1_guarded) t1Str = `<span class="guard-static">🛡 GUARDED</span>`;
             
             let t2Str = '--';
@@ -505,7 +511,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         "time": m.close_time, "slug": m.slug, "reason": m.close_reason,
                         "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price, "pnl": m.realized_pnl,
                         "t1_side": m.t1_side, "t1_price": m.t1_price, "t1_time": m.t1_time,
-                        "t1_guarded": m.t1_guarded, "t1_guard_ratio": m.t1_guard_ratio,
+                        "t1_guarded": m.t1_guarded, "t1_guard_ratio": m.t1_guard_ratio, "t1_override": getattr(m, 'ofa_override', False),
                         "t2_side": m.t2_side, "t2_price": m.t2_price, "t2_time": m.t2_time
                     })
                 else:
@@ -576,17 +582,29 @@ def run_server():
     server.serve_forever()
 
 # ─── CORE STRATEGY ───
-def check_guard_imbalance(book: OrderBook) -> Tuple[float, str]:
-    if not book: return 0.0, ""
-    b_vol = book.get_local_vols(book.bid, "bid", 0.10)
-    a_vol = book.get_local_vols(book.ask, "ask", 0.10)
-    if a_vol == 0 and b_vol > 0: return 999.0, "BID_WALL"
-    if b_vol == 0 and a_vol > 0: return 999.0, "ASK_WALL"
-    if a_vol == 0 and b_vol == 0: return 0.0, ""
+def check_guard_and_velocity(mdm: MarketData, loser_book: OrderBook, winner_side: str) -> Tuple[float, str, bool]:
+    if not loser_book: return 0.0, "", False
+    b_vol = loser_book.get_local_vols(loser_book.bid, "bid", 0.10)
+    a_vol = loser_book.get_local_vols(loser_book.ask, "ask", 0.10)
     
-    if b_vol / a_vol >= GUARD_IMBALANCE_THRESHOLD: return (b_vol / a_vol), "BID_WALL"
-    if a_vol / b_vol >= GUARD_IMBALANCE_THRESHOLD: return (a_vol / b_vol), "ASK_WALL"
-    return 0.0, ""
+    ratio, wall_type = 0.0, ""
+    if a_vol == 0 and b_vol > 0: ratio, wall_type = 999.0, "BID_WALL"
+    elif b_vol == 0 and a_vol > 0: ratio, wall_type = 999.0, "ASK_WALL"
+    elif a_vol > 0 and b_vol / a_vol >= GUARD_IMBALANCE_THRESHOLD: ratio, wall_type = (b_vol / a_vol), "BID_WALL"
+    elif b_vol > 0 and a_vol / b_vol >= GUARD_IMBALANCE_THRESHOLD: ratio, wall_type = (a_vol / b_vol), "ASK_WALL"
+    
+    override_velocity = False
+    if ratio >= GUARD_IMBALANCE_THRESHOLD:
+        hist = mdm.history_vol_yes if winner_side == "YES" else mdm.history_vol_no
+        if len(hist) >= 4:
+            past_b_vol = hist[0][1] 
+            current_b_vol = hist[-1][1]
+            if past_b_vol > 0 and (current_b_vol / past_b_vol >= 1.25):
+                override_velocity = True
+            elif current_b_vol - past_b_vol >= 1000:
+                override_velocity = True
+                
+    return ratio, wall_type, override_velocity
 
 def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares: float, fees: float, ttr: int, pnl: float = 0.0):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -622,6 +640,13 @@ def evaluate_market(mdm: MarketData, now: float):
 
     yb, nb = GLOBAL_STATE.books.get(mdm.yes_token), GLOBAL_STATE.books.get(mdm.no_token)
     
+    if yb:
+        mdm.history_vol_yes.append((now, yb.get_local_vols(yb.bid, "bid"), yb.get_local_vols(yb.ask, "ask")))
+        mdm.history_vol_yes = [x for x in mdm.history_vol_yes if now - x[0] <= 10.0]
+    if nb:
+        mdm.history_vol_no.append((now, nb.get_local_vols(nb.bid, "bid"), nb.get_local_vols(nb.ask, "ask")))
+        mdm.history_vol_no = [x for x in mdm.history_vol_no if now - x[0] <= 10.0]
+
     if ttr <= 1:
         mdm.expired_processed = True
         if mdm.state != MarketState.CLOSED:
@@ -640,117 +665,97 @@ def evaluate_market(mdm: MarketData, now: float):
     if not yb or not nb: return
     if mdm.state == MarketState.CLOSED: return
     
-    # ─── TWO-WINDOW GUARANTEED ENTRY PIPELINE ───
+    # ─── OVERHAULED ENTRY PIPELINE (Instant Auto-Buy) ───
     if mdm.state == MarketState.WATCH:
-        if ttr > HEDGE_DEADLINE_TTR:
-            target = T_WINDOW_1 if ttr > 600 else T_WINDOW_2
-            if 0 < yb.ask <= target:
-                mdm.state = MarketState.WAITING_NO
-                mdm.yes_entry_price = yb.ask
-                mdm.yes_shares = BASE_CAPITAL_PER_LEG / yb.ask
-                fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-                mdm.total_fees_paid += fee
-                execute_trade(mdm, "YES", yb.ask, "MAKER_FILL_LEG_1", mdm.yes_shares, fee, ttr)
-            elif 0 < nb.ask <= target:
-                mdm.state = MarketState.WAITING_YES
-                mdm.no_entry_price = nb.ask
-                mdm.no_shares = BASE_CAPITAL_PER_LEG / nb.ask
-                fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-                mdm.total_fees_paid += fee
-                execute_trade(mdm, "NO", nb.ask, "MAKER_FILL_LEG_1", mdm.no_shares, fee, ttr)
-        
-        elif ENTRY_CUTOFF_TTR < ttr <= HEDGE_DEADLINE_TTR:
-            if yb.ask > 0 and nb.ask > 0:
-                if yb.ask + nb.ask <= MAX_COMBINED_COST:
-                    mdm.state = MarketState.BOTH
-                    mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
-                    fee_yes = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-                    mdm.total_fees_paid += fee_yes
-                    execute_trade(mdm, "YES", yb.ask, "TAKER_FORCE_FILL_L1", mdm.yes_shares, fee_yes, ttr)
-                    
-                    mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
-                    fee_no = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-                    mdm.total_fees_paid += fee_no
-                    execute_trade(mdm, "NO", nb.ask, "TAKER_FORCE_FILL_L2", mdm.no_shares, fee_no, ttr)
-                else:
-                    mdm.state = MarketState.CLOSED
-                    execute_trade(mdm, "NONE", 0.0, "ABORT_TOO_EXPENSIVE", 0.0, 0.0, ttr)
+        target = T_WINDOW_1 if ttr > 600 else T_WINDOW_2
+        if 0 < yb.ask <= target:
+            mdm.state = MarketState.WAITING_NO
+            mdm.yes_entry_price = yb.ask
+            mdm.yes_shares = BASE_CAPITAL_PER_LEG / yb.ask
+            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+            mdm.total_fees_paid += fee
+            execute_trade(mdm, "YES", yb.ask, "MAKER_FILL_LEG_1", mdm.yes_shares, fee, ttr)
+        elif 0 < nb.ask <= target:
+            mdm.state = MarketState.WAITING_YES
+            mdm.no_entry_price = nb.ask
+            mdm.no_shares = BASE_CAPITAL_PER_LEG / nb.ask
+            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+            mdm.total_fees_paid += fee
+            execute_trade(mdm, "NO", nb.ask, "MAKER_FILL_LEG_1", mdm.no_shares, fee, ttr)
 
     elif mdm.state == MarketState.WAITING_NO:
-        if ttr > HEDGE_DEADLINE_TTR:
-            target = T_WINDOW_1 if ttr > 600 else T_WINDOW_2
-            if 0 < nb.ask <= target:
-                mdm.state = MarketState.BOTH
-                mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
-                fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-                mdm.total_fees_paid += fee
-                execute_trade(mdm, "NO", nb.ask, "MAKER_FILL_LEG_2", mdm.no_shares, fee, ttr)
-        elif ENTRY_CUTOFF_TTR < ttr <= HEDGE_DEADLINE_TTR and nb.ask > 0:
-            if mdm.yes_entry_price + nb.ask <= MAX_COMBINED_COST:
-                mdm.state = MarketState.BOTH
-                mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
-                fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-                mdm.total_fees_paid += fee
-                execute_trade(mdm, "NO", nb.ask, "TAKER_HEDGE_GUARANTEE", mdm.no_shares, fee, ttr)
-            else:
-                mdm.state = MarketState.CLOSED
-                shares_to_sell = mdm.yes_shares
-                revenue = shares_to_sell * yb.bid
-                fee = revenue * TAKER_FEE_RATE
-                mdm.total_fees_paid += fee
-                execute_trade(mdm, "YES", yb.bid, "ABORT_ORPHANED_LEG", shares_to_sell, fee, ttr)
-                calc_pnl = revenue - BASE_CAPITAL_PER_LEG - mdm.total_fees_paid
-                execute_trade(mdm, "CLOSED", 0.00, "CLOSED_ABORTED", 0.0, 0.0, ttr, calc_pnl)
+        if nb.ask > 0 and nb.ask <= (T_WINDOW_1 if ttr > 600 else T_WINDOW_2):
+            mdm.state = MarketState.BOTH
+            mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
+            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+            mdm.total_fees_paid += fee
+            execute_trade(mdm, "NO", nb.ask, "MAKER_FILL_LEG_2", mdm.no_shares, fee, ttr)
+        elif nb.ask > 0 and (mdm.yes_entry_price + nb.ask <= MAX_COMBINED_COST):
+            mdm.state = MarketState.BOTH
+            mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
+            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+            mdm.total_fees_paid += fee
+            execute_trade(mdm, "NO", nb.ask, "TAKER_HEDGE_GUARANTEE", mdm.no_shares, fee, ttr)
+        elif ttr <= HEDGE_DEADLINE_TTR:
+            mdm.state = MarketState.CLOSED
+            shares_to_sell = mdm.yes_shares
+            revenue = shares_to_sell * yb.bid
+            fee = revenue * TAKER_FEE_RATE
+            mdm.total_fees_paid += fee
+            execute_trade(mdm, "YES", yb.bid, "ABORT_ORPHANED_LEG", shares_to_sell, fee, ttr)
+            calc_pnl = revenue - BASE_CAPITAL_PER_LEG - mdm.total_fees_paid
+            execute_trade(mdm, "CLOSED", 0.00, "CLOSED_ABORTED", 0.0, 0.0, ttr, calc_pnl)
             
     elif mdm.state == MarketState.WAITING_YES:
-        if ttr > HEDGE_DEADLINE_TTR:
-            target = T_WINDOW_1 if ttr > 600 else T_WINDOW_2
-            if 0 < yb.ask <= target:
-                mdm.state = MarketState.BOTH
-                mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
-                fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-                mdm.total_fees_paid += fee
-                execute_trade(mdm, "YES", yb.ask, "MAKER_FILL_LEG_2", mdm.yes_shares, fee, ttr)
-        elif ENTRY_CUTOFF_TTR < ttr <= HEDGE_DEADLINE_TTR and yb.ask > 0:
-            if mdm.no_entry_price + yb.ask <= MAX_COMBINED_COST:
-                mdm.state = MarketState.BOTH
-                mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
-                fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-                mdm.total_fees_paid += fee
-                execute_trade(mdm, "YES", yb.ask, "TAKER_HEDGE_GUARANTEE", mdm.yes_shares, fee, ttr)
-            else:
-                mdm.state = MarketState.CLOSED
-                shares_to_sell = mdm.no_shares
-                revenue = shares_to_sell * nb.bid
-                fee = revenue * TAKER_FEE_RATE
-                mdm.total_fees_paid += fee
-                execute_trade(mdm, "NO", nb.bid, "ABORT_ORPHANED_LEG", shares_to_sell, fee, ttr)
-                calc_pnl = revenue - BASE_CAPITAL_PER_LEG - mdm.total_fees_paid
-                execute_trade(mdm, "CLOSED", 0.00, "CLOSED_ABORTED", 0.0, 0.0, ttr, calc_pnl)
+        if yb.ask > 0 and yb.ask <= (T_WINDOW_1 if ttr > 600 else T_WINDOW_2):
+            mdm.state = MarketState.BOTH
+            mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
+            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+            mdm.total_fees_paid += fee
+            execute_trade(mdm, "YES", yb.ask, "MAKER_FILL_LEG_2", mdm.yes_shares, fee, ttr)
+        elif yb.ask > 0 and (mdm.no_entry_price + yb.ask <= MAX_COMBINED_COST):
+            mdm.state = MarketState.BOTH
+            mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
+            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
+            mdm.total_fees_paid += fee
+            execute_trade(mdm, "YES", yb.ask, "TAKER_HEDGE_GUARANTEE", mdm.yes_shares, fee, ttr)
+        elif ttr <= HEDGE_DEADLINE_TTR:
+            mdm.state = MarketState.CLOSED
+            shares_to_sell = mdm.no_shares
+            revenue = shares_to_sell * nb.bid
+            fee = revenue * TAKER_FEE_RATE
+            mdm.total_fees_paid += fee
+            execute_trade(mdm, "NO", nb.bid, "ABORT_ORPHANED_LEG", shares_to_sell, fee, ttr)
+            calc_pnl = revenue - BASE_CAPITAL_PER_LEG - mdm.total_fees_paid
+            execute_trade(mdm, "CLOSED", 0.00, "CLOSED_ABORTED", 0.0, 0.0, ttr, calc_pnl)
             
     elif mdm.state == MarketState.BOTH:
         if yb.bid > nb.bid: winner_bid, loser_side, loser_bid, loser_shares, loser_book = yb.bid, "NO", nb.bid, mdm.no_shares, nb
         else: winner_bid, loser_side, loser_bid, loser_shares, loser_book = nb.bid, "YES", yb.bid, mdm.yes_shares, yb
             
         if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
-            guard_ratio, wall_type = check_guard_imbalance(loser_book)
-            if guard_ratio >= GUARD_IMBALANCE_THRESHOLD:
+            guard_ratio, wall_type, override_vel = check_guard_and_velocity(mdm, loser_book, winner_side)
+            
+            if guard_ratio >= GUARD_IMBALANCE_THRESHOLD and not override_vel:
                 if not mdm.t1_guarded:
                     mdm.t1_guarded = True
                     mdm.t1_guard_ratio = guard_ratio
                     execute_trade(mdm, loser_side, loser_bid, f"BLOCKED_{wall_type}", 0.0, 0.0, ttr)
             else:
+                if override_vel and guard_ratio >= GUARD_IMBALANCE_THRESHOLD:
+                    mdm.ofa_override = True
+                    execute_trade(mdm, winner_side, winner_bid, "OFA_VELOCITY_OVERRIDE", 0.0, 0.0, ttr)
+                    
                 mdm.t1_executed = True
                 shares_to_sell = loser_shares * 0.50
-                if loser_side == "YES": mdm.yes_shares -= shares_to_sell
-                else: mdm.no_shares -= shares_to_sell
                 fee = (shares_to_sell * loser_bid) * 0.001 
                 mdm.total_fees_paid += fee
                 execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T1", shares_to_sell, fee, ttr)
             
         elif winner_bid >= SELL_LOSER_T2_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
-            guard_ratio, wall_type = check_guard_imbalance(loser_book)
-            if guard_ratio >= GUARD_IMBALANCE_THRESHOLD:
+            guard_ratio, wall_type, override_vel = check_guard_and_velocity(mdm, loser_book, winner_side)
+            
+            if guard_ratio >= GUARD_IMBALANCE_THRESHOLD and not override_vel:
                 if not mdm.t2_guarded:
                     mdm.t2_guarded = True
                     mdm.t2_guard_ratio = guard_ratio
@@ -910,15 +915,15 @@ if __name__ == "__main__":
     init_csv()
     sync_time_with_api()
     
-    # 1. Start Infrastructure Threads (Sensors)
+    # 1. Start Infrastructure Threads
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=btc_oracle_loop, daemon=True).start()
     threading.Thread(target=polymarket_ws_thread, daemon=True).start()
     
-    # 2. Run Pre-Flight Diagnostics (Blocks until healthy)
+    # 2. Run Diagnostics
     run_diagnostics()
     
-    # 3. Start Execution Threads (Weapons)
+    # 3. Start Execution Threads
     threading.Thread(target=discovery_thread, daemon=True).start()
     threading.Thread(target=tick_loop, daemon=True).start()
     threading.Thread(target=snapshot_loop, daemon=True).start()
