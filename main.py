@@ -1,5 +1,5 @@
 """
-main.py — BSS Bot v6.10 (OFA Engine + Instant Arbitrage Lock)
+main.py — BSS Bot v6.11 (Instant Arbitrage + OFA Shadow Mode)
 FULL PRODUCTION BUILD
 """
 import os
@@ -88,7 +88,7 @@ class MarketData:
         self.expired_processed = False
         
         self.strike_price = 0.0
-        self.ofa_override = False
+        self.ofa_shadow_flag = False  # Observation only
         
         self.history_yes: List[float] = []
         self.history_no: List[float] = []
@@ -188,7 +188,8 @@ def init_csv():
             csv.writer(f).writerow(["Timestamp", "Slug", "State", "Yes_Ask", "Yes_Bid", "No_Ask", "No_Bid"])
     if not os.path.exists("telemetry_shadow.csv"):
         with open("telemetry_shadow.csv", "w", newline="") as f:
-            csv.writer(f).writerow(["Timestamp", "Slug", "Token", "TTR", "Ticker_Price", "Local_Bid_Vol", "Local_Ask_Vol", "Imbalance_Ratio", "Signal"])
+            # Added OFA data hooks for backtesting
+            csv.writer(f).writerow(["Timestamp", "Slug", "Token", "TTR", "Ticker_Price", "Local_Bid_Vol", "Local_Ask_Vol", "Imbalance_Ratio", "Signal", "Vel_Pct", "Vel_Flat", "OFA_Signal"])
 
 def log_trade_csv_worker(ts, slug, action, side, price, shares, fees, ttr, pnl):
     link = f"https://polymarket.com/event/{slug}"
@@ -202,7 +203,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>BSS Analysis Dashboard v6.10 (OFA Engine)</title>
+<title>BSS Dashboard v6.11 (Shadow OFA)</title>
 <style>
     :root { --bg-main: #0B1120; --bg-panel: #1E293B; --header-bg: #0F172A; --header-text: #F8FAFC; --sub-header-bg: #0F172A; --text-navy: #F8FAFC; --text-light: #94A3B8; --border-color: #334155; --val-green: #34D399; --val-red: #F87171; --val-yellow: #FCD34D; --val-pink: #F472B6; --font-sans: system-ui, -apple-system, sans-serif; }
     body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
@@ -248,7 +249,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     .btn-action:hover { background: #334155; }
     .btn-verify { color: #60A5FA; text-decoration: none; font-weight: 800; font-size: 12px;}
     .guard-static { background: #1E3A8A; color: #DBEAFE; padding: 3px 6px; border-radius: 3px; font-size: 11px; font-weight: 800; border: 1px solid #3B82F6;}
-    .ofa-static { background: #064E3B; color: #D1FAE5; padding: 3px 6px; border-radius: 3px; font-size: 11px; font-weight: 800; border: 1px solid #10B981;}
+    .ofa-static { background: #92400E; color: #FEF3C7; padding: 3px 6px; border-radius: 3px; font-size: 11px; font-weight: 800; border: 1px solid #F59E0B;}
     .bg-market-row { display: flex; justify-content: space-between; padding: 8px 15px; border-bottom: 1px solid var(--border-color); font-family: monospace; }
     .bg-market-row:last-child { border-bottom: none; }
 </style>
@@ -256,7 +257,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 
 <div class="header-panel">
-    <div class="brand-title">BSS Analysis Dashboard v6.10 (OFA Engine)
+    <div class="brand-title">BSS Analysis Dashboard v6.11 (Shadow OFA)
         <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
         <span class="status-tags" id="ws-status">[WS: Checking...]</span>
     </div>
@@ -467,7 +468,7 @@ setInterval(async () => {
             let t1Str = '--';
             
             if (h.t1_side && h.t1_side !== "" && h.t1_price > 0) t1Str = `<span class="val-gold">${h.t1_side}</span> @ $${h.t1_price.toFixed(3)}`;
-            else if (h.t1_override) t1Str = `<span class="ofa-static">OFA_OVERRIDE</span>`;
+            else if (h.t1_shadow) t1Str = `<span class="ofa-static">OFA_OBSERVING</span>`;
             else if (h.t1_guarded) t1Str = `<span class="guard-static">🛡 GUARDED</span>`;
             
             let t2Str = '--';
@@ -511,7 +512,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         "time": m.close_time, "slug": m.slug, "reason": m.close_reason,
                         "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price, "pnl": m.realized_pnl,
                         "t1_side": m.t1_side, "t1_price": m.t1_price, "t1_time": m.t1_time,
-                        "t1_guarded": m.t1_guarded, "t1_guard_ratio": m.t1_guard_ratio, "t1_override": getattr(m, 'ofa_override', False),
+                        "t1_guarded": m.t1_guarded, "t1_guard_ratio": m.t1_guard_ratio, "t1_shadow": getattr(m, 'ofa_shadow_flag', False),
                         "t2_side": m.t2_side, "t2_price": m.t2_price, "t2_time": m.t2_time
                     })
                 else:
@@ -562,7 +563,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             files = [
                 ("trades_full.csv", ["Timestamp", "Slug", "Action", "Side", "Executed_Price", "Share_Quantity", "Fees_Paid", "TTR_at_Execution", "Realized_PnL", "Verify_Link"]),
                 ("snapshot_live.csv", ["Timestamp", "Slug", "State", "Yes_Ask", "Yes_Bid", "No_Ask", "No_Bid"]),
-                ("telemetry_shadow.csv", ["Timestamp", "Slug", "Token", "TTR", "Ticker_Price", "Local_Bid_Vol", "Local_Ask_Vol", "Imbalance_Ratio", "Signal"])
+                ("telemetry_shadow.csv", ["Timestamp", "Slug", "Token", "TTR", "Ticker_Price", "Local_Bid_Vol", "Local_Ask_Vol", "Imbalance_Ratio", "Signal", "Vel_Pct", "Vel_Flat", "OFA_Signal"])
             ]
             try:
                 for f, headers in files:
@@ -582,8 +583,8 @@ def run_server():
     server.serve_forever()
 
 # ─── CORE STRATEGY ───
-def check_guard_and_velocity(mdm: MarketData, loser_book: OrderBook, winner_side: str) -> Tuple[float, str, bool]:
-    if not loser_book: return 0.0, "", False
+def check_guard_and_velocity(mdm: MarketData, loser_book: OrderBook, winner_side: str, now: float) -> Tuple[float, str, bool, float, float]:
+    if not loser_book: return 0.0, "", False, 0.0, 0.0
     b_vol = loser_book.get_local_vols(loser_book.bid, "bid", 0.10)
     a_vol = loser_book.get_local_vols(loser_book.ask, "ask", 0.10)
     
@@ -593,18 +594,23 @@ def check_guard_and_velocity(mdm: MarketData, loser_book: OrderBook, winner_side
     elif a_vol > 0 and b_vol / a_vol >= GUARD_IMBALANCE_THRESHOLD: ratio, wall_type = (b_vol / a_vol), "BID_WALL"
     elif b_vol > 0 and a_vol / b_vol >= GUARD_IMBALANCE_THRESHOLD: ratio, wall_type = (a_vol / b_vol), "ASK_WALL"
     
-    override_velocity = False
+    shadow_velocity = False
+    vel_pct, vel_flat = 0.0, 0.0
+    
     if ratio >= GUARD_IMBALANCE_THRESHOLD:
         hist = mdm.history_vol_yes if winner_side == "YES" else mdm.history_vol_no
         if len(hist) >= 4:
             past_b_vol = hist[0][1] 
             current_b_vol = hist[-1][1]
+            vel_flat = current_b_vol - past_b_vol
+            if past_b_vol > 0: vel_pct = current_b_vol / past_b_vol
+            
             if past_b_vol > 0 and (current_b_vol / past_b_vol >= 1.25):
-                override_velocity = True
+                shadow_velocity = True
             elif current_b_vol - past_b_vol >= 1000:
-                override_velocity = True
+                shadow_velocity = True
                 
-    return ratio, wall_type, override_velocity
+    return ratio, wall_type, shadow_velocity, vel_pct, vel_flat
 
 def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares: float, fees: float, ttr: int, pnl: float = 0.0):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -734,18 +740,25 @@ def evaluate_market(mdm: MarketData, now: float):
         else: winner_bid, loser_side, loser_bid, loser_shares, loser_book = nb.bid, "YES", yb.bid, mdm.yes_shares, yb
             
         if not mdm.t1_executed and winner_bid >= SELL_LOSER_T1_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
-            guard_ratio, wall_type, override_vel = check_guard_and_velocity(mdm, loser_book, winner_side)
+            guard_ratio, wall_type, shadow_vel, v_pct, v_flat = check_guard_and_velocity(mdm, loser_book, winner_side, now)
             
-            if guard_ratio >= GUARD_IMBALANCE_THRESHOLD and not override_vel:
+            # Log OFA Shadow Data
+            if guard_ratio >= GUARD_IMBALANCE_THRESHOLD and not mdm.ofa_shadow_flag:
+                mdm.ofa_shadow_flag = True
+                ts_log = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                ofa_sig = "WOULD_OVERRIDE" if shadow_vel else "STAY_BLOCKED"
+                try:
+                    with open("telemetry_shadow.csv", "a", newline="") as f:
+                        csv.writer(f).writerow([ts_log, mdm.slug, loser_side, ttr, f"{loser_bid:.3f}", 0, 0, f"{guard_ratio:.1f}", f"SHADOW_{wall_type}", f"{v_pct:.2f}", f"{v_flat:.0f}", ofa_sig])
+                except Exception: pass
+
+            if guard_ratio >= GUARD_IMBALANCE_THRESHOLD:
+                if shadow_vel: print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] [OFA_SHADOW_OVERRIDE] {mdm.slug} | OFA sees velocity, but bot stays blocked.", flush=True)
                 if not mdm.t1_guarded:
                     mdm.t1_guarded = True
                     mdm.t1_guard_ratio = guard_ratio
                     execute_trade(mdm, loser_side, loser_bid, f"BLOCKED_{wall_type}", 0.0, 0.0, ttr)
             else:
-                if override_vel and guard_ratio >= GUARD_IMBALANCE_THRESHOLD:
-                    mdm.ofa_override = True
-                    execute_trade(mdm, winner_side, winner_bid, "OFA_VELOCITY_OVERRIDE", 0.0, 0.0, ttr)
-                    
                 mdm.t1_executed = True
                 shares_to_sell = loser_shares * 0.50
                 fee = (shares_to_sell * loser_bid) * 0.001 
@@ -753,9 +766,9 @@ def evaluate_market(mdm: MarketData, now: float):
                 execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T1", shares_to_sell, fee, ttr)
             
         elif winner_bid >= SELL_LOSER_T2_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
-            guard_ratio, wall_type, override_vel = check_guard_and_velocity(mdm, loser_book, winner_side)
+            guard_ratio, wall_type, shadow_vel, v_pct, v_flat = check_guard_and_velocity(mdm, loser_book, winner_side, now)
             
-            if guard_ratio >= GUARD_IMBALANCE_THRESHOLD and not override_vel:
+            if guard_ratio >= GUARD_IMBALANCE_THRESHOLD:
                 if not mdm.t2_guarded:
                     mdm.t2_guarded = True
                     mdm.t2_guard_ratio = guard_ratio
@@ -825,14 +838,14 @@ def telemetry_loop():
                         y_b_vol, y_a_vol = yb.get_local_vols(yb.bid, "bid", 0.10), yb.get_local_vols(yb.ask, "ask", 0.10)
                         r_y = y_b_vol / y_a_vol if y_a_vol > 0 else 999.0
                         r_y_inv = y_a_vol / y_b_vol if y_b_vol > 0 else 999.0
-                        if r_y >= 2.0: writer.writerow([ts, m.slug, "YES", ttr, f"{yb.ask:.3f}", f"{y_b_vol:.0f}", f"{y_a_vol:.0f}", f"{r_y:.1f}", "BID_WALL"])
-                        elif r_y_inv >= 2.0: writer.writerow([ts, m.slug, "YES", ttr, f"{yb.ask:.3f}", f"{y_b_vol:.0f}", f"{y_a_vol:.0f}", f"{r_y_inv:.1f}", "ASK_WALL"])
+                        if r_y >= 2.0: writer.writerow([ts, m.slug, "YES", ttr, f"{yb.ask:.3f}", f"{y_b_vol:.0f}", f"{y_a_vol:.0f}", f"{r_y:.1f}", "BID_WALL", "", "", ""])
+                        elif r_y_inv >= 2.0: writer.writerow([ts, m.slug, "YES", ttr, f"{yb.ask:.3f}", f"{y_b_vol:.0f}", f"{y_a_vol:.0f}", f"{r_y_inv:.1f}", "ASK_WALL", "", "", ""])
                     if nb and nb.bids and nb.asks:
                         n_b_vol, n_a_vol = nb.get_local_vols(nb.bid, "bid", 0.10), nb.get_local_vols(nb.ask, "ask", 0.10)
                         r_n = n_b_vol / n_a_vol if n_a_vol > 0 else 999.0
                         r_n_inv = n_a_vol / n_b_vol if n_b_vol > 0 else 999.0
-                        if r_n >= 2.0: writer.writerow([ts, m.slug, "NO", ttr, f"{nb.ask:.3f}", f"{n_b_vol:.0f}", f"{n_a_vol:.0f}", f"{r_n:.1f}", "BID_WALL"])
-                        elif r_n_inv >= 2.0: writer.writerow([ts, m.slug, "NO", ttr, f"{nb.ask:.3f}", f"{n_b_vol:.0f}", f"{n_a_vol:.0f}", f"{r_n_inv:.1f}", "ASK_WALL"])
+                        if r_n >= 2.0: writer.writerow([ts, m.slug, "NO", ttr, f"{nb.ask:.3f}", f"{n_b_vol:.0f}", f"{n_a_vol:.0f}", f"{r_n:.1f}", "BID_WALL", "", "", ""])
+                        elif r_n_inv >= 2.0: writer.writerow([ts, m.slug, "NO", ttr, f"{nb.ask:.3f}", f"{n_b_vol:.0f}", f"{n_a_vol:.0f}", f"{r_n_inv:.1f}", "ASK_WALL", "", "", ""])
         except Exception: pass
         time.sleep(5)
 
