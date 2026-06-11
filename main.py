@@ -1,10 +1,20 @@
+"""
+V6.14 POLYMARKET ENDGAME TRADING ENGINE (main.py)
+-------------------------------------------------
+Architecture:
+- OFA Velocity Override: Bypasses static guard if spoof wall detected.
+- Execution Engine: 50% Gradual Exit, $0.02 Offset Penetration.
+- Observation Engine: Decoupled Telemetry, Cloud Ghost UI, Cats Counter.
+- Dependencies: Standard Python Library ONLY.
+"""
+
 import time
 import collections
 import logging
 import sys
 from typing import Dict, Optional
 
-# Configure standard stream logging so it shows up in your cloud console
+# Configure standard stream logging to ensure visibility in cloud consoles (Railway/Docker)
 logging.basicConfig(
     stream=sys.stdout,
     level=logging.INFO,
@@ -18,6 +28,7 @@ logger = logging.getLogger("V6.14_Engine")
 # ==========================================
 class OFAVelocityTracker:
     def __init__(self, lookback_horizon_secs: int = 15, tick_interval_secs: int = 5):
+        """Maintains a rolling memory buffer to compute order book velocity."""
         self.maxlen = max(1, int(lookback_horizon_secs / tick_interval_secs))
         self.history: Dict[str, collections.deque] = collections.defaultdict(
             lambda: collections.deque(maxlen=self.maxlen)
@@ -27,6 +38,7 @@ class OFAVelocityTracker:
         self.history[slug].append((time.time(), bid_vol, ask_vol))
 
     def is_wall_fake(self, slug: str, target_side: str) -> bool:
+        """Evaluates if the wall is a stagnant Market Maker spoof."""
         buffer = self.history[slug]
         if len(buffer) < self.maxlen:
             return False 
@@ -37,6 +49,7 @@ class OFAVelocityTracker:
         vol_delta = latest_vol - initial_vol
         growth_rate = (latest_vol / initial_vol) if initial_vol > 0 else 1.0
 
+        # OVERRIDE RULE: Volume growth < 25% AND absolute delta < 1000 shares
         if growth_rate < 1.25 and abs(vol_delta) < 1000:
             return True
         return False
@@ -48,10 +61,12 @@ class V614_TradingEngine:
     def __init__(self):
         self.ofa_tracker = OFAVelocityTracker()
         
+        # Core Parameters
         self.trigger_threshold = 0.86
         self.gradual_exit_pct = 0.50
         self.static_guard_ratio = 3.5
         
+        # State Tracking
         self.cats_count = 0 
         self.dashboard_ui: Dict[str, dict] = {} 
         self.positions: Dict[str, Dict[str, float]] = collections.defaultdict(
@@ -62,20 +77,26 @@ class V614_TradingEngine:
         slug = market_data['Slug']
         ttr = market_data['TTR']
         
+        # 1. DECOUPLED TELEMETRY (Logs until 30s after expiration)
         if ttr >= -30:
-            pass # Hook for your CSV telemetry writer
+            self._log_to_telemetry_shadow(slug, market_data)
 
+        # 2. UPDATE GHOST UI & CATS COUNTER
         self._update_ghost_dashboard(slug, market_data)
 
+        # 3. GHOST UI CLEANUP (Drop market from screen 5s after expiration)
         if ttr < -5 and slug in self.dashboard_ui:
             del self.dashboard_ui[slug]
 
+        # 4. TRADING KILL-SWITCH
         if ttr <= 0:
             return None
             
+        # 5. PORTFOLIO CHECK (Have we already exited T1?)
         if self.positions[slug]["YES"] <= 5.0 or self.positions[slug]["NO"] <= 5.0:
             return None
 
+        # 6. EVALUATE SALVAGE DECISION
         return self.evaluate_salvage(market_data)
 
     def evaluate_salvage(self, market_data: dict) -> Optional[dict]:
@@ -85,6 +106,7 @@ class V614_TradingEngine:
         imbalance = market_data['Imbalance_Ratio']
         losing_side = market_data['Losing_Side']
 
+        # Update Memory
         self.ofa_tracker.update_snapshot(slug, market_data['Local_Bid_Vol'], market_data['Local_Ask_Vol'])
 
         if ttr > 60: return None
@@ -95,6 +117,7 @@ class V614_TradingEngine:
         if not static_guard_blocked:
             return self.build_execution_payload(market_data, "CLEAN_BOOK")
 
+        # OFA OVERRIDE LOGIC
         is_fake_wall = self.ofa_tracker.is_wall_fake(slug, target_side=losing_side)
         if is_fake_wall:
             return self.build_execution_payload(market_data, "OFA_SPOOF_OVERRIDE")
@@ -102,6 +125,7 @@ class V614_TradingEngine:
         return None
 
     def build_execution_payload(self, market_data: dict, reason: str) -> dict:
+        """Constructs Payload with $0.02 Offset Penetration."""
         current_bid = market_data['Bid_Price']
         penetration_limit_price = max(0.01, round(current_bid - 0.02, 2))
 
@@ -138,16 +162,22 @@ class V614_TradingEngine:
         ui_state["Imbalance"] = market_data['Imbalance_Ratio']
         ui_state["TTR"] = market_data['TTR']
         
+        # Cats Counter Logic
         if market_data['TTR'] <= 0 and ui_state["Status"] == "[LOCKED IN]":
             sold_token = ui_state["Sold_Side"]
             ultimate_winner = market_data['Winning_Side']
             
+            # Whipsaw: We sold the token, but it ended up winning at TTR 0
             if sold_token == ultimate_winner and not ui_state["Cat_Logged"]:
                 self.cats_count += 1
                 ui_state["Cat_Logged"] = True
                 logger.warning(f"⚠️ CATASTROPHIC WHIPSAW DETECTED ON {slug}!")
             
             ui_state["Status"] = "[RESOLVED]"
+
+    def _log_to_telemetry_shadow(self, slug: str, market_data: dict):
+        """Hook for your local CSV writer or Database ingestion."""
+        pass
 
 # ==========================================
 # 3. CLOUD-COMPATIBLE LOG DASHBOARD
@@ -174,25 +204,38 @@ def main():
     logger.info("Starting V6.14 Polymarket Endgame Engine [Cloud Edition]...")
     bot = V614_TradingEngine()
     
-    # Mock data to simulate the exact final 60 seconds of a volatile market
-    test_feed = [
-        {'Slug': 'btc-updown-5m-1781178900', 'TTR': 65, 'Winning_Side': 'YES', 'Losing_Side': 'NO', 'Mid_Price': 0.85, 'Bid_Price': 0.14, 'Imbalance_Ratio': 2.2, 'Local_Bid_Vol': 1500, 'Local_Ask_Vol': 6000},
-        {'Slug': 'btc-updown-5m-1781178900', 'TTR': 60, 'Winning_Side': 'YES', 'Losing_Side': 'NO', 'Mid_Price': 0.88, 'Bid_Price': 0.12, 'Imbalance_Ratio': 4.2, 'Local_Bid_Vol': 1500, 'Local_Ask_Vol': 6050},
-        {'Slug': 'btc-updown-5m-1781178900', 'TTR': 55, 'Winning_Side': 'YES', 'Losing_Side': 'NO', 'Mid_Price': 0.89, 'Bid_Price': 0.11, 'Imbalance_Ratio': 4.3, 'Local_Bid_Vol': 1500, 'Local_Ask_Vol': 6100},
-        {'Slug': 'btc-updown-5m-1781178900', 'TTR': 0,  'Winning_Side': 'NO',  'Losing_Side': 'YES','Mid_Price': 1.00, 'Bid_Price': 0.00, 'Imbalance_Ratio': 0.0, 'Local_Bid_Vol': 0,    'Local_Ask_Vol': 0},
-        {'Slug': 'btc-updown-5m-1781178900', 'TTR': -3, 'Winning_Side': 'NO',  'Losing_Side': 'YES','Mid_Price': 1.00, 'Bid_Price': 0.00, 'Imbalance_Ratio': 0.0, 'Local_Bid_Vol': 0,    'Local_Ask_Vol': 0},
-    ]
-
-    for tick in test_feed:
-        time.sleep(1) # Simulates data arrival
+    # ---------------------------------------------------------
+    # 🔌 LIVE DATA INGESTION LOOP
+    # ---------------------------------------------------------
+    """
+    try:
+        # Example: Connect to your Polymarket WebSocket or polling mechanism
+        # ws_client = GammaWebSocketClient(...)
         
-        payload = bot.process_market_tick(tick)
-        
-        if payload:
-            logger.info(f"Generated Order Outbound: {payload}")
+        while True:
+            # 1. Fetch live tick
+            # raw_tick = ws_client.recv()
+            # formatted_tick = format_tick(raw_tick) # Ensure keys match engine expectations
             
-        # Prints the dashboard table directly to your Docker/Railway logs
-        render_cloud_dashboard(bot)
+            # 2. Process through the engine
+            # execution_payload = bot.process_market_tick(formatted_tick)
+            
+            # 3. Fire API execution if triggered
+            # if execution_payload:
+            #     logger.info(f"Generated Order Outbound: {execution_payload}")
+            #     gamma_client.create_order(execution_payload)
+                
+            # 4. Render Dashboard (Consider rate-limiting this print statement to every 1s-3s)
+            # render_cloud_dashboard(bot)
+            
+            time.sleep(0.1) # Prevent CPU pegging if polling
+            
+    except KeyboardInterrupt:
+        logger.info("Engine safely shut down by user.")
+    except Exception as e:
+        logger.error(f"Critical execution error: {e}")
+    """
+    logger.info("Awaiting live data integration block...")
 
 if __name__ == "__main__":
     main()
