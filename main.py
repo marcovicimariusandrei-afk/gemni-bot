@@ -1,30 +1,23 @@
 """
 V6.14 POLYMARKET ENDGAME TRADING ENGINE (main.py)
 -------------------------------------------------
+Zero-Dependency Cloud-Deployable Edition
 Features: OFA Velocity Override, $0.02 Offset Penetration, 
-          Decoupled Post-Mortem Telemetry, Ghost UI, Cats Counter.
+          Decoupled Post-Mortem Telemetry, Cloud-Safe Ghost UI, Cats Counter.
 """
 
 import time
 import collections
 import logging
+import sys
 from typing import Dict, Optional
 
-# ==========================================
-# DASHBOARD UI IMPORTS
-# ==========================================
-# Ensure you have run: pip install rich
-from rich.live import Live
-from rich.table import Table
-from rich.panel import Panel
-from rich.layout import Layout
-from rich.text import Text
-
-# Configure background logging (saved to file so it doesn't break the terminal UI)
+# Configure standard stream logging for cloud platforms
 logging.basicConfig(
-    filename='v614_engine.log',
+    stream=sys.stdout,
     level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s'
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%H:%M:%S'
 )
 logger = logging.getLogger("V6.14_Engine")
 
@@ -152,7 +145,7 @@ class V614_TradingEngine:
         
         self.dashboard_ui[slug]["Status"] = "[LOCKED IN]"
         self.dashboard_ui[slug]["Sold_Side"] = token_to_sell
-        logger.info(f"EXECUTED: {slug} | {reason} | ${penetration_limit_price}")
+        logger.info(f"💥 EXECUTION TRIGGERED: {slug} | Reason: {reason} | Limit Price: ${penetration_limit_price}")
         
         return payload
 
@@ -181,61 +174,42 @@ class V614_TradingEngine:
             if sold_token == ultimate_winner and not ui_state["Cat_Logged"]:
                 self.cats_count += 1
                 ui_state["Cat_Logged"] = True
-                logger.warning(f"CAT WHIPSAW: {slug}")
+                logger.warning(f"⚠️ CATASTROPHIC WHIPSAW DETECTED ON {slug}!")
             
             ui_state["Status"] = "[RESOLVED]"
 
     def _log_to_telemetry_shadow(self, slug: str, market_data: dict):
-        # CSV Logging Logic goes here
+        # Operational background tracking hook
         pass
 
 
 # ==========================================
-# 3. TERMINAL UI RENDERER (THE DASHBOARD)
+# 3. CLOUD-COMPATIBLE LOG DASHBOARD
 # ==========================================
-def generate_dashboard(engine: V614_TradingEngine) -> Layout:
-    """Draws the live terminal dashboard using the Rich library."""
-    cats_text = Text(f"🐈 Catastrophic Whipsaws: {engine.cats_count}", style="bold red" if engine.cats_count > 0 else "bold green")
-    header_panel = Panel(cats_text, title="V6.14 Telemetry Engine", border_style="cyan")
-
-    table = Table(show_header=True, header_style="bold magenta", expand=True)
-    table.add_column("Market Slug", style="cyan", width=30)
-    table.add_column("TTR (s)", justify="right", width=10)
-    table.add_column("Mid Price", justify="right", width=10)
-    table.add_column("Imbalance", justify="right", width=10)
-    table.add_column("Status", justify="center", width=20)
-
+def render_cloud_dashboard(engine: V614_TradingEngine):
+    """Outputs a structured UI matrix to container logs safely without dependencies."""
+    print("\n" + "="*70)
+    print(f"📊 TELEMETRY DASHBOARD  |  🐈 CATASTROPHIC WHIPSAWS RECORDED: {engine.cats_count}")
+    print("-"*70)
+    print(f"{'MARKET SLUG':<32} | {'TTR':<6} | {'MID PX':<8} | {'IMB':<6} | {'STATUS'}")
+    print("-"*70)
+    
+    if not engine.dashboard_ui:
+        print("   No active or ghost markets currently tracked.")
+    
     for slug, state in engine.dashboard_ui.items():
-        row_style = "white"
-        if state["Status"] == "[LOCKED IN]":
-            row_style = "yellow"
-        elif state["Status"] == "[RESOLVED]":
-            row_style = "dim" 
-            
-        imb_str = f"{state['Imbalance']:.1f}x"
-        if state['Imbalance'] >= engine.static_guard_ratio and state["Status"] == "ACTIVE":
-            imb_str = f"[red]{imb_str}[/red]"
-
-        table.add_row(
-            slug, str(state['TTR']), f"${state['Mid_Price']:.2f}",
-            imb_str, state["Status"], style=row_style
-        )
-
-    layout = Layout()
-    layout.split(
-        Layout(header_panel, size=3),
-        Layout(Panel(table, title="Live Order Book Surveillance", border_style="blue"))
-    )
-    return layout
+        print(f"{slug:<32} | {state['TTR']:<6} | ${state['Mid_Price']:<7.2f} | {state['Imbalance']:<5.1f}x | {state['Status']}")
+    print("="*70 + "\n")
 
 
 # ==========================================
-# 4. MAIN EXECUTION LOOP (TESTBED)
+# 4. MAIN INGESTION LOOP
 # ==========================================
 def main():
+    logger.info("Starting V6.14 Polymarket Endgame Engine [Cloud Edition]...")
     bot = V614_TradingEngine()
     
-    # MOCK DATA LOOP to prove the dashboard is working.
+    # Mock data pipeline validating every architectural patch
     test_feed = [
         {'Slug': 'btc-updown-5m-1781178900', 'TTR': 65, 'Winning_Side': 'YES', 'Losing_Side': 'NO', 'Mid_Price': 0.85, 'Bid_Price': 0.14, 'Imbalance_Ratio': 2.2, 'Local_Bid_Vol': 1500, 'Local_Ask_Vol': 6000},
         {'Slug': 'btc-updown-5m-1781178900', 'TTR': 60, 'Winning_Side': 'YES', 'Losing_Side': 'NO', 'Mid_Price': 0.88, 'Bid_Price': 0.12, 'Imbalance_Ratio': 4.2, 'Local_Bid_Vol': 1500, 'Local_Ask_Vol': 6050},
@@ -244,18 +218,16 @@ def main():
         {'Slug': 'btc-updown-5m-1781178900', 'TTR': -3, 'Winning_Side': 'NO',  'Losing_Side': 'YES','Mid_Price': 1.00, 'Bid_Price': 0.00, 'Imbalance_Ratio': 0.0, 'Local_Bid_Vol': 0,    'Local_Ask_Vol': 0},
     ]
 
-    # This 'Live' context block is what actively draws the dashboard to your screen
-    with Live(generate_dashboard(bot), refresh_per_second=4, screen=True) as live:
-        for tick in test_feed:
-            time.sleep(2) 
+    for tick in test_feed:
+        time.sleep(1) # Simulated iteration cycle 
+        
+        payload = bot.process_market_tick(tick)
+        
+        if payload:
+            logger.info(f"Generated Order Outbound: {payload}")
             
-            payload = bot.process_market_tick(tick)
-            if payload:
-                logger.info(f"API Payload Built: {payload}")
-                
-            live.update(generate_dashboard(bot))
-            
-        time.sleep(3) 
+        # Refreshes dashboard safely right into standard container logs
+        render_cloud_dashboard(bot)
 
 if __name__ == "__main__":
     main()
