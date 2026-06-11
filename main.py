@@ -307,6 +307,9 @@ DASHBOARD_HTML = r"""<!doctype html>
     .queue-container { background: var(--bg-panel); border: 1px solid var(--border-color); padding: 15px 20px; font-family: monospace; font-size: 13px; color: var(--text-light); line-height: 1.8; border-radius: 6px; margin-bottom:35px;}
     .bg-market-row { display: flex; justify-content: space-between; padding: 8px 15px; border-bottom: 1px solid var(--border-color); font-family: monospace; }
     .bg-market-row:last-child { border-bottom: none; }
+    .vault { display: flex; gap: 15px; background: var(--sub-header-bg); padding: 15px; border: 1px solid var(--border-color); align-items: center; justify-content: center; margin-bottom: 25px; border-radius: 6px;}
+    .btn-action { background: #1E293B; color: var(--text-navy); border: 1px solid var(--border-color); padding: 8px 18px; cursor: pointer; font-weight: 700; border-radius: 4px; transition: all 0.2s;}
+    .btn-action:hover { background: #334155; }
 </style>
 </head>
 <body>
@@ -320,6 +323,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         <div class="vital-box"><div class="vital-label">Total Realized P&L</div><div class="vital-value" id="v-pnl">$0.00</div></div>
         <div class="vital-box"><div class="vital-label">Completed Trades</div><div class="vital-value" id="v-trades">0</div></div>
         <div class="vital-box"><div class="vital-label">Active Slots</div><div class="vital-value" id="v-active">0</div></div>
+        <div class="vital-box"><div class="vital-label">Catastrophic Whipsaws</div><div class="vital-value red" id="v-cats">0</div></div>
     </div>
 </div>
 
@@ -335,6 +339,14 @@ DASHBOARD_HTML = r"""<!doctype html>
         <thead><tr><th>Time Closed</th><th>Market Slug</th><th>YES Entry</th><th>NO Entry</th><th>T1 Exit</th><th>Net P&L</th><th>Verify</th></tr></thead>
         <tbody id="log-body"><tr><td colspan="7" style="color: var(--text-light); padding: 20px;">No historical data available.</td></tr></tbody>
     </table>
+</div>
+
+<div class="vault">
+    <span style="font-weight: 800; margin-right: 15px; color: var(--text-navy);">Data Vault:</span>
+    <button class="btn-action" onclick="window.location.href='/api/dl_trades'">Download Trades</button>
+    <button class="btn-action" onclick="window.location.href='/api/dl_snaps'">Download Snapshots</button>
+    <button class="btn-action" style="color: #FCD34D;" onclick="window.location.href='/api/dl_telemetry'">Download Telemetry</button>
+    <button class="btn-action" style="color: #FCA5A5; margin-left: auto; border-color: #7F1D1D;" onclick="deleteFiles()">⚠ Wipe Logs</button>
 </div>
 
 <script>
@@ -372,6 +384,14 @@ function getConvictionHtml(ask) {
     return { pct: fillPct, text: trackerText };
 }
 
+async function deleteFiles() {
+    if(confirm("WARNING: This will permanently delete all logged CSV data on Railway. Continue?")) {
+        await fetch('/api/delete_logs', {method: 'POST'});
+        alert("Logs purged successfully.");
+        window.location.reload();
+    }
+}
+
 setInterval(async () => {
     try {
         const r = await fetch('/api/status');
@@ -390,6 +410,7 @@ setInterval(async () => {
         
         document.getElementById('v-trades').textContent = s.total_trades_count;
         document.getElementById('v-active').textContent = activeMarkets.length;
+        document.getElementById('v-cats').textContent = s.cats_count;
         
         let htmlCards = '';
         let htmlQueue = '';
@@ -571,15 +592,45 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 "uptime_s": int(time.time() - SYSTEM_BOOT_TIME),
                 "ws_connected": GLOBAL_STATE.ws_connected, "pnl": GLOBAL_STATE.total_pnl,
                 "total_trades_count": GLOBAL_STATE.total_trades,
+                "cats_count": GLOBAL_STATE.engine.cats_count,
                 "markets": m_data, "history": history_data[-15:]
             }
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps(payload).encode('utf-8'))
+        elif self.path in ["/api/dl_trades", "/api/dl_snaps", "/api/dl_telemetry"]:
+            filename = "trades_full.csv"
+            if self.path == "/api/dl_snaps": filename = "snapshot_live.csv"
+            elif self.path == "/api/dl_telemetry": filename = "telemetry_shadow.csv"
+            self.send_response(200)
+            self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+            self.send_header('Content-Type', 'text/csv')
+            self.end_headers()
+            try:
+                with open(filename, "rb") as f:
+                    self.wfile.write(f.read())
+            except Exception: pass
         else:
             self.send_response(404)
             self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/api/delete_logs":
+            files = [
+                ("trades_full.csv", ["Timestamp", "Slug", "Action", "Side", "Executed_Price", "Share_Quantity", "Fees_Paid", "TTR_at_Execution", "Realized_PnL"]),
+                ("snapshot_live.csv", ["Timestamp", "Slug", "State", "Yes_Ask", "Yes_Bid", "No_Ask", "No_Bid"]),
+                ("telemetry_shadow.csv", ["Timestamp", "Slug", "Token", "TTR", "Ticker_Price", "Local_Bid_Vol", "Local_Ask_Vol", "Imbalance_Ratio", "Signal", "Vel_Pct", "Vel_Flat", "OFA_Signal"])
+            ]
+            try:
+                for f, headers in files:
+                    with open(f, "w", newline="") as fp: 
+                        csv.writer(fp).writerow(headers)
+                self.send_response(200)
+                self.end_headers()
+            except Exception:
+                self.send_response(500)
+                self.end_headers()
 
     def log_message(self, format, *args): pass
 
@@ -883,7 +934,7 @@ if __name__ == "__main__":
     init_csv()
     sync_time_with_api()
     
-    # Restored Web Server
+    # Web Server
     threading.Thread(target=run_server, daemon=True).start()
     
     threading.Thread(target=btc_oracle_loop, daemon=True).start()
@@ -894,7 +945,7 @@ if __name__ == "__main__":
     threading.Thread(target=discovery_thread, daemon=True).start()
     threading.Thread(target=tick_loop, daemon=True).start()
     
-    # Restored Snapshot loop for UI sparklines
+    # Snapshot loop for UI sparklines
     threading.Thread(target=snapshot_loop, daemon=True).start()
     
     threading.Thread(target=telemetry_loop, daemon=True).start()
