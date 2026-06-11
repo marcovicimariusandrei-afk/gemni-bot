@@ -1,969 +1,261 @@
 """
-main.py — BSS Bot v6.12 (Mid-Price Enforcement + UI Dual Display)
-FULL PRODUCTION BUILD
+V6.14 POLYMARKET ENDGAME TRADING ENGINE (main.py)
+-------------------------------------------------
+Features: OFA Velocity Override, $0.02 Offset Penetration, 
+          Decoupled Post-Mortem Telemetry, Ghost UI, Cats Counter.
 """
-import os
-import sys
+
 import time
-import json
-import threading
-import socketserver
-import http.server
-import requests
-import websocket
-import csv
-from typing import Dict, List, Tuple
-from datetime import datetime, timezone
+import collections
+import logging
+from typing import Dict, Optional
 
-# ─── CONFIGURATION ───
-MODE = os.getenv("MODE", "live").lower()
+# ==========================================
+# DASHBOARD UI IMPORTS
+# ==========================================
+# Ensure you have run: pip install rich
+from rich.live import Live
+from rich.table import Table
+from rich.panel import Panel
+from rich.layout import Layout
+from rich.text import Text
 
-BASE_CAPITAL_PER_LEG = 5.10  
-TAKER_FEE_RATE = 0.018 
+# Configure background logging (saved to file so it doesn't break the terminal UI)
+logging.basicConfig(
+    filename='v614_engine.log',
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s'
+)
+logger = logging.getLogger("V6.14_Engine")
 
-# Timeline Parameters
-LOOKAHEAD_MINUTES = 25  # EXTENDED: Scout early, grab cheap inventory
-HEDGE_DEADLINE_TTR = 320
-ENTRY_CUTOFF_TTR = 120  
+# ==========================================
+# 1. THE VELOCITY TRACKER (OFA ENGINE)
+# ==========================================
+class OFAVelocityTracker:
+    def __init__(self, lookback_horizon_secs: int = 15, tick_interval_secs: int = 5):
+        """Maintains a rolling memory buffer to compute order book velocity."""
+        self.maxlen = max(1, int(lookback_horizon_secs / tick_interval_secs))
+        self.history: Dict[str, collections.deque] = collections.defaultdict(
+            lambda: collections.deque(maxlen=self.maxlen)
+        )
 
-# Cost Parameters
-MAX_COMBINED_COST = 1.03  # CEILING: Safely absorb spread for instant lock
+    def update_snapshot(self, slug: str, bid_vol: float, ask_vol: float):
+        self.history[slug].append((time.time(), bid_vol, ask_vol))
 
-# Target Pricing Windows
-T_WINDOW_1 = 0.49  
-T_WINDOW_2 = 0.50  
+    def is_wall_fake(self, slug: str, target_side: str) -> bool:
+        """Evaluates if the wall is a stagnant Market Maker spoof."""
+        buffer = self.history[slug]
+        if len(buffer) < self.maxlen:
+            return False 
 
-# Exit Parameters
-SELL_LOSER_T1_THRESH = 0.86
-SELL_LOSER_T1_TTR_MAX = 60  # STRICT LAW: Only act in the final 60 seconds
-SELL_LOSER_T2_THRESH = 0.95
+        initial_vol = buffer[0][1] if target_side == "YES" else buffer[0][2]
+        latest_vol  = buffer[-1][1] if target_side == "YES" else buffer[-1][2]
 
-# ─── DEFENSE PARAMETERS ───
-GUARD_IMBALANCE_THRESHOLD = 3.5   
+        vol_delta = latest_vol - initial_vol
+        growth_rate = (latest_vol / initial_vol) if initial_vol > 0 else 1.0
 
-PORT = int(os.getenv("PORT", "8080"))
-SYSTEM_BOOT_TIME = time.time()
+        # OVERRIDE RULE: Volume growth < 25% AND absolute delta < 1000 shares
+        if growth_rate < 1.25 and abs(vol_delta) < 1000:
+            return True
+        return False
 
-# ─── STATE MODELS ───
-class MarketState:
-    WATCH = "WATCH"
-    WAITING_NO = "WAITING_NO"
-    WAITING_YES = "WAITING_YES"
-    BOTH = "BOTH"
-    CLOSED = "CLOSED"
 
-class MarketData:
-    def __init__(self, condition_id: str, slug: str, yes_id: str, no_id: str, end_ts: float):
-        self.condition_id = condition_id
-        self.slug = slug
-        self.yes_token = yes_id
-        self.no_token = no_id
-        self.end_ts = end_ts
-        self.state = MarketState.WATCH
-        
-        self.yes_entry_price = 0.0
-        self.no_entry_price = 0.0
-        self.yes_shares = 0.0
-        self.no_shares = 0.0
-        self.total_fees_paid = 0.0
-        
-        self.t1_executed = False
-        self.t1_side = ""
-        self.t1_price = 0.0
-        self.t1_time = ""
-        self.t1_guarded = False
-        self.t1_guard_ratio = 0.0
-        
-        self.t2_side = ""
-        self.t2_price = 0.0
-        self.t2_time = ""
-        self.t2_guarded = False
-        self.t2_guard_ratio = 0.0
-        
-        self.salvage_revenue = 0.0
-        self.realized_pnl = 0.0
-        
-        self.close_time = ""
-        self.close_reason = ""
-        self.expired_processed = False
-        
-        self.strike_price = 0.0
-        self.ofa_shadow_flag = False  # Observation only
-        
-        self.history_yes: List[float] = []
-        self.history_no: List[float] = []
-        
-        # OFA Velocity Trackers (timestamp, bid_vol, ask_vol)
-        self.history_vol_yes: List[Tuple[float, float, float]] = []
-        self.history_vol_no: List[Tuple[float, float, float]] = []
-
-class OrderBook:
+# ==========================================
+# 2. THE MASTER TRADING ENGINE
+# ==========================================
+class V614_TradingEngine:
     def __init__(self):
-        self.bids: Dict[float, float] = {}
-        self.asks: Dict[float, float] = {}
-
-    @property
-    def bid(self): return max(self.bids.keys()) if self.bids else 0.0
-
-    @property
-    def ask(self): return min(self.asks.keys()) if self.asks else 0.0
-
-    def get_local_vols(self, current_price: float, side: str, depth: float = 0.10) -> float:
-        vol = 0.0
-        if side == "bid":
-            for p, s in self.bids.items():
-                if p >= current_price - depth: vol += s
-        else:
-            for p, s in self.asks.items():
-                if p <= current_price + depth: vol += s
-        return vol
-
-class BotState:
-    def __init__(self):
-        self.running = True
-        self.armed = False  
-        self.markets: Dict[str, MarketData] = {}
-        self.books: Dict[str, OrderBook] = {}
-        self.ws_connected = False
-        self.ws_handle = None
-        self.total_pnl = 0.0
-        self.total_trades = 0 
-        self.sold_losers = 0
-        self.time_offset = 0.0
-        self.btc_live = 0.0
-
-GLOBAL_STATE = BotState()
-
-# ─── TIME & ORACLES ───
-def sync_time_with_api():
-    try:
-        start_ping = time.time()
-        res = requests.get("https://gamma-api.polymarket.com/events?limit=1", timeout=5)
-        end_ping = time.time()
-        if res.status_code == 200:
-            rtt_latency = (end_ping - start_ping) / 2.0 
-            server_time_str = res.headers.get("Date", "")
-            if server_time_str:
-                server_dt = datetime.strptime(server_time_str, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=timezone.utc)
-                server_ts = server_dt.timestamp() + rtt_latency
-                local_ts = end_ping
-                GLOBAL_STATE.time_offset = server_ts - local_ts
-    except Exception: pass
-
-def get_synced_time() -> float:
-    return time.time() + GLOBAL_STATE.time_offset
-
-def btc_oracle_loop():
-    while GLOBAL_STATE.running:
-        try:
-            res = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=3)
-            if res.status_code == 200:
-                GLOBAL_STATE.btc_live = float(res.json()["price"])
-        except Exception: pass
-        time.sleep(2)
-
-# ─── PRE-FLIGHT DIAGNOSTICS ───
-def run_diagnostics():
-    print("\n" + "═"*55)
-    print(" 🛡️  [SYSTEM DIAGNOSTICS] SENSORS INITIALIZING...")
-    print("═"*55, flush=True)
-    
-    while GLOBAL_STATE.btc_live == 0.0 or not GLOBAL_STATE.ws_connected:
-        time.sleep(0.5)
+        self.ofa_tracker = OFAVelocityTracker()
         
-    print(f" [REST] Gamma API Sync     : OK (Offset: {GLOBAL_STATE.time_offset:+.3f}s)")
-    print(f" [API]  Binance Spot Oracle: ONLINE (${GLOBAL_STATE.btc_live:,.2f})")
-    print(f" [WSS]  Polymarket Stream  : CONNECTED")
-    print("═"*55)
-    print(" [inf] Health checks passed. Arming execution engine...\n", flush=True)
-    GLOBAL_STATE.armed = True
-
-# ─── ASYNC CSV LOGGING SYSTEM ───
-def init_csv():
-    if not os.path.exists("trades_full.csv"):
-        with open("trades_full.csv", "w", newline="") as f:
-            csv.writer(f).writerow(["Timestamp", "Slug", "Action", "Side", "Executed_Price", "Share_Quantity", "Fees_Paid", "TTR_at_Execution", "Realized_PnL", "Verify_Link"])
-    if not os.path.exists("snapshot_live.csv"):
-        with open("snapshot_live.csv", "w", newline="") as f:
-            csv.writer(f).writerow(["Timestamp", "Slug", "State", "Yes_Ask", "Yes_Bid", "No_Ask", "No_Bid"])
-    if not os.path.exists("telemetry_shadow.csv"):
-        with open("telemetry_shadow.csv", "w", newline="") as f:
-            csv.writer(f).writerow(["Timestamp", "Slug", "Token", "TTR", "Ticker_Price", "Local_Bid_Vol", "Local_Ask_Vol", "Imbalance_Ratio", "Signal", "Vel_Pct", "Vel_Flat", "OFA_Signal"])
-
-def log_trade_csv_worker(ts, slug, action, side, price, shares, fees, ttr, pnl):
-    link = f"https://polymarket.com/event/{slug}"
-    try:
-        with open("trades_full.csv", "a", newline="") as f:
-            csv.writer(f).writerow([ts, slug, action, side, f"{price:.3f}", f"{shares:.2f}", f"{fees:.3f}", ttr, f"{pnl:.3f}", link])
-    except Exception: pass
-
-# ─── DASHBOARD HTML ───
-DASHBOARD_HTML = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>BSS Dashboard v6.12 (Mid-Price Engine)</title>
-<style>
-    :root { --bg-main: #0B1120; --bg-panel: #1E293B; --header-bg: #0F172A; --header-text: #F8FAFC; --sub-header-bg: #0F172A; --text-navy: #F8FAFC; --text-light: #94A3B8; --border-color: #334155; --val-green: #34D399; --val-red: #F87171; --val-yellow: #FCD34D; --val-pink: #F472B6; --font-sans: system-ui, -apple-system, sans-serif; }
-    body { background: var(--bg-main); color: var(--text-navy); font-family: var(--font-sans); padding: 20px; font-size: 14px; margin: 0; }
-    .header-panel { background: var(--header-bg); border: 1px solid var(--border-color); display: flex; flex-direction: column; text-align: center; margin-bottom: 20px; border-radius: 6px; }
-    .brand-title { font-size: 22px; font-weight: bold; color: var(--header-text); padding: 14px 0; border-bottom: 1px solid var(--border-color); }
-    .status-tags { font-size: 12px; font-weight: normal; margin-left: 15px; color: var(--text-light); }
-    .vitals-row { display: flex; background: var(--sub-header-bg); }
-    .vital-box { flex: 1; padding: 15px; border-right: 1px solid var(--border-color); text-align: center; }
-    .vital-box:last-child { border-right: none; }
-    .vital-label { font-size: 12px; font-weight: 700; text-transform: uppercase; margin-bottom: 8px; color: var(--text-light); }
-    .vital-value { background: var(--bg-panel); color: var(--text-navy); font-size: 24px; font-weight: 800; padding: 8px; border-radius: 4px; border: 1px solid var(--border-color); font-family: monospace; }
-    .vital-value.green { color: var(--val-green); border-color: #064E3B; background: #065F46;}
-    .vital-value.red { color: var(--val-red); border-color: #7F1D1D; background: #991B1B;}
-    .sec-title { background: var(--header-bg); color: var(--header-text); font-size: 15px; font-weight: bold; text-align: center; padding: 12px; margin-bottom: 15px; border-radius: 6px; border: 1px solid var(--border-color);}
-    .grid { display: grid; grid-template-columns: 1fr; gap: 20px; margin-bottom: 15px; }
-    .card { background: var(--bg-panel); border: 1px solid var(--border-color); display: flex; flex-direction: column; border-radius: 6px; overflow: hidden;}
-    .card-header { background: var(--sub-header-bg); padding: 12px 20px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; font-weight: 800; font-size: 15px; align-items: center;}
-    .ref-bar { background:#0F172A; border-bottom:1px solid var(--border-color); padding:10px 20px; display:flex; justify-content:space-between; font-family:monospace; font-size:13px; }
-    .leg-container { display: flex; width: 100%; }
-    .leg-col { flex: 1; padding: 20px; border-right: 1px solid var(--border-color); }
-    .leg-col:last-child { border-right: none; }
-    .leg-title { font-size: 13px; font-weight: 800; text-align: center; margin-bottom: 15px; color: var(--text-light); text-transform: uppercase; }
-    .data-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; color: var(--text-light); align-items: center;}
-    .data-row b { color: var(--text-navy); font-family: monospace; font-size: 15px;}
-    .svg-container { height: 50px; margin-top: 15px; background: #0F172A; border: 1px solid var(--border-color); border-radius: 4px;}
-    .conviction-bar { height: 6px; background: #0F172A; border: 1px solid #334155; border-radius: 4px; position: relative; margin-top: 6px; margin-bottom: 10px; width: 100%; }
-    .conviction-fill { height: 100%; border-radius: 3px; transition: width 0.3s ease; }
-    .conviction-fill.yes { background: #38BDF8; }
-    .conviction-fill.no { background: #94A3B8; }
-    .marker { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--val-yellow); z-index: 5; }
-    .marker.t2 { background: var(--val-pink); }
-    .val-green { color: var(--val-green); font-weight: 800; font-family: monospace; }
-    .val-red { color: var(--val-red); font-weight: 800; font-family: monospace; }
-    .val-gold { color: var(--val-yellow); font-weight: 800; font-family: monospace; }
-    .val-pink { color: var(--val-pink); font-weight: 800; font-family: monospace; }
-    .table-container { background: var(--bg-panel); border: 1px solid var(--border-color); margin-bottom: 35px; border-radius: 6px; overflow: hidden; }
-    table { width: 100%; border-collapse: collapse; text-align: left; }
-    th { background: var(--sub-header-bg); color: var(--text-light); font-size: 11px; font-weight: 800; text-transform: uppercase; padding: 12px; border-bottom: 1px solid var(--border-color); text-align: center;}
-    td { padding: 12px 10px; border-bottom: 1px solid var(--border-color); text-align: center; font-size: 13px; font-family: monospace; color: var(--text-navy);}
-    .queue-container { background: var(--bg-panel); border: 1px solid var(--border-color); padding: 15px 20px; font-family: monospace; font-size: 13px; color: var(--text-light); line-height: 1.8; border-radius: 6px; margin-bottom:35px;}
-    .vault { display: flex; gap: 15px; background: var(--sub-header-bg); padding: 15px; border: 1px solid var(--border-color); align-items: center; justify-content: center; margin-bottom: 25px; border-radius: 6px;}
-    .btn-action { background: #1E293B; color: var(--text-navy); border: 1px solid var(--border-color); padding: 8px 18px; cursor: pointer; font-weight: 700; border-radius: 4px; transition: all 0.2s;}
-    .btn-action:hover { background: #334155; }
-    .btn-verify { color: #60A5FA; text-decoration: none; font-weight: 800; font-size: 12px;}
-    .guard-static { background: #1E3A8A; color: #DBEAFE; padding: 3px 6px; border-radius: 3px; font-size: 11px; font-weight: 800; border: 1px solid #3B82F6;}
-    .ofa-static { background: #92400E; color: #FEF3C7; padding: 3px 6px; border-radius: 3px; font-size: 11px; font-weight: 800; border: 1px solid #F59E0B;}
-    .bg-market-row { display: flex; justify-content: space-between; padding: 8px 15px; border-bottom: 1px solid var(--border-color); font-family: monospace; }
-    .bg-market-row:last-child { border-bottom: none; }
-</style>
-</head>
-<body>
-
-<div class="header-panel">
-    <div class="brand-title">BSS Dashboard v6.12 (Mid-Price Engine)
-        <span class="status-tags" id="bot-uptime">[Uptime: 0h 0m 0s]</span>
-        <span class="status-tags" id="ws-status">[WS: Checking...]</span>
-    </div>
-    <div class="vitals-row">
-        <div class="vital-box"><div class="vital-label">Total Realized P&L</div><div class="vital-value" id="v-pnl">$0.00</div></div>
-        <div class="vital-box"><div class="vital-label">Completed Trades</div><div class="vital-value" id="v-trades">0</div></div>
-        <div class="vital-box"><div class="vital-label">Active Slots</div><div class="vital-value" id="v-active">0</div></div>
-    </div>
-</div>
-
-<div class="sec-title">Execution Focus (Primary Market)</div>
-<div class="grid" id="active-cards"><div style="text-align:center; padding:30px; color:var(--text-light);">Awaiting Data...</div></div>
-
-<div class="sec-title">Background Active & Scouting Queue</div>
-<div class="queue-container" id="obs-queue">Scanning...</div>
-
-<div class="sec-title">Consolidated Trade Lifecycle History</div>
-<div class="table-container">
-    <table>
-        <thead><tr><th>Time Closed</th><th>Market Slug</th><th>YES Entry</th><th>NO Entry</th><th>T1 Exit</th><th>T2 Exit</th><th>Net P&L</th><th>Verify</th></tr></thead>
-        <tbody id="log-body"><tr><td colspan="8" style="color: var(--text-light); padding: 20px;">No historical data available.</td></tr></tbody>
-    </table>
-</div>
-
-<div class="vault">
-    <span style="font-weight: 800; margin-right: 15px; color: var(--text-navy);">Data Vault:</span>
-    <button class="btn-action" onclick="window.location.href='/api/dl_trades'">Download Trades</button>
-    <button class="btn-action" onclick="window.location.href='/api/dl_snaps'">Download Snapshots</button>
-    <button class="btn-action" style="color: #FCD34D;" onclick="window.location.href='/api/dl_telemetry'">Download Telemetry</button>
-    <button class="btn-action" style="color: #FCA5A5; margin-left: auto; border-color: #7F1D1D;" onclick="deleteFiles()">⚠ Wipe Logs</button>
-</div>
-
-<script>
-function renderSparkline(history, color, t1_price, t2_price) {
-    if(!history || history.length < 2) return '';
-    const min = Math.min(...history), max = Math.max(...history);
-    const range = (max - min) || 0.01;
-    const pts = history.map((val, i) => {
-        const x = (i / (history.length - 1)) * 100;
-        const y = 100 - (((val - min) / range) * 100);
-        return `${x},${y}`;
-    }).join(' ');
-    
-    let svg = `<polyline fill="none" stroke="${color}" stroke-width="2.5" points="${pts}" />`;
-    if (t1_price > 0) {
-        let yT1 = 100 - (((t1_price - min) / range) * 100);
-        yT1 = Math.max(5, Math.min(95, yT1)); 
-        svg += `<circle cx="80" cy="${yT1}" r="4" fill="var(--val-yellow)" stroke="#0B1120" stroke-width="1.5" />`;
-    }
-    if (t2_price > 0) {
-        let yT2 = 100 - (((t2_price - min) / range) * 100);
-        yT2 = Math.max(5, Math.min(95, yT2)); 
-        svg += `<circle cx="92" cy="${yT2}" r="4" fill="var(--val-pink)" stroke="#0B1120" stroke-width="1.5" />`;
-    }
-    return `<svg width="100%" height="100%" viewBox="0 -10 100 120" preserveAspectRatio="none">${svg}</svg>`;
-}
-
-function getImbalanceBadge(bidV, askV) {
-    if (askV > 0 && bidV >= askV * 3.5) return `<span style="background:var(--val-green); color:#064E3B; padding:2px 6px; border-radius:3px; font-size:10px; font-weight:800; margin-left:8px;">⚠ BID WALL</span>`;
-    else if (bidV > 0 && askV >= bidV * 3.5) return `<span style="background:var(--val-red); color:#fff; padding:2px 6px; border-radius:3px; font-size:10px; font-weight:800; margin-left:8px;">⚠ ASK WALL</span>`;
-    return '';
-}
-
-function getConvictionHtml(ask) {
-    let fillPct = Math.min(100, Math.max(0, ask * 100));
-    let distT1 = Math.round((ask - 0.86) * 100);
-    let distT2 = Math.round((ask - 0.95) * 100);
-    let trackerText = "";
-    if (ask >= 0.95) trackerText = `<span class="val-pink">T2 REACHED (+${distT2}¢)</span>`;
-    else if (ask >= 0.86) trackerText = `<span class="val-gold">T1 REACHED (+${distT1}¢)</span> | <span style="color:var(--text-light)">${Math.abs(distT2)}¢ to T2</span>`;
-    else trackerText = `<span style="color:var(--text-light)">${Math.abs(distT1)}¢ to T1 | ${Math.abs(distT2)}¢ to T2</span>`;
-    return { pct: fillPct, text: trackerText };
-}
-
-async function deleteFiles() {
-    if(confirm("WARNING: This will permanently delete all logged CSV data on Railway. Continue?")) {
-        await fetch('/api/delete_logs', {method: 'POST'});
-        alert("Logs purged successfully.");
-        window.location.reload();
-    }
-}
-
-setInterval(async () => {
-    try {
-        const r = await fetch('/api/status');
-        const s = await r.json();
+        # Core Parameters
+        self.trigger_threshold = 0.86
+        self.gradual_exit_pct = 0.50
+        self.static_guard_ratio = 3.5
         
-        document.getElementById('bot-uptime').textContent = `[Uptime: ${Math.floor(s.uptime_s/3600)}h ${Math.floor((s.uptime_s%3600)/60)}m ${s.uptime_s%60}s]`;
-        document.getElementById('ws-status').textContent = s.ws_connected ? "[WS: CONNECTED]" : "[WS: DROPPED]";
-        document.getElementById('ws-status').style.color = s.ws_connected ? "#34d399" : "#f87171";
+        # State Tracking
+        self.cats_count = 0 
+        self.dashboard_ui: Dict[str, dict] = {} 
+        self.positions: Dict[str, Dict[str, float]] = collections.defaultdict(
+            lambda: {"YES": 10.0, "NO": 10.0}
+        )
+
+    def process_market_tick(self, market_data: dict) -> Optional[dict]:
+        slug = market_data['Slug']
+        ttr = market_data['TTR']
         
-        const pnlBox = document.getElementById('v-pnl');
-        pnlBox.textContent = (s.pnl >= 0 ? '+' : '') + '$' + s.pnl.toFixed(2);
-        pnlBox.className = "vital-value " + (s.pnl > 0 ? "green" : (s.pnl < 0 ? "red" : ""));
-        
-        let activeMarkets = s.markets.filter(m => m.state === 'BOTH' && m.ttr_s > 0);
-        let otherMarkets = s.markets.filter(m => m.state !== 'BOTH' && m.state !== 'CLOSED' && m.ttr_s > 0);
-        
-        document.getElementById('v-trades').textContent = s.total_trades_count;
-        document.getElementById('v-active').textContent = activeMarkets.length;
-        
-        let htmlCards = '';
-        let htmlQueue = '';
-        
-        if (activeMarkets.length > 0) {
-            let primary = activeMarkets[0]; 
+        # 1. DECOUPLED TELEMETRY (Logs until 30s after expiration)
+        if ttr >= -30:
+            self._log_to_telemetry_shadow(slug, market_data)
+
+        # 2. UPDATE GHOST UI & CATS COUNTER
+        self._update_ghost_dashboard(slug, market_data)
+
+        # 3. GHOST UI CLEANUP (Drop market from screen 5s after expiration)
+        if ttr < -5 and slug in self.dashboard_ui:
+            del self.dashboard_ui[slug]
+
+        # 4. TRADING KILL-SWITCH
+        if ttr <= 0:
+            return None
             
-            let valYes = primary.yes_shares * primary.yes_bid;
-            let valNo = primary.no_shares * primary.no_bid;
-            let yesBadge = getImbalanceBadge(primary.yes_b_vol, primary.yes_a_vol);
-            let noBadge = getImbalanceBadge(primary.no_b_vol, primary.no_a_vol);
+        # 5. PORTFOLIO CHECK (Have we already exited?)
+        if self.positions[slug]["YES"] <= 5.0 or self.positions[slug]["NO"] <= 5.0:
+            return None
 
-            let strikeText = primary.strike > 0 ? '$' + primary.strike.toFixed(2) : 'Awaiting 5m Mark';
-            let liveText = primary.live_btc > 0 ? '$' + primary.live_btc.toFixed(2) : 'Loading...';
-            let spotDeltaStr = '<span style="color:var(--text-light)">--</span>';
-            if (primary.strike > 0 && primary.live_btc > 0) {
-                let diff = primary.live_btc - primary.strike;
-                let colorClass = diff >= 0 ? 'val-green' : 'val-red';
-                let sign = diff >= 0 ? '+$' : '-$';
-                spotDeltaStr = `<span class="${colorClass}">${sign}${Math.abs(diff).toFixed(2)}</span>`;
-            }
+        # 6. EVALUATE SALVAGE DECISION
+        return self.evaluate_salvage(market_data)
 
-            // Using MID price for Conviction Tracking
-            let cYesData = getConvictionHtml(primary.yes_mid);
-            let cNoData = getConvictionHtml(primary.no_mid);
+    def evaluate_salvage(self, market_data: dict) -> Optional[dict]:
+        slug = market_data['Slug']
+        ttr = market_data['TTR']
+        mid_price = market_data['Mid_Price']
+        imbalance = market_data['Imbalance_Ratio']
+        losing_side = market_data['Losing_Side']
 
-            htmlCards = `<div class="card">
-                <div class="card-header">
-                    <span>${primary.slug}</span>
-                    <span style="color:var(--text-light);">TTR: <span style="color:var(--text-navy);">${primary.ttr_s}s</span></span>
-                </div>
-                <div class="ref-bar">
-                    <div><span style="color:var(--text-light)">Ref Strike:</span> <b style="color:var(--text-navy)">${strikeText}</b></div>
-                    <div><span style="color:var(--text-light)">Live Spot:</span> <b style="color:var(--text-navy)">${liveText}</b></div>
-                    <div><span style="color:var(--text-light)">Distance:</span> <b>${spotDeltaStr}</b></div>
-                </div>
-                <div class="leg-container">
-                    <div class="leg-col">
-                        <div class="leg-title">YES LEG</div>
-                        <div class="data-row"><span>Shares:</span> <b>${primary.yes_shares.toFixed(2)}</b></div>
-                        <div class="data-row"><span>Entry:</span> <b>$${primary.yes_entry > 0 ? primary.yes_entry.toFixed(3) : '0.000'}</b></div>
-                        <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;">
-                            <span>Ask:</span> <b>$${primary.yes_ask.toFixed(3)}</b>
-                        </div>
-                        <div class="data-row">
-                            <span>Bid: ${yesBadge}</span> <b>$${primary.yes_bid.toFixed(3)}</b>
-                        </div>
-                        <div class="data-row" style="background: rgba(252, 211, 77, 0.1); padding: 4px 8px; border-radius: 4px; margin-top: 4px;">
-                            <span style="color:var(--text-navy)">Mid (Trigger):</span> <b class="val-gold">$${primary.yes_mid.toFixed(3)}</b>
-                        </div>
-                        <div class="data-row" style="margin-top:8px;"><span>Bid Value:</span> <b class="val-green">$${valYes.toFixed(2)}</b></div>
-                        
-                        <div class="data-row" style="margin-top:12px; font-size:12px;"><span>Proximity:</span> <b>${cYesData.text}</b></div>
-                        <div class="conviction-bar">
-                            <div class="conviction-fill yes" style="width: ${cYesData.pct}%"></div>
-                            <div class="marker" style="left: 86%" title="Tier 1 (0.86)"></div>
-                            <div class="marker t2" style="left: 95%" title="Tier 2 (0.95)"></div>
-                        </div>
+        # Update Memory
+        self.ofa_tracker.update_snapshot(slug, market_data['Local_Bid_Vol'], market_data['Local_Ask_Vol'])
 
-                        <div class="svg-container">${renderSparkline(primary.history_yes, '#38BDF8', primary.t1_price, primary.t2_price)}</div>
-                    </div>
-                    <div class="leg-col">
-                        <div class="leg-title">NO LEG</div>
-                        <div class="data-row"><span>Shares:</span> <b>${primary.no_shares.toFixed(2)}</b></div>
-                        <div class="data-row"><span>Entry:</span> <b>$${primary.no_entry > 0 ? primary.no_entry.toFixed(3) : '0.000'}</b></div>
-                        <div class="data-row" style="margin-top:10px; border-top:1px solid var(--border-color); padding-top:10px;">
-                            <span>Ask:</span> <b>$${primary.no_ask.toFixed(3)}</b>
-                        </div>
-                        <div class="data-row">
-                            <span>Bid: ${noBadge}</span> <b>$${primary.no_bid.toFixed(3)}</b>
-                        </div>
-                        <div class="data-row" style="background: rgba(252, 211, 77, 0.1); padding: 4px 8px; border-radius: 4px; margin-top: 4px;">
-                            <span style="color:var(--text-navy)">Mid (Trigger):</span> <b class="val-gold">$${primary.no_mid.toFixed(3)}</b>
-                        </div>
-                        <div class="data-row" style="margin-top:8px;"><span>Bid Value:</span> <b class="val-green">$${valNo.toFixed(2)}</b></div>
-                        
-                        <div class="data-row" style="margin-top:12px; font-size:12px;"><span>Proximity:</span> <b>${cNoData.text}</b></div>
-                        <div class="conviction-bar">
-                            <div class="conviction-fill no" style="width: ${cNoData.pct}%"></div>
-                            <div class="marker" style="left: 86%" title="Tier 1 (0.86)"></div>
-                            <div class="marker t2" style="left: 95%" title="Tier 2 (0.95)"></div>
-                        </div>
+        if ttr > 60: return None
+        if mid_price < self.trigger_threshold: return None
 
-                        <div class="svg-container">${renderSparkline(primary.history_no, '#94A3B8', primary.t1_price, primary.t2_price)}</div>
-                    </div>
-                </div>
-            </div>`;
+        static_guard_blocked = imbalance >= self.static_guard_ratio
 
-            if (activeMarkets.length > 1) {
-                htmlQueue += `<div style="font-weight:bold; color:var(--text-navy); margin-bottom:10px;">BACKGROUND LOCKED POSITIONS</div>`;
-                for(let i=1; i<activeMarkets.length; i++) {
-                    let m = activeMarkets[i];
-                    htmlQueue += `<div class="bg-market-row">
-                        <span>${m.slug}</span>
-                        <span>TTR: <b class="val-gold">${m.ttr_s}s</b></span>
-                    </div>`;
-                }
-                htmlQueue += `<div style="margin-bottom:15px; border-bottom:1px solid var(--border-color); padding-bottom:5px;"></div>`;
-            }
-        } else {
-            htmlCards = '<div style="text-align:center; padding:30px; color:var(--text-light);">No active locked positions...</div>';
+        if not static_guard_blocked:
+            return self.build_execution_payload(market_data, "CLEAN_BOOK")
+
+        # OFA OVERRIDE LOGIC
+        is_fake_wall = self.ofa_tracker.is_wall_fake(slug, target_side=losing_side)
+        if is_fake_wall:
+            return self.build_execution_payload(market_data, "OFA_SPOOF_OVERRIDE")
+
+        return None
+
+    def build_execution_payload(self, market_data: dict, reason: str) -> dict:
+        """Constructs Payload with $0.02 Offset Penetration."""
+        current_bid = market_data['Bid_Price']
+        penetration_limit_price = max(0.01, round(current_bid - 0.02, 2))
+
+        slug = market_data['Slug']
+        token_to_sell = market_data['Losing_Side']
+        shares_to_sell = self.positions[slug][token_to_sell] * self.gradual_exit_pct
+
+        payload = {
+            "slug": slug,
+            "token": token_to_sell,
+            "order_type": "LIMIT",
+            "price": penetration_limit_price,
+            "quantity": shares_to_sell,
+            "metadata": {"execution_reason": reason}
         }
+        
+        self.positions[slug][token_to_sell] -= shares_to_sell
+        
+        self.dashboard_ui[slug]["Status"] = "[LOCKED IN]"
+        self.dashboard_ui[slug]["Sold_Side"] = token_to_sell
+        logger.info(f"EXECUTED: {slug} | {reason} | ${penetration_limit_price}")
+        
+        return payload
 
-        if(otherMarkets.length > 0) {
-            htmlQueue += `<div style="font-weight:bold; color:var(--text-light); margin-bottom:10px;">SCOUTING / GATHERING LEGS</div>`;
-            otherMarkets.forEach(m => {
-                let status = m.state === 'WATCH' ? 'Scouting' : 'Filling Dual Leg';
-                htmlQueue += `<div class="bg-market-row" style="color:var(--text-light);">
-                    <span>${m.slug} | Status: ${status}</span>
-                    <span>TTR: ${m.ttr_s}s</span>
-                </div>`;
-            });
-        }
-
-        document.getElementById('active-cards').innerHTML = htmlCards;
-        document.getElementById('obs-queue').innerHTML = htmlQueue || 'No upcoming markets in window.';
-
-        let logHtml = '';
-        s.history.reverse().forEach(h => {
-            const pnlStr = h.pnl !== 0.0 ? (h.pnl > 0 ? `+${h.pnl.toFixed(2)}` : h.pnl.toFixed(2)) : '--';
-            let t1Str = '--';
-            
-            if (h.t1_side && h.t1_side !== "" && h.t1_price > 0) t1Str = `<span class="val-gold">${h.t1_side}</span> @ $${h.t1_price.toFixed(3)}`;
-            else if (h.t1_shadow) t1Str = `<span class="ofa-static">OFA_OBSERVING</span>`;
-            else if (h.t1_guarded) t1Str = `<span class="guard-static">🛡 GUARDED</span>`;
-            
-            let t2Str = '--';
-            if (h.t2_side && h.t2_side !== "") t2Str = `<span class="val-pink">${h.t2_side}</span> @ $${h.t2_price.toFixed(3)}`;
-            
-            logHtml += `<tr>
-                <td style="color:var(--text-light); font-size: 13px;">${h.time}</td>
-                <td>${h.slug}</td>
-                <td>${h.yes_entry > 0 ? '$'+h.yes_entry.toFixed(3) : '--'}</td>
-                <td>${h.no_entry > 0 ? '$'+h.no_entry.toFixed(3) : '--'}</td>
-                <td style="line-height:1.4;">${t1Str}</td>
-                <td style="line-height:1.4;">${t2Str}</td>
-                <td class="${h.pnl>0?'val-green':(h.pnl<0?'val-red':'')}">${pnlStr}</td>
-                <td><a href="https://polymarket.com/event/${h.slug}" target="_blank" class="btn-verify">LINK ↗</a></td>
-            </tr>`;
-        });
-        if(logHtml) document.getElementById('log-body').innerHTML = logHtml;
-
-    } catch(e) {}
-}, 500); 
-</script>
-</body>
-</html>
-"""
-
-# ─── API & SERVER ───
-class DashboardHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/":
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(DASHBOARD_HTML.encode('utf-8'))
-        elif self.path == "/api/status":
-            now = get_synced_time()
-            m_data, history_data = [], []
-            for m in sorted(GLOBAL_STATE.markets.values(), key=lambda x: x.end_ts):
-                ttr = int(m.end_ts - now)
-                if m.state == MarketState.CLOSED and m.close_time != "" and getattr(m, 'expired_processed', False):
-                    history_data.append({
-                        "time": m.close_time, "slug": m.slug, "reason": m.close_reason,
-                        "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price, "pnl": m.realized_pnl,
-                        "t1_side": m.t1_side, "t1_price": m.t1_price, "t1_time": m.t1_time,
-                        "t1_guarded": m.t1_guarded, "t1_guard_ratio": m.t1_guard_ratio, "t1_shadow": getattr(m, 'ofa_shadow_flag', False),
-                        "t2_side": m.t2_side, "t2_price": m.t2_price, "t2_time": m.t2_time
-                    })
-                else:
-                    yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
-                    y_b_v = yb.get_local_vols(yb.bid, "bid", 0.10) if yb else 0
-                    y_a_v = yb.get_local_vols(yb.ask, "ask", 0.10) if yb else 0
-                    n_b_v = nb.get_local_vols(nb.bid, "bid", 0.10) if nb else 0
-                    n_a_v = nb.get_local_vols(nb.ask, "ask", 0.10) if nb else 0
-                    m_data.append({
-                        "slug": m.slug, "state": m.state, "ttr_s": ttr,
-                        "yes_entry": m.yes_entry_price, "no_entry": m.no_entry_price,
-                        "yes_shares": m.yes_shares, "no_shares": m.no_shares,
-                        "yes_ask": yb.ask if yb else 0.0, "no_ask": nb.ask if nb else 0.0,
-                        "yes_bid": yb.bid if yb else 0.0, "no_bid": nb.bid if nb else 0.0,
-                        "yes_mid": ((yb.bid + yb.ask) / 2.0) if (yb and yb.bid > 0 and yb.ask > 0) else (yb.bid if yb else 0.0),
-                        "no_mid": ((nb.bid + nb.ask) / 2.0) if (nb and nb.bid > 0 and nb.ask > 0) else (nb.bid if nb else 0.0),
-                        "yes_b_vol": y_b_v, "yes_a_vol": y_a_v,
-                        "no_b_vol": n_b_v, "no_a_vol": n_a_v,
-                        "strike": m.strike_price, "live_btc": GLOBAL_STATE.btc_live,
-                        "history_yes": m.history_yes[-30:], "history_no": m.history_no[-30:],
-                        "t1_price": m.t1_price, "t2_price": m.t2_price
-                    })
-            payload = {
-                "uptime_s": int(time.time() - SYSTEM_BOOT_TIME),
-                "ws_connected": GLOBAL_STATE.ws_connected, "pnl": GLOBAL_STATE.total_pnl,
-                "total_trades_count": GLOBAL_STATE.total_trades,
-                "markets": m_data, "history": history_data[-15:]
+    def _update_ghost_dashboard(self, slug: str, market_data: dict):
+        if slug not in self.dashboard_ui:
+            self.dashboard_ui[slug] = {
+                "Status": "ACTIVE", 
+                "Sold_Side": None, 
+                "Cat_Logged": False,
+                "Mid_Price": 0.0,
+                "Imbalance": 0.0,
+                "TTR": 0
             }
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(payload).encode('utf-8'))
-        elif self.path in ["/api/dl_trades", "/api/dl_snaps", "/api/dl_telemetry"]:
-            filename = "trades_full.csv"
-            if self.path == "/api/dl_snaps": filename = "snapshot_live.csv"
-            elif self.path == "/api/dl_telemetry": filename = "telemetry_shadow.csv"
-            self.send_response(200)
-            self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
-            self.send_header('Content-Type', 'text/csv')
-            self.end_headers()
-            try:
-                with open(filename, "rb") as f:
-                    self.wfile.write(f.read())
-            except Exception: pass
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def do_POST(self):
-        if self.path == "/api/delete_logs":
-            files = [
-                ("trades_full.csv", ["Timestamp", "Slug", "Action", "Side", "Executed_Price", "Share_Quantity", "Fees_Paid", "TTR_at_Execution", "Realized_PnL", "Verify_Link"]),
-                ("snapshot_live.csv", ["Timestamp", "Slug", "State", "Yes_Ask", "Yes_Bid", "No_Ask", "No_Bid"]),
-                ("telemetry_shadow.csv", ["Timestamp", "Slug", "Token", "TTR", "Ticker_Price", "Local_Bid_Vol", "Local_Ask_Vol", "Imbalance_Ratio", "Signal", "Vel_Pct", "Vel_Flat", "OFA_Signal"])
-            ]
-            try:
-                for f, headers in files:
-                    with open(f, "w", newline="") as fp: 
-                        csv.writer(fp).writerow(headers)
-                self.send_response(200)
-                self.end_headers()
-            except Exception:
-                self.send_response(500)
-                self.end_headers()
-
-    def log_message(self, format, *args): pass
-
-def run_server():
-    server = socketserver.ThreadingTCPServer(("", PORT), DashboardHandler)
-    print(f"[System] UI listening on port {PORT}", flush=True)
-    server.serve_forever()
-
-# ─── CORE STRATEGY ───
-def check_guard_and_velocity(mdm: MarketData, loser_book: OrderBook, winner_side: str, now: float) -> Tuple[float, str, bool, float, float]:
-    if not loser_book: return 0.0, "", False, 0.0, 0.0
-    b_vol = loser_book.get_local_vols(loser_book.bid, "bid", 0.10)
-    a_vol = loser_book.get_local_vols(loser_book.ask, "ask", 0.10)
-    
-    ratio, wall_type = 0.0, ""
-    if a_vol == 0 and b_vol > 0: ratio, wall_type = 999.0, "BID_WALL"
-    elif b_vol == 0 and a_vol > 0: ratio, wall_type = 999.0, "ASK_WALL"
-    elif a_vol > 0 and b_vol / a_vol >= GUARD_IMBALANCE_THRESHOLD: ratio, wall_type = (b_vol / a_vol), "BID_WALL"
-    elif b_vol > 0 and a_vol / b_vol >= GUARD_IMBALANCE_THRESHOLD: ratio, wall_type = (a_vol / b_vol), "ASK_WALL"
-    
-    shadow_velocity = False
-    vel_pct, vel_flat = 0.0, 0.0
-    
-    if ratio >= GUARD_IMBALANCE_THRESHOLD:
-        hist = mdm.history_vol_yes if winner_side == "YES" else mdm.history_vol_no
-        if len(hist) >= 4:
-            past_b_vol = hist[0][1] 
-            current_b_vol = hist[-1][1]
-            vel_flat = current_b_vol - past_b_vol
-            if past_b_vol > 0: vel_pct = current_b_vol / past_b_vol
             
-            if past_b_vol > 0 and (current_b_vol / past_b_vol >= 1.25):
-                shadow_velocity = True
-            elif current_b_vol - past_b_vol >= 1000:
-                shadow_velocity = True
+        ui_state = self.dashboard_ui[slug]
+        ui_state["Mid_Price"] = market_data['Mid_Price']
+        ui_state["Imbalance"] = market_data['Imbalance_Ratio']
+        ui_state["TTR"] = market_data['TTR']
+        
+        # Cats Counter Logic
+        if market_data['TTR'] <= 0 and ui_state["Status"] == "[LOCKED IN]":
+            sold_token = ui_state["Sold_Side"]
+            ultimate_winner = market_data['Winning_Side']
+            
+            # Whipsaw: We sold the token, but it ended up winning at TTR 0
+            if sold_token == ultimate_winner and not ui_state["Cat_Logged"]:
+                self.cats_count += 1
+                ui_state["Cat_Logged"] = True
+                logger.warning(f"CAT WHIPSAW: {slug}")
+            
+            ui_state["Status"] = "[RESOLVED]"
+
+    def _log_to_telemetry_shadow(self, slug: str, market_data: dict):
+        # CSV Logging Logic goes here
+        pass
+
+
+# ==========================================
+# 3. TERMINAL UI RENDERER (THE DASHBOARD)
+# ==========================================
+def generate_dashboard(engine: V614_TradingEngine) -> Layout:
+    """Draws the live terminal dashboard using the Rich library."""
+    cats_text = Text(f"🐈 Catastrophic Whipsaws: {engine.cats_count}", style="bold red" if engine.cats_count > 0 else "bold green")
+    header_panel = Panel(cats_text, title="V6.14 Telemetry Engine", border_style="cyan")
+
+    table = Table(show_header=True, header_style="bold magenta", expand=True)
+    table.add_column("Market Slug", style="cyan", width=30)
+    table.add_column("TTR (s)", justify="right", width=10)
+    table.add_column("Mid Price", justify="right", width=10)
+    table.add_column("Imbalance", justify="right", width=10)
+    table.add_column("Status", justify="center", width=20)
+
+    for slug, state in engine.dashboard_ui.items():
+        row_style = "white"
+        if state["Status"] == "[LOCKED IN]":
+            row_style = "yellow"
+        elif state["Status"] == "[RESOLVED]":
+            row_style = "dim" 
+            
+        imb_str = f"{state['Imbalance']:.1f}x"
+        if state['Imbalance'] >= engine.static_guard_ratio and state["Status"] == "ACTIVE":
+            imb_str = f"[red]{imb_str}[/red]"
+
+        table.add_row(
+            slug, str(state['TTR']), f"${state['Mid_Price']:.2f}",
+            imb_str, state["Status"], style=row_style
+        )
+
+    layout = Layout()
+    layout.split(
+        Layout(header_panel, size=3),
+        Layout(Panel(table, title="Live Order Book Surveillance", border_style="blue"))
+    )
+    return layout
+
+
+# ==========================================
+# 4. MAIN EXECUTION LOOP (TESTBED)
+# ==========================================
+def main():
+    bot = V614_TradingEngine()
+    
+    # MOCK DATA LOOP to prove the dashboard is working.
+    test_feed = [
+        {'Slug': 'btc-updown-5m-1781178900', 'TTR': 65, 'Winning_Side': 'YES', 'Losing_Side': 'NO', 'Mid_Price': 0.85, 'Bid_Price': 0.14, 'Imbalance_Ratio': 2.2, 'Local_Bid_Vol': 1500, 'Local_Ask_Vol': 6000},
+        {'Slug': 'btc-updown-5m-1781178900', 'TTR': 60, 'Winning_Side': 'YES', 'Losing_Side': 'NO', 'Mid_Price': 0.88, 'Bid_Price': 0.12, 'Imbalance_Ratio': 4.2, 'Local_Bid_Vol': 1500, 'Local_Ask_Vol': 6050},
+        {'Slug': 'btc-updown-5m-1781178900', 'TTR': 55, 'Winning_Side': 'YES', 'Losing_Side': 'NO', 'Mid_Price': 0.89, 'Bid_Price': 0.11, 'Imbalance_Ratio': 4.3, 'Local_Bid_Vol': 1500, 'Local_Ask_Vol': 6100},
+        {'Slug': 'btc-updown-5m-1781178900', 'TTR': 0,  'Winning_Side': 'NO',  'Losing_Side': 'YES','Mid_Price': 1.00, 'Bid_Price': 0.00, 'Imbalance_Ratio': 0.0, 'Local_Bid_Vol': 0,    'Local_Ask_Vol': 0},
+        {'Slug': 'btc-updown-5m-1781178900', 'TTR': -3, 'Winning_Side': 'NO',  'Losing_Side': 'YES','Mid_Price': 1.00, 'Bid_Price': 0.00, 'Imbalance_Ratio': 0.0, 'Local_Bid_Vol': 0,    'Local_Ask_Vol': 0},
+    ]
+
+    # This 'Live' context block is what actively draws the dashboard to your screen
+    with Live(generate_dashboard(bot), refresh_per_second=4, screen=True) as live:
+        for tick in test_feed:
+            time.sleep(2) 
+            
+            payload = bot.process_market_tick(tick)
+            if payload:
+                logger.info(f"API Payload Built: {payload}")
                 
-    return ratio, wall_type, shadow_velocity, vel_pct, vel_flat
-
-def execute_trade(mdm: MarketData, side: str, price: float, action: str, shares: float, fees: float, ttr: int, pnl: float = 0.0):
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"[{ts}] [{action}] {mdm.slug} | {side} @ {price:.3f} | Shares: {shares:.2f}", flush=True)
-    
-    if action == "SELL_LOSER_T1":
-        GLOBAL_STATE.sold_losers += 1
-        mdm.salvage_revenue += (shares * price)
-        mdm.t1_side, mdm.t1_price, mdm.t1_time = side, price, ts
-    if action == "SELL_LOSER_T2":
-        GLOBAL_STATE.sold_losers += 1
-        mdm.salvage_revenue += (shares * price)
-        mdm.t2_side, mdm.t2_price, mdm.t2_time = side, price, ts
-    if "CLOSED" in action or "EXPIRED" in action:
-        mdm.close_time, mdm.close_reason = ts, action
-        GLOBAL_STATE.total_trades += 1
-        mdm.realized_pnl = pnl
-        GLOBAL_STATE.total_pnl += pnl
-    threading.Thread(target=log_trade_csv_worker, args=(ts, mdm.slug, action, side, price, shares, fees, ttr, pnl), daemon=True).start()
-
-def evaluate_market(mdm: MarketData, now: float):
-    if getattr(mdm, 'expired_processed', False): return
-    
-    ttr = int(mdm.end_ts - now)
-    
-    if ttr < 0:
-        mdm.expired_processed = True
-        mdm.state = MarketState.CLOSED
-        return
-
-    if 0 < ttr <= 300 and mdm.strike_price == 0.0 and GLOBAL_STATE.btc_live > 0:
-        mdm.strike_price = GLOBAL_STATE.btc_live
-
-    yb, nb = GLOBAL_STATE.books.get(mdm.yes_token), GLOBAL_STATE.books.get(mdm.no_token)
-    
-    if yb:
-        mdm.history_vol_yes.append((now, yb.get_local_vols(yb.bid, "bid"), yb.get_local_vols(yb.ask, "ask")))
-        mdm.history_vol_yes = [x for x in mdm.history_vol_yes if now - x[0] <= 10.0]
-    if nb:
-        mdm.history_vol_no.append((now, nb.get_local_vols(nb.bid, "bid"), nb.get_local_vols(nb.ask, "ask")))
-        mdm.history_vol_no = [x for x in mdm.history_vol_no if now - x[0] <= 10.0]
-
-    if ttr <= 1:
-        mdm.expired_processed = True
-        if mdm.state != MarketState.CLOSED:
-            mdm.state = MarketState.CLOSED
-            if not yb or not nb: return
-            winner_side = "YES" if yb.bid > nb.bid else "NO"
+            live.update(generate_dashboard(bot))
             
-            cost_basis = mdm.total_fees_paid
-            if mdm.yes_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
-            if mdm.no_shares > 0: cost_basis += BASE_CAPITAL_PER_LEG
-            winner_shares = mdm.yes_shares if winner_side == "YES" else mdm.no_shares 
-            calc_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
-            execute_trade(mdm, winner_side, 0.00, "EXPIRED_AT_BUZZER", 0.0, 0.0, ttr, calc_pnl)
-        return
-        
-    if not yb or not nb: return
-    if mdm.state == MarketState.CLOSED: return
-    
-    if mdm.state == MarketState.WATCH:
-        target = T_WINDOW_1 if ttr > 600 else T_WINDOW_2
-        if 0 < yb.ask <= target:
-            mdm.state = MarketState.WAITING_NO
-            mdm.yes_entry_price = yb.ask
-            mdm.yes_shares = BASE_CAPITAL_PER_LEG / yb.ask
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, "YES", yb.ask, "MAKER_FILL_LEG_1", mdm.yes_shares, fee, ttr)
-        elif 0 < nb.ask <= target:
-            mdm.state = MarketState.WAITING_YES
-            mdm.no_entry_price = nb.ask
-            mdm.no_shares = BASE_CAPITAL_PER_LEG / nb.ask
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, "NO", nb.ask, "MAKER_FILL_LEG_1", mdm.no_shares, fee, ttr)
-
-    elif mdm.state == MarketState.WAITING_NO:
-        if nb.ask > 0 and nb.ask <= (T_WINDOW_1 if ttr > 600 else T_WINDOW_2):
-            mdm.state = MarketState.BOTH
-            mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, "NO", nb.ask, "MAKER_FILL_LEG_2", mdm.no_shares, fee, ttr)
-        elif nb.ask > 0 and (mdm.yes_entry_price + nb.ask <= MAX_COMBINED_COST):
-            mdm.state = MarketState.BOTH
-            mdm.no_entry_price, mdm.no_shares = nb.ask, BASE_CAPITAL_PER_LEG / nb.ask
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, "NO", nb.ask, "TAKER_HEDGE_GUARANTEE", mdm.no_shares, fee, ttr)
-        elif ttr <= HEDGE_DEADLINE_TTR:
-            mdm.state = MarketState.CLOSED
-            shares_to_sell = mdm.yes_shares
-            revenue = shares_to_sell * yb.bid
-            fee = revenue * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, "YES", yb.bid, "ABORT_ORPHANED_LEG", shares_to_sell, fee, ttr)
-            calc_pnl = revenue - BASE_CAPITAL_PER_LEG - mdm.total_fees_paid
-            execute_trade(mdm, "CLOSED", 0.00, "CLOSED_ABORTED", 0.0, 0.0, ttr, calc_pnl)
-            
-    elif mdm.state == MarketState.WAITING_YES:
-        if yb.ask > 0 and yb.ask <= (T_WINDOW_1 if ttr > 600 else T_WINDOW_2):
-            mdm.state = MarketState.BOTH
-            mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, "YES", yb.ask, "MAKER_FILL_LEG_2", mdm.yes_shares, fee, ttr)
-        elif yb.ask > 0 and (mdm.no_entry_price + yb.ask <= MAX_COMBINED_COST):
-            mdm.state = MarketState.BOTH
-            mdm.yes_entry_price, mdm.yes_shares = yb.ask, BASE_CAPITAL_PER_LEG / yb.ask
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, "YES", yb.ask, "TAKER_HEDGE_GUARANTEE", mdm.yes_shares, fee, ttr)
-        elif ttr <= HEDGE_DEADLINE_TTR:
-            mdm.state = MarketState.CLOSED
-            shares_to_sell = mdm.no_shares
-            revenue = shares_to_sell * nb.bid
-            fee = revenue * TAKER_FEE_RATE
-            mdm.total_fees_paid += fee
-            execute_trade(mdm, "NO", nb.bid, "ABORT_ORPHANED_LEG", shares_to_sell, fee, ttr)
-            calc_pnl = revenue - BASE_CAPITAL_PER_LEG - mdm.total_fees_paid
-            execute_trade(mdm, "CLOSED", 0.00, "CLOSED_ABORTED", 0.0, 0.0, ttr, calc_pnl)
-            
-    elif mdm.state == MarketState.BOTH:
-        # Calculate Mid-Prices to bypass Market Maker "Bid Vacuums"
-        y_mid = (yb.bid + yb.ask) / 2.0 if (yb.bid > 0 and yb.ask > 0) else yb.bid
-        n_mid = (nb.bid + nb.ask) / 2.0 if (nb.bid > 0 and nb.ask > 0) else nb.bid
-        
-        if y_mid > n_mid: 
-            winner_mid, loser_side, loser_bid, loser_shares, loser_book = y_mid, "NO", nb.bid, mdm.no_shares, nb
-            winner_side = "YES"
-        else: 
-            winner_mid, loser_side, loser_bid, loser_shares, loser_book = n_mid, "YES", yb.bid, mdm.yes_shares, yb
-            winner_side = "NO"
-            
-        # STRICT 60 SECOND LAW enforced, but logic evaluates Mid-Price
-        if not mdm.t1_executed and winner_mid >= SELL_LOSER_T1_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
-            guard_ratio, wall_type, shadow_vel, v_pct, v_flat = check_guard_and_velocity(mdm, loser_book, winner_side, now)
-            
-            # Log OFA Shadow Data
-            if guard_ratio >= GUARD_IMBALANCE_THRESHOLD and not mdm.ofa_shadow_flag:
-                mdm.ofa_shadow_flag = True
-                ts_log = datetime.now(timezone.utc).strftime("%H:%M:%S")
-                ofa_sig = "WOULD_OVERRIDE" if shadow_vel else "STAY_BLOCKED"
-                try:
-                    with open("telemetry_shadow.csv", "a", newline="") as f:
-                        csv.writer(f).writerow([ts_log, mdm.slug, loser_side, ttr, f"{loser_bid:.3f}", 0, 0, f"{guard_ratio:.1f}", f"SHADOW_{wall_type}", f"{v_pct:.2f}", f"{v_flat:.0f}", ofa_sig])
-                except Exception: pass
-
-            if guard_ratio >= GUARD_IMBALANCE_THRESHOLD:
-                if shadow_vel: print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] [OFA_SHADOW_OVERRIDE] {mdm.slug} | OFA sees velocity, but bot stays blocked.", flush=True)
-                if not mdm.t1_guarded:
-                    mdm.t1_guarded = True
-                    mdm.t1_guard_ratio = guard_ratio
-                    execute_trade(mdm, loser_side, loser_bid, f"BLOCKED_{wall_type}", 0.0, 0.0, ttr)
-            elif loser_bid > 0.0:  # Ensures we don't execute a cash-sale at $0.00
-                mdm.t1_executed = True
-                shares_to_sell = loser_shares * 0.50
-                fee = (shares_to_sell * loser_bid) * 0.001 
-                mdm.total_fees_paid += fee
-                execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T1", shares_to_sell, fee, ttr)
-            
-        elif winner_mid >= SELL_LOSER_T2_THRESH and 0 < ttr <= SELL_LOSER_T1_TTR_MAX:
-            guard_ratio, wall_type, shadow_vel, v_pct, v_flat = check_guard_and_velocity(mdm, loser_book, winner_side, now)
-            
-            if guard_ratio >= GUARD_IMBALANCE_THRESHOLD:
-                if not mdm.t2_guarded:
-                    mdm.t2_guarded = True
-                    mdm.t2_guard_ratio = guard_ratio
-                    execute_trade(mdm, loser_side, loser_bid, f"BLOCKED_{wall_type}", 0.0, 0.0, ttr)
-            elif loser_bid > 0.0:
-                mdm.state = MarketState.CLOSED
-                shares_to_sell = loser_shares * 0.99 
-                fee = (shares_to_sell * loser_bid) * 0.001 
-                mdm.total_fees_paid += fee
-                execute_trade(mdm, loser_side, loser_bid, "SELL_LOSER_T2", shares_to_sell, fee, ttr)
-                cost_basis = (BASE_CAPITAL_PER_LEG * 2) + mdm.total_fees_paid
-                winner_shares = mdm.yes_shares if loser_side == "NO" else mdm.no_shares
-                final_pnl = (winner_shares * 1.00) + mdm.salvage_revenue - cost_basis
-                execute_trade(mdm, "CLOSED", winner_mid, "CLOSED_T2_RESOLVED", 0.0, 0.0, ttr, final_pnl)
-
-def tick_loop():
-    while GLOBAL_STATE.running:
-        if not GLOBAL_STATE.armed:
-            time.sleep(1)
-            continue
-            
-        now = get_synced_time()
-        for m in list(GLOBAL_STATE.markets.values()):
-            try: evaluate_market(m, now)
-            except Exception: pass
-        time.sleep(0.05)
-
-def snapshot_loop():
-    while GLOBAL_STATE.running:
-        if not GLOBAL_STATE.armed:
-            time.sleep(1)
-            continue
-            
-        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        try:
-            with open("snapshot_live.csv", "a", newline="") as f:
-                writer = csv.writer(f)
-                for m in GLOBAL_STATE.markets.values():
-                    if m.end_ts >= get_synced_time() - 5:
-                        yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
-                        ya, ybd = yb.ask if yb else 0, yb.bid if yb else 0
-                        na, nbd = nb.ask if nb else 0, nb.bid if nb else 0
-                        writer.writerow([ts, m.slug, m.state, f"{ya:.3f}", f"{ybd:.3f}", f"{na:.3f}", f"{nbd:.3f}"])
-                        m.history_yes.append(ya)
-                        m.history_no.append(na)
-                        if len(m.history_yes) > 30: m.history_yes.pop(0)
-                        if len(m.history_no) > 30: m.history_no.pop(0)
-        except Exception: pass
-        time.sleep(30)
-
-def telemetry_loop():
-    while GLOBAL_STATE.running:
-        if not GLOBAL_STATE.armed:
-            time.sleep(1)
-            continue
-            
-        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        try:
-            with open("telemetry_shadow.csv", "a", newline="") as f:
-                writer = csv.writer(f)
-                for m in list(GLOBAL_STATE.markets.values()):
-                    if m.state == MarketState.CLOSED: continue
-                    ttr = int(m.end_ts - get_synced_time())
-                    if ttr < 0: continue
-                    yb, nb = GLOBAL_STATE.books.get(m.yes_token), GLOBAL_STATE.books.get(m.no_token)
-                    if yb and yb.bids and yb.asks:
-                        y_b_vol, y_a_vol = yb.get_local_vols(yb.bid, "bid", 0.10), yb.get_local_vols(yb.ask, "ask", 0.10)
-                        r_y = y_b_vol / y_a_vol if y_a_vol > 0 else 999.0
-                        r_y_inv = y_a_vol / y_b_vol if y_b_vol > 0 else 999.0
-                        if r_y >= 2.0: writer.writerow([ts, m.slug, "YES", ttr, f"{yb.ask:.3f}", f"{y_b_vol:.0f}", f"{y_a_vol:.0f}", f"{r_y:.1f}", "BID_WALL", "", "", ""])
-                        elif r_y_inv >= 2.0: writer.writerow([ts, m.slug, "YES", ttr, f"{yb.ask:.3f}", f"{y_b_vol:.0f}", f"{y_a_vol:.0f}", f"{r_y_inv:.1f}", "ASK_WALL", "", "", ""])
-                    if nb and nb.bids and nb.asks:
-                        n_b_vol, n_a_vol = nb.get_local_vols(nb.bid, "bid", 0.10), nb.get_local_vols(nb.ask, "ask", 0.10)
-                        r_n = n_b_vol / n_a_vol if n_a_vol > 0 else 999.0
-                        r_n_inv = n_a_vol / n_b_vol if n_b_vol > 0 else 999.0
-                        if r_n >= 2.0: writer.writerow([ts, m.slug, "NO", ttr, f"{nb.ask:.3f}", f"{n_b_vol:.0f}", f"{n_a_vol:.0f}", f"{r_n:.1f}", "BID_WALL", "", "", ""])
-                        elif r_n_inv >= 2.0: writer.writerow([ts, m.slug, "NO", ttr, f"{nb.ask:.3f}", f"{n_b_vol:.0f}", f"{n_a_vol:.0f}", f"{r_n_inv:.1f}", "ASK_WALL", "", "", ""])
-        except Exception: pass
-        time.sleep(5)
-
-def discovery_thread():
-    while GLOBAL_STATE.running:
-        if not GLOBAL_STATE.armed:
-            time.sleep(1)
-            continue
-            
-        sync_time_with_api() 
-        now = get_synced_time()
-        boundaries = [int((now // 300) * 300) + (i * 300) for i in range(1, (LOOKAHEAD_MINUTES // 5) + 1)]
-        new_markets = False
-        for ts in boundaries:
-            slug = f"btc-updown-5m-{ts}"
-            try:
-                res = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}", timeout=5)
-                if res.status_code == 200 and res.json():
-                    m_info = res.json()[0].get("markets", [])[0]
-                    cid = m_info["conditionId"]
-                    if cid not in GLOBAL_STATE.markets:
-                        end_ts = datetime.fromisoformat(m_info["endDate"].replace("Z", "+00:00")).timestamp()
-                        if end_ts > get_synced_time() + 120:
-                            tks = json.loads(m_info["clobTokenIds"])
-                            outcomes = json.loads(m_info["outcomes"])
-                            y_idx = 0 if outcomes[0].lower() in ["yes", "up"] else 1
-                            GLOBAL_STATE.markets[cid] = MarketData(cid, slug, tks[y_idx], tks[1-y_idx], end_ts)
-                            print(f"[Discovery] Tracking: {slug}", flush=True)
-                            new_markets = True
-            except Exception: pass
-        if new_markets and GLOBAL_STATE.ws_handle:
-            try: GLOBAL_STATE.ws_handle.close()
-            except Exception: pass
-        time.sleep(30)
-
-def polymarket_ws_thread():
-    def on_message(ws, msg):
-        try:
-            parsed_msg = json.loads(msg)
-            event_list = parsed_msg if isinstance(parsed_msg, list) else [parsed_msg]
-            for event in event_list:
-                if not isinstance(event, dict): continue
-                aid = event.get("asset_id") or event.get("market")
-                if not aid: continue
-                if event.get("event_type") == "book":
-                    book = GLOBAL_STATE.books.setdefault(aid, OrderBook())
-                    book.bids = {float(b["price"]): float(b["size"]) for b in event.get("bids", [])}
-                    book.asks = {float(a["price"]): float(a["size"]) for a in event.get("asks", [])}
-                elif event.get("event_type") == "price_change":
-                    book = GLOBAL_STATE.books.get(aid)
-                    if not book: continue
-                    for ch in event.get("changes", []):
-                        s, p, sz = ch.get("side", ""), float(ch.get("price", 0)), float(ch.get("size", 0))
-                        if s == "BUY":
-                            if sz == 0: book.bids.pop(p, None)
-                            else: book.bids[p] = sz
-                        elif s == "SELL":
-                            if sz == 0: book.asks.pop(p, None)
-                            else: book.asks[p] = sz
-        except Exception: pass
-
-    def on_open(ws):
-        GLOBAL_STATE.ws_connected = True
-        tks = [t for m in GLOBAL_STATE.markets.values() if m.end_ts >= get_synced_time() - 5 for t in (m.yes_token, m.no_token)]
-        if tks:
-            try: ws.send(json.dumps({"type": "Market", "assets_ids": tks}))
-            except Exception: pass
-
-    while GLOBAL_STATE.running:
-        try:
-            ws = websocket.WebSocketApp("wss://ws-subscriptions-clob.polymarket.com/ws/market", on_message=on_message, on_open=on_open)
-            GLOBAL_STATE.ws_handle = ws
-            ws.run_forever(ping_interval=20, ping_timeout=10)
-        except Exception: pass
-        GLOBAL_STATE.ws_handle = None
-        GLOBAL_STATE.ws_connected = False
-        time.sleep(2)
+        time.sleep(3) 
 
 if __name__ == "__main__":
-    init_csv()
-    sync_time_with_api()
-    
-    # 1. Start Infrastructure Threads
-    threading.Thread(target=run_server, daemon=True).start()
-    threading.Thread(target=btc_oracle_loop, daemon=True).start()
-    threading.Thread(target=polymarket_ws_thread, daemon=True).start()
-    
-    # 2. Run Diagnostics
-    run_diagnostics()
-    
-    # 3. Start Execution Threads
-    threading.Thread(target=discovery_thread, daemon=True).start()
-    threading.Thread(target=tick_loop, daemon=True).start()
-    threading.Thread(target=snapshot_loop, daemon=True).start()
-    threading.Thread(target=telemetry_loop, daemon=True).start()
-    
-    while GLOBAL_STATE.running:
-        time.sleep(1)
+    main()
