@@ -1,6 +1,6 @@
 """
 main.py — BSS Bot v6.15 (Tiered Exit + Maker Hook + Vault)
-FULL PRODUCTION BUILD - RICH WEB UI + PATCHED BACKEND
+PATCHED: Strict $0.49 Stalking & Zero-Fee Maker Leg 1
 """
 import os
 import sys
@@ -33,8 +33,7 @@ HEDGE_DEADLINE_TTR = 320
 ENTRY_CUTOFF_TTR = 120      
 
 MAX_COMBINED_COST = 1.01    
-T_WINDOW_1 = 0.49  
-T_WINDOW_2 = 0.50  
+MAX_FIRST_LEG_COST = 0.49  # FIXED: Strictly forces the bot to wait for an edge
 
 SELL_LOSER_T1_THRESH = 0.86
 SELL_LOSER_T2_THRESH = 0.95
@@ -67,7 +66,6 @@ class V615Engine:
         self.cats_count = 0
 
 def render_cloud_dashboard(engine):
-    # Minimal terminal output so it doesn't spam your logs, relying on the Web UI instead.
     now = get_synced_time()
     active = [m for m in GLOBAL_STATE.markets.values() if m.state == MarketState.BOTH and m.end_ts - now > -30]
     if active:
@@ -507,21 +505,18 @@ def evaluate_market(mdm: MarketData, now: float):
     y_mid = (yb.bid + yb.ask) / 2.0 if (yb.bid > 0 and yb.ask > 0) else yb.bid
     n_mid = (nb.bid + nb.ask) / 2.0 if (nb.bid > 0 and nb.ask > 0) else nb.bid
     
-    # 1. Stalk & Entry
+    # 1. Strict $0.49 Stalking Entry
     if mdm.state == MarketState.WATCH:
-        target = T_WINDOW_1 if ttr > 600 else T_WINDOW_2
-        if 0 < yb.ask <= target:
+        if 0 < yb.ask <= MAX_FIRST_LEG_COST:
             mdm.yes_entry_price = yb.ask
             mdm.yes_shares = BASE_CAPITAL_PER_LEG / yb.ask
             mdm.state = MarketState.WAITING_NO
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE; mdm.total_fees_paid += fee
-            execute_trade(mdm, "YES", yb.ask, "MAKER_FILL_LEG_1", mdm.yes_shares, fee, ttr)
-        elif 0 < nb.ask <= target:
+            execute_trade(mdm, "YES", yb.ask, "MAKER_FILL_LEG_1", mdm.yes_shares, 0.0, ttr) # 0% Maker fee
+        elif 0 < nb.ask <= MAX_FIRST_LEG_COST:
             mdm.no_entry_price = nb.ask
             mdm.no_shares = BASE_CAPITAL_PER_LEG / nb.ask
             mdm.state = MarketState.WAITING_YES
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE; mdm.total_fees_paid += fee
-            execute_trade(mdm, "NO", nb.ask, "MAKER_FILL_LEG_1", mdm.no_shares, fee, ttr)
+            execute_trade(mdm, "NO", nb.ask, "MAKER_FILL_LEG_1", mdm.no_shares, 0.0, ttr) # 0% Maker fee
 
     elif mdm.state == MarketState.WAITING_NO:
         if ttr <= ENTRY_CUTOFF_TTR:
@@ -533,7 +528,7 @@ def evaluate_market(mdm: MarketData, now: float):
             mdm.no_entry_price = nb.ask
             mdm.no_shares = BASE_CAPITAL_PER_LEG / nb.ask
             mdm.state = MarketState.BOTH
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE; mdm.total_fees_paid += fee
+            fee = mdm.no_shares * nb.ask * TAKER_FEE_RATE; mdm.total_fees_paid += fee
             execute_trade(mdm, "NO", nb.ask, "TAKER_HEDGE_GUARANTEE", mdm.no_shares, fee, ttr)
             
     elif mdm.state == MarketState.WAITING_YES:
@@ -546,7 +541,7 @@ def evaluate_market(mdm: MarketData, now: float):
             mdm.yes_entry_price = yb.ask
             mdm.yes_shares = BASE_CAPITAL_PER_LEG / yb.ask
             mdm.state = MarketState.BOTH
-            fee = BASE_CAPITAL_PER_LEG * TAKER_FEE_RATE; mdm.total_fees_paid += fee
+            fee = mdm.yes_shares * yb.ask * TAKER_FEE_RATE; mdm.total_fees_paid += fee
             execute_trade(mdm, "YES", yb.ask, "TAKER_HEDGE_GUARANTEE", mdm.yes_shares, fee, ttr)
 
     # 2. Tiered Exit & Maker-First Hook
@@ -598,7 +593,7 @@ def tick_loop():
         now = get_synced_time()
         for m in list(GLOBAL_STATE.markets.values()):
             try: evaluate_market(m, now)
-            except Exception: pass
+            except Exception as e: print(f"[ERR] {m.slug}: {e}")
         time.sleep(0.05)
 
 def snapshot_loop():
