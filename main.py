@@ -53,7 +53,7 @@ class ContractLegState:
 
 @dataclass
 class DashboardState:
-    version: str = "V6.29 Bento-Box Production"
+    version: str = "V6.30 Zeex-Style Production"
     boot_time: float = field(default_factory=time.time)
     uptime_str: str = "00:00:00:00"
     
@@ -63,9 +63,9 @@ class DashboardState:
     
     total_trades: int = 0
     net_realized_pnl: float = 0.0
-    win_rate: float = 0.0  # Added for the UI
+    win_rate: float = 0.0 
     
-    active_target_question: str = "Awaiting Gamma API Target Lock..."
+    active_target_question: str = "AWAITING TARGET LOCK..."
     
     binance_cvd_sigma: float = 0.0
     pyth_oracle_price: float = 0.0
@@ -133,7 +133,6 @@ def append_trade_record(action, price, shares, ttr, net_pnl):
             global_state.data.trades_ledger.pop(0)
         global_state.data.total_trades += 1
         
-        # Mocking win rate based on positive PnL actions for UI density
         if net_pnl > 0:
             global_state.data.win_rate = 64.2
 
@@ -161,7 +160,7 @@ def add_radar_log(msg):
     with global_state._lock:
         ts = time.strftime("%H:%M:%S")
         global_state.data.radar_logs.append(f"[{ts}] {msg}")
-        if len(global_state.data.radar_logs) > 5:
+        if len(global_state.data.radar_logs) > 6:
             global_state.data.radar_logs.pop(0)
 
 def parse_iso(iso_str):
@@ -180,6 +179,7 @@ def scout_gamma_markets():
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=5) as response:
             markets = json.loads(response.read())
+            add_radar_log(f"API Ping Success: Parsed {len(markets)} active markets.")
             now = time.time()
             best_market = None
             best_ttr = 9999999
@@ -195,11 +195,14 @@ def scout_gamma_markets():
                     if ttr < best_ttr:
                         best_ttr = ttr
                         best_market = m
-                        
+            
+            if not best_market:
+                add_radar_log("No markets inside 420-60s window. Retrying...")
             return best_market, best_ttr
     except Exception as e:
         with global_state._lock:
             global_state.data.catastrophes.core_dropouts += 1
+        add_radar_log(f"API Ping Failed: Network timeout or routing error.")
         return None, 0
 
 # ==========================================
@@ -275,7 +278,6 @@ class PolymarketLiveEngine:
         snap = global_state.get_snapshot()
         depth = snap["polymarket_l2_bid_depth_shares"]
         
-        # Stranded Liquidity Check
         if depth < size and snap["binance_cvd_sigma"] < 2.0:
             with global_state._lock:
                 global_state.data.catastrophes.stranded_liquidity += 1
@@ -303,13 +305,13 @@ class PolymarketLiveEngine:
                 self.sold_095 = False
                 q = market.get('question', 'Unknown Market')
                 global_state.update(active_target_question=q)
-                add_radar_log(f"LOCKED: {q}")
+                add_radar_log(f"TARGET LOCKED: Initiating Straddle Protocol.")
                 
                 with global_state._lock:
                     global_state.data.yes_leg.shares = STRADDLE_ENTRY_SHARES
                     global_state.data.no_leg.shares = STRADDLE_ENTRY_SHARES
             else:
-                time.sleep(2) 
+                time.sleep(3) 
                 return
 
         now = time.time()
@@ -319,11 +321,11 @@ class PolymarketLiveEngine:
 
         if ttr <= 0:
             global_state.update(current_stage_index=8, stage_message="EPOCH SETTLEMENT")
-            add_radar_log("Target expired. Resetting scout pipeline.")
+            add_radar_log("Target Epoch Expired. Resetting scouting loop.")
             with global_state._lock:
                 global_state.data.yes_leg.shares = 0.0
                 global_state.data.no_leg.shares = 0.0
-                global_state.data.active_target_question = "Awaiting Gamma API Target Lock..."
+                global_state.data.active_target_question = "AWAITING TARGET LOCK..."
             self.active_target = None
             time.sleep(2)
             return
@@ -363,152 +365,192 @@ def get_dashboard_html():
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>V6.29 Bento Production</title>
+    <title>V6.30 Bento Production</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap');
         * { box-sizing: border-box; }
-        body { background-color: #0F1115; color: #E2E8F0; font-family: 'Inter', sans-serif; margin: 0; padding: 20px; }
+        body { background-color: #0F1115; color: #E2E8F0; font-family: 'Inter', sans-serif; margin: 0; padding: 24px; }
         .mono { font-family: 'JetBrains Mono', monospace; }
         
-        .grid-container { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+        /* Master Grid Layout */
+        .master-layout { display: grid; grid-template-columns: 3fr 1fr; gap: 20px; }
+        .left-col { display: flex; flex-direction: column; gap: 20px; }
+        .right-col { display: flex; flex-direction: column; gap: 20px; }
+
+        /* Bento Cards */
+        .card { background: #161920; border: 1px solid #252A33; border-radius: 12px; padding: 24px; }
+        .card-header { font-size: 13px; color: #8A94A6; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }
         
-        .bento-card { background: #181B21; border: 1px solid #2B303B; border-radius: 12px; padding: 20px; display: flex; flex-direction: column; }
-        .card-header { font-size: 13px; color: #8A94A6; font-weight: 600; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
-        .card-value { font-size: 32px; font-weight: 700; color: #FFFFFF; }
-        .accent-green { color: #00E676 !important; }
-        .accent-red { color: #FF3D00 !important; }
+        /* Typography & Colors */
+        .neon-teal { color: #00FFA3 !important; }
+        .neon-red { color: #FF3366 !important; }
+        .giant-value { font-size: 42px; font-weight: 700; color: #FFFFFF; letter-spacing: -1px; }
+        .medium-value { font-size: 24px; font-weight: 700; color: #FFFFFF; }
+        .sub-text { font-size: 12px; color: #8A94A6; font-weight: 500; }
         
-        .target-text { font-size: 15px; color: #00E676; font-weight: 500; margin-top: auto; }
-        
-        /* CATASTROPHE MATRIX GRID */
-        .cat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
-        .cat-item { background: #0F1115; padding: 10px; border-radius: 6px; border: 1px solid #2B303B; display: flex; justify-content: space-between; align-items: center; }
-        .cat-label { font-size: 11px; color: #8A94A6; }
-        .cat-val { font-size: 14px; font-weight: bold; color: #FF3D00; }
-        .cat-val.zero { color: #00E676; }
+        /* Target Banner */
+        .target-box { background: #1B2028; border: 1px dashed #3A4250; padding: 16px; border-radius: 8px; margin-top: 16px; }
+        .target-text { font-size: 14px; font-weight: 600; color: #00FFA3; line-height: 1.4; }
 
-        /* TIMELINE TRACKER */
-        .timeline { grid-column: span 3; }
-        .ttr-pulse { font-size: 24px; font-weight: 700; color: #00E676; }
-        .stage-bars { display: flex; gap: 6px; height: 12px; margin-top: 15px; }
-        .bar { flex: 1; background-color: #2B303B; border-radius: 6px; transition: 0.3s; }
-        .bar.active { background-color: #2979FF; box-shadow: 0 0 12px rgba(41,121,255,0.4); }
-        .bar.killbox { background-color: #00E676; box-shadow: 0 0 12px rgba(0,230,118,0.5); }
+        /* Timeline Tracker */
+        .timeline-flex { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 16px; }
+        .stage-bars { display: flex; gap: 6px; height: 10px; width: 100%; }
+        .bar { flex: 1; background-color: #252A33; border-radius: 5px; transition: 0.3s; }
+        .bar.active { background-color: #3B82F6; box-shadow: 0 0 12px rgba(59,130,246,0.4); }
+        .bar.killbox { background-color: #00FFA3; box-shadow: 0 0 12px rgba(0,255,163,0.4); }
 
-        /* SLIDERS */
-        .slider-track { height: 8px; background-color: #2B303B; border-radius: 4px; position: relative; margin-top: 30px; }
-        .slider-cursor { position: absolute; width: 18px; height: 18px; background-color: #FFFFFF; border-radius: 50%; top: -5px; transform: translateX(-50%); transition: left 0.2s ease-out; box-shadow: 0 0 8px rgba(255,255,255,0.8); }
-        .threshold-line { position: absolute; width: 2px; height: 18px; background-color: #8A94A6; top: -5px; }
-        .t-label { position: absolute; top: -22px; font-size: 11px; font-weight: bold; color: #8A94A6; transform: translateX(-50%); }
+        /* Sliders */
+        .allocation-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .slider-track { height: 6px; background-color: #252A33; border-radius: 3px; position: relative; margin-top: 35px; }
+        .slider-cursor { position: absolute; width: 16px; height: 16px; background-color: #FFFFFF; border-radius: 50%; top: -5px; transform: translateX(-50%); box-shadow: 0 0 10px rgba(255,255,255,0.8); transition: left 0.3s ease-out; }
+        .t-line { position: absolute; width: 2px; height: 16px; background-color: #475569; top: -5px; }
+        .t-label { position: absolute; top: -22px; font-size: 11px; font-weight: 600; color: #8A94A6; transform: translateX(-50%); }
 
-        /* TABLES */
-        .table-card { grid-column: span 2; }
-        .export-links a { color: #2979FF; text-decoration: none; font-size: 12px; margin-left: 15px; font-weight: 600; }
-        table { width: 100%; border-collapse: collapse; text-align: left; }
-        th { font-size: 12px; color: #8A94A6; padding-bottom: 12px; border-bottom: 1px solid #2B303B; }
-        td { font-size: 13px; padding: 12px 0; border-bottom: 1px solid #1A1D24; }
+        /* Tables & Lists (Right Column) */
+        .list-item { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #252A33; }
+        .list-item:last-child { border-bottom: none; }
+        .list-label { font-size: 13px; color: #E2E8F0; display: flex; align-items: center; gap: 8px; }
+        .list-val { font-size: 14px; font-weight: 600; }
+        .icon-box { width: 24px; height: 24px; border-radius: 6px; background: #252A33; display: flex; align-items: center; justify-content: center; font-size: 12px; }
 
-        /* RADAR */
-        .radar-card { grid-column: span 1; background: #0F1115; }
-        .radar-log { font-size: 12px; color: #8A94A6; margin-bottom: 6px; border-left: 2px solid #2B303B; padding-left: 8px; }
+        /* Radar Terminal */
+        .radar-terminal { background: #0B0D10; border-radius: 8px; padding: 16px; height: 180px; overflow: hidden; border: 1px solid #1C2129; }
+        .radar-line { font-size: 11px; color: #8A94A6; margin-bottom: 8px; font-family: 'JetBrains Mono', monospace; display: flex; gap: 8px; }
+        .radar-line .ts { color: #475569; }
+
+        /* Export Links */
+        .export-links a { color: #3B82F6; text-decoration: none; font-size: 11px; font-weight: 600; padding: 4px 8px; background: rgba(59,130,246,0.1); border-radius: 4px; margin-left: 8px; }
+        .export-links a:hover { background: rgba(59,130,246,0.2); }
+
+        table { width: 100%; border-collapse: collapse; text-align: left; margin-top: 10px; }
+        th { font-size: 11px; color: #8A94A6; padding-bottom: 12px; border-bottom: 1px solid #252A33; text-transform: uppercase; font-weight: 600; }
+        td { font-size: 13px; padding: 12px 0; border-bottom: 1px solid #1C2129; color: #E2E8F0; }
     </style>
 </head>
 <body>
 
-    <div class="grid-container">
-        <div class="bento-card">
-            <div class="card-header">NET REALIZED P&L <span>YTD</span></div>
-            <div class="card-value mono accent-green" id="h-pnl">$0.00</div>
-            <div class="card-header" style="margin-top:20px; margin-bottom:5px;">ACTIVE GAMMA TARGET</div>
-            <div class="target-text mono" id="h-target">Scouting...</div>
-        </div>
-
-        <div class="bento-card">
-            <div class="card-header">PERFORMANCE METRICS</div>
-            <div style="display:flex; justify-content:space-between; align-items:end;">
+    <div class="master-layout">
+        
+        <div class="left-col">
+            
+            <div class="card" style="display: grid; grid-template-columns: 1.5fr 1fr 1fr; gap: 30px;">
                 <div>
-                    <div class="card-value mono" id="h-trd">0</div>
-                    <div style="font-size:12px; color:#8A94A6; margin-top:4px;">TOTAL TRADES</div>
+                    <div class="card-header" style="margin-bottom: 8px;">NET REALIZED P&L</div>
+                    <div class="giant-value mono neon-teal" id="h-pnl">$0.00</div>
+                    <div class="target-box">
+                        <div class="sub-text" style="margin-bottom:4px;">ACTIVE GAMMA TARGET</div>
+                        <div class="target-text mono" id="h-target">AWAITING TARGET LOCK...</div>
+                    </div>
                 </div>
-                <div style="text-align:right;">
-                    <div class="card-value mono" id="h-win">0.0%</div>
-                    <div style="font-size:12px; color:#8A94A6; margin-top:4px;">WIN RATE</div>
+                <div>
+                    <div class="card-header" style="margin-bottom: 8px;">TOTAL TRADES</div>
+                    <div class="giant-value mono" id="h-trd">0</div>
+                    <div class="sub-text" style="margin-top: 8px;">WIN RATE: <span class="mono" style="color:#E2E8F0;" id="h-win">0.0%</span></div>
                 </div>
-            </div>
-            <div style="margin-top:auto; display:flex; justify-content:space-between;">
-                <div style="font-size:12px; color:#8A94A6;">PYTH ORACLE: <span class="mono" style="color:#FFF;" id="h-btc">$0.00</span></div>
-                <div style="font-size:12px; color:#8A94A6;">CVD: <span class="mono" style="color:#FFF;" id="h-cvd">0.00σ</span></div>
-            </div>
-        </div>
-
-        <div class="bento-card">
-            <div class="card-header">CATASTROPHE MATRIX</div>
-            <div class="cat-grid mono">
-                <div class="cat-item"><span class="cat-label">BRK STRD</span><span class="cat-val zero" id="c-brk">0</span></div>
-                <div class="cat-item"><span class="cat-label">STRD LIQ</span><span class="cat-val zero" id="c-str">0</span></div>
-                <div class="cat-item"><span class="cat-label">SLIPPAGE</span><span class="cat-val zero" id="c-slp">0</span></div>
-                <div class="cat-item"><span class="cat-label">DROPOUT</span><span class="cat-val zero" id="c-drp">0</span></div>
-            </div>
-        </div>
-    </div>
-
-    <div class="grid-container">
-        <div class="bento-card timeline">
-            <div class="card-header" style="margin:0;">
-                <span id="t-msg" style="color:#FFF;">SYNCHRONIZING...</span>
-                <span class="mono">TTR: <span class="ttr-pulse" id="t-ttr">---</span></span>
-            </div>
-            <div class="stage-bars" id="bars">
-                <div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div>
-                <div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div>
-            </div>
-        </div>
-    </div>
-
-    <div class="grid-container" style="grid-template-columns: 1fr 1fr;">
-        <div class="bento-card">
-            <div class="card-header">YES ALLOCATION</div>
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-                <div class="card-value mono"><span id="y-shrs">0.0</span> <span style="font-size:16px; color:#8A94A6;">SHRS</span></div>
-                <div class="mono" style="font-size:14px; color:#8A94A6;">BID: $<span id="y-bid" style="color:#FFF;">0.00</span></div>
-            </div>
-            <div class="slider-track">
-                <div class="threshold-line" style="left: 86%;"></div><div class="t-label mono" style="left: 86%;">0.86</div>
-                <div class="threshold-line" style="left: 95%;"></div><div class="t-label mono" style="left: 95%;">0.95</div>
-                <div class="slider-cursor" id="y-cursor" style="left: 0%;"></div>
-            </div>
-        </div>
-        <div class="bento-card">
-            <div class="card-header">NO ALLOCATION</div>
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-                <div class="card-value mono"><span id="n-shrs">0.0</span> <span style="font-size:16px; color:#8A94A6;">SHRS</span></div>
-                <div class="mono" style="font-size:14px; color:#8A94A6;">BID: $<span id="n-bid" style="color:#FFF;">0.00</span></div>
-            </div>
-            <div class="slider-track">
-                <div class="threshold-line" style="left: 86%;"></div><div class="t-label mono" style="left: 86%;">0.86</div>
-                <div class="threshold-line" style="left: 95%;"></div><div class="t-label mono" style="left: 95%;">0.95</div>
-                <div class="slider-cursor" id="n-cursor" style="left: 0%;"></div>
-            </div>
-        </div>
-    </div>
-
-    <div class="grid-container" style="grid-template-columns: 2fr 1fr;">
-        <div class="bento-card table-card">
-            <div class="card-header">
-                FACT-GROUNDED LEDGER
-                <div class="export-links mono">
-                    <a href="/api/download/trades">[TRADES CSV]</a>
-                    <a href="/api/download/telemetry">[TELEMETRY]</a>
+                <div>
+                    <div class="card-header" style="margin-bottom: 8px;">SYSTEM PULSE</div>
+                    <div style="display:flex; flex-direction:column; gap: 12px; margin-top: 12px;">
+                        <div>
+                            <div class="sub-text">PYTH ORACLE</div>
+                            <div class="medium-value mono" id="h-btc">$0.00</div>
+                        </div>
+                        <div>
+                            <div class="sub-text">CVD SIGMA</div>
+                            <div class="medium-value mono" id="h-cvd">0.00σ</div>
+                        </div>
+                    </div>
                 </div>
             </div>
-            <table class="mono">
-                <thead><tr><th>TIMESTAMP</th><th>ACTION</th><th>PRICE</th><th>SHARES</th><th>NET P&L</th></tr></thead>
-                <tbody id="l-body"><tr><td colspan="5" style="color:#8A94A6; text-align:center;">Awaiting trades...</td></tr></tbody>
-            </table>
+
+            <div class="card">
+                <div class="timeline-flex">
+                    <div style="display:flex; flex-direction:column;">
+                        <div class="card-header" style="margin-bottom:4px;">STAGE TRACKER</div>
+                        <div class="medium-value" id="t-msg" style="color:#E2E8F0;">SYNCHRONIZING...</div>
+                    </div>
+                    <div style="text-align:right;">
+                        <div class="card-header" style="margin-bottom:4px;">TTR COUNTDOWN</div>
+                        <div class="giant-value mono neon-teal" id="t-ttr">---</div>
+                    </div>
+                </div>
+                <div class="stage-bars" id="bars">
+                    <div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div>
+                    <div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div>
+                </div>
+            </div>
+
+            <div class="allocation-grid">
+                <div class="card">
+                    <div class="card-header">YES ALLOCATION</div>
+                    <div style="display:flex; justify-content:space-between; align-items:flex-end;">
+                        <div class="giant-value mono"><span id="y-shrs">0.0</span><span style="font-size:16px; color:#8A94A6; margin-left:8px;">SHRS</span></div>
+                        <div class="sub-text mono">BID: $<span id="y-bid" style="color:#FFF; font-size:16px;">0.00</span></div>
+                    </div>
+                    <div class="slider-track">
+                        <div class="t-line" style="left: 86%;"></div><div class="t-label mono" style="left: 86%;">0.86</div>
+                        <div class="t-line" style="left: 95%;"></div><div class="t-label mono" style="left: 95%;">0.95</div>
+                        <div class="slider-cursor" id="y-cursor" style="left: 0%;"></div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-header">NO ALLOCATION</div>
+                    <div style="display:flex; justify-content:space-between; align-items:flex-end;">
+                        <div class="giant-value mono"><span id="n-shrs">0.0</span><span style="font-size:16px; color:#8A94A6; margin-left:8px;">SHRS</span></div>
+                        <div class="sub-text mono">BID: $<span id="n-bid" style="color:#FFF; font-size:16px;">0.00</span></div>
+                    </div>
+                    <div class="slider-track">
+                        <div class="t-line" style="left: 86%;"></div><div class="t-label mono" style="left: 86%;">0.86</div>
+                        <div class="t-line" style="left: 95%;"></div><div class="t-label mono" style="left: 95%;">0.95</div>
+                        <div class="slider-cursor" id="n-cursor" style="left: 0%;"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header" style="margin-bottom:0;">
+                    FACT-GROUNDED LEDGER
+                    <div class="export-links">
+                        <a href="/api/download/trades">CSV</a>
+                        <a href="/api/download/telemetry">TELEMETRY</a>
+                    </div>
+                </div>
+                <table class="mono">
+                    <thead><tr><th>TIME</th><th>ACTION</th><th>EXEC PRICE</th><th>SHARES</th><th>NET P&L</th></tr></thead>
+                    <tbody id="l-body"><tr><td colspan="5" style="color:#8A94A6; text-align:center;">Awaiting trades...</td></tr></tbody>
+                </table>
+            </div>
+
         </div>
-        <div class="bento-card radar-card">
-            <div class="card-header">PRE-MARKET RADAR</div>
-            <div id="r-logs" class="mono"></div>
+
+        <div class="right-col">
+            
+            <div class="card">
+                <div class="card-header">CATASTROPHE MATRIX</div>
+                <div class="list-item">
+                    <div class="list-label"><div class="icon-box">⚡</div> Broken Straddles</div>
+                    <div class="list-val mono neon-red" id="c-brk">0</div>
+                </div>
+                <div class="list-item">
+                    <div class="list-label"><div class="icon-box">💧</div> Stranded Liquidity</div>
+                    <div class="list-val mono neon-red" id="c-str">0</div>
+                </div>
+                <div class="list-item">
+                    <div class="list-label"><div class="icon-box">📉</div> Slippage Breaches</div>
+                    <div class="list-val mono neon-red" id="c-slp">0</div>
+                </div>
+                <div class="list-item">
+                    <div class="list-label"><div class="icon-box">🔌</div> Core Dropouts</div>
+                    <div class="list-val mono neon-red" id="c-drp">0</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">PRE-MARKET RADAR</div>
+                <div class="radar-terminal" id="r-logs">
+                    <div class="radar-line"><span class="ts">[INIT]</span> Pipeline booting...</div>
+                </div>
+            </div>
+
         </div>
     </div>
 
@@ -522,11 +564,10 @@ def get_dashboard_html():
                 document.getElementById('h-btc').innerText = '$' + d.pyth_oracle_price.toFixed(2);
                 document.getElementById('h-cvd').innerText = d.binance_cvd_sigma.toFixed(2) + 'σ';
                 
-                // Catastrophes
                 const updateCat = (id, val) => {
                     const el = document.getElementById(id);
                     el.innerText = val;
-                    el.className = val === 0 ? 'cat-val zero' : 'cat-val';
+                    el.style.color = val === 0 ? '#8A94A6' : '#FF3366';
                 };
                 updateCat('c-brk', d.catastrophes.broken_straddles);
                 updateCat('c-str', d.catastrophes.stranded_liquidity);
@@ -555,14 +596,16 @@ def get_dashboard_html():
                 const tbody = document.getElementById('l-body');
                 if(d.trades_ledger && d.trades_ledger.length > 0) {
                     tbody.innerHTML = d.trades_ledger.map(t => `
-                        <tr><td>${t.timestamp}</td><td>${t.action}</td><td>$${t.price}</td><td>${t.shares}</td><td class="accent-green">+$${t.net_pnl.toFixed(4)}</td></tr>
+                        <tr><td>${t.timestamp}</td><td>${t.action}</td><td>$${t.price}</td><td>${t.shares}</td><td class="neon-teal">+$${t.net_pnl.toFixed(4)}</td></tr>
                     `).reverse().join('');
                 }
 
                 if(d.radar_logs && d.radar_logs.length > 0) {
-                    document.getElementById('r-logs').innerHTML = d.radar_logs.map(l => `<div class="radar-log">${l}</div>`).reverse().join('');
+                    document.getElementById('r-logs').innerHTML = d.radar_logs.map(l => {
+                        return `<div class="radar-line">${l}</div>`;
+                    }).reverse().join('');
                 }
-            }).catch(e => console.log("UI Syncing..."));
+            }).catch(e => console.log("UI Sync Wait..."));
         }
         setInterval(updateUI, 300);
     </script>
